@@ -1,5 +1,3 @@
-# EOS_Loader
-BIOS management loader for EOS
 # Eos — Loader
 
 The Xbox-side application for the Eos modchip. It runs on the Original Xbox, manages BIOS
@@ -30,7 +28,7 @@ NVRAM / settings tooling — all from an on-console UI with FTP and HTTP access.
 
 - An Original Xbox (any revision) with an installed **Eos** board.
 - **RXDK / MSVC 2003** toolchain to build the XBE.
-- **eos_packer** to package the build into a flashable/distributable image.
+- **Python 3 + `lz4`** and `eos_pack.py` to pack the XBE into a bootable BIOS image.
 
 > The codebase targets the RXDK / MSVC 2003 environment (C89-era constraints, no CRT/heap,
 > `/GL` on all units). It is not expected to build under a modern toolchain unchanged.
@@ -39,27 +37,41 @@ NVRAM / settings tooling — all from an on-console UI with FTP and HTTP access.
 
 ## Building
 
-1. Build the project with the RXDK / MSVC 2003 toolchain to produce the loader `default.xbe`.
-2. Package with **eos_packer** (the known-good packer) to produce the final image:
+Build the project with the RXDK / MSVC 2003 toolchain to produce the loader `default.xbe`.
 
-   ```
-   eos_packer <built default.xbe + assets>  ->  <eos loader image>
-   ```
+## Packing the BIOS image
 
-   > Use your established eos_packer invocation/output target — the build flow is unchanged
-   > from the current working setup. Fill in the exact command line for this repo here.
+The Eos board boots a **2 MB Xenium-style BIOS image** with the loader XBE embedded
+(LZ4-compressed) in the XeniumOS bank, and a borrowed Cerbios kernel + bank geometry kept
+byte-for-byte. `eos_pack.py` swaps **only** the embedded XBE into a known-good template, so
+the kernel's XBE-location expectations stay satisfied — your launcher XBE is the only
+variable.
 
-3. Flash / install the resulting image (see below).
+Requires Python 3 + the `lz4` package (`pip install lz4`).
 
----
+```bash
+# pack your built loader into a bootable image
+python3 eos_pack.py pack <template.bin> default.xbe eos.bin
 
-## Install
+# confirm the payload round-trips byte-identical
+python3 eos_pack.py verify eos.bin
 
-The loader is served by the Eos board as the cold-boot default, so the Xbox boots straight
-into it. Update it either by:
+# (pull an XBE back out of an image)
+python3 eos_pack.py unpack eos.bin out.xbe
+```
 
-- **eos_packer + flash** — repackage and write the new image to the board, or
-- **OTA** — use the loader's HTTP/OTA updater to push a new build to a running unit.
+- `<template.bin>` must be the **2 MB Xenium image** (e.g. `Xenium_Prometheos_V1_5_0.bin`) —
+  not the 256 K Cerbios `.bin` or the 1 MB RP2040 image.
+- The XBE is placed at the XeniumOS bank (`0x100000`); descriptor is `u32 decompressed_size,
+  u32 compressed_size` then the raw LZ4 block. Kernel sits at `0x180000`.
+- Budget: descriptor + compressed XBE must fit **0x80000 (512 KB)** — `pack` errors on
+  overflow and self-verifies the round-trip before writing.
+
+> Stock BIOS images (Cerbios, etc.) flash directly — packing is only for embedding a custom
+> loader XBE.
+
+> **Flashing the packed image to the board is chip prep, not loader software** — see the
+> firmware README ("Flashing / chip prep"). The loader's job ends at producing `eos.bin`.
 
 ---
 
