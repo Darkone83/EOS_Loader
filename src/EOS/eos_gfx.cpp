@@ -20,6 +20,8 @@ int         g_oy = 0;
 static IDirect3D8* s_d3d = 0;
 static IDirect3DTexture8* s_white = 0;   // 1x1 white, for solid fills
 static IDirect3DTexture8* s_glowTex = 0;   // 64x64 radial glow sprite
+static IDirect3DTexture8* s_discTex = 0;   // 64x64 hard disc (pill caps, 3-slice)
+static IDirect3DTexture8* s_ballTex = 0;   // 64x64 lit sphere (3D orbs)
 static DWORD              s_glowPix[64 * 64];
 static DWORD              s_baseFilter = D3DTEXF_POINT;   // LINEAR when HD-scaled
 
@@ -178,11 +180,61 @@ bool Gfx_Init()
             }
         s_glowTex = Gfx_CreateTexARGB(64, 64, s_glowPix);
     }
+
+    // Hard-edged disc with a ~1px AA rim, reused (left/right halves) as the
+    // rounded end-caps of the 3D pills via a horizontal 3-slice. The disc fills
+    // the whole texture (centre 31.5, radius 31.5) so its vertical diameter is
+    // full height -- the flat side butts the middle rect seamlessly. Integer math.
+    {
+        int dx2, dy2;
+        for (dy2 = 0; dy2 < 64; ++dy2)
+            for (dx2 = 0; dx2 < 64; ++dx2) {
+                int ddx = dx2 * 2 - 63, ddy = dy2 * 2 - 63;   // *2 to keep integer (half-px)
+                int d2 = ddx * ddx + ddy * ddy;               // radius 63 in this doubled space
+                int a;
+                if (d2 <= 61 * 61) a = 255;
+                else if (d2 >= 63 * 63) a = 0;
+                else a = (63 * 63 - d2) * 255 / (63 * 63 - 61 * 61);
+                s_glowPix[dy2 * 64 + dx2] = ((DWORD)a << 24) | 0x00FFFFFF;
+            }
+        s_discTex = Gfx_CreateTexARGB(64, 64, s_glowPix);
+    }
+
+    // Lit-sphere impostor for the 3D orbs: per-pixel surface normal of a sphere,
+    // shaded by a fixed upper-left/front light (N.L diffuse + ambient), with a
+    // soft rim alpha. RGB carries the shading (grayscale); the orb's color tints
+    // it at draw time. This is what makes the background balls read as round 3D
+    // objects instead of flat glow sprites. Newton sqrt (init-time, no libm).
+    {
+        int bx, by;
+        for (by = 0; by < 64; ++by)
+            for (bx = 0; bx < 64; ++bx) {
+                float fx = ((float)bx - 31.5f) / 30.0f;   // -1..1 across the disc
+                float fy = ((float)by - 31.5f) / 30.0f;
+                float r2 = fx * fx + fy * fy, z, d, lum;
+                int a, L;
+                if (r2 >= 1.0f) { s_glowPix[by * 64 + bx] = 0; continue; }
+                z = 1.0f - r2;                            // z = sqrt(1 - r2)
+                { float gx = z + 0.001f; int it; for (it = 0; it < 6; ++it) gx = 0.5f * (gx + z / gx); z = gx; }
+                d = fx * (-0.5f) + fy * (-0.5f) + z * 0.70711f;   // N.L, L unit upper-left/front
+                if (d < 0.0f) d = 0.0f;
+                lum = 0.20f + 0.80f * d;                  // ambient + diffuse
+                if (lum > 1.0f) lum = 1.0f;
+                L = (int)(lum * 255.0f);
+                a = 255;
+                if (r2 > 0.80f) a = (int)((1.0f - (r2 - 0.80f) * 5.0f) * 255.0f);   // soft rim
+                if (a < 0) a = 0;
+                s_glowPix[by * 64 + bx] = ((DWORD)a << 24) | ((DWORD)L << 16) | ((DWORD)L << 8) | (DWORD)L;
+            }
+        s_ballTex = Gfx_CreateTexARGB(64, 64, s_glowPix);
+    }
     return (s_white != 0);
 }
 
 void Gfx_Shutdown()
 {
+    if (s_ballTex) { s_ballTex->Release(); s_ballTex = 0; }
+    if (s_discTex) { s_discTex->Release(); s_discTex = 0; }
     if (s_glowTex) { s_glowTex->Release(); s_glowTex = 0; }
     if (s_white) { s_white->Release(); s_white = 0; }
     if (g_dev) { g_dev->Release();   g_dev = 0; }
@@ -337,4 +389,172 @@ void Gfx_GlowRounded(int x, int y, int w, int h, int r, DWORD color)
         Gfx_FillRounded(x - g, y - g, w + 2 * g, h + 2 * g, r + g, c);
     }
     g_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);  // restore
+}
+// ===================== Real 3D pass (perspective) =======================
+// The layer above is XYZRHW (screen-space). For genuine depth we set a
+// perspective projection + identity view and feed untransformed XYZ geometry,
+// letting the NV2A's fixed-function T&L do the perspective divide. The 3D
+// viewport is clamped to the 4:3 design area so it aligns with the 2D chrome.
+
+struct V3 { float x, y, z; DWORD c; float u, v; };
+#define FVF3 (D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1)
+
+static D3DVIEWPORT8 s_vpSaved;
+static int          s_vpHave = 0;
+
+static void mat_zero_id(D3DMATRIX* m)
+{
+    int i; float* f = &m->_11;
+    for (i = 0; i < 16; ++i) f[i] = 0.0f;
+    m->_11 = m->_22 = m->_33 = m->_44 = 1.0f;
+}
+
+void Gfx_Begin3D(void)
+{
+    D3DMATRIX proj, idn;
+    D3DVIEWPORT8 vp;
+
+    // 60deg vertical FOV, 4:3, near 1 / far 50, left-handed.
+    mat_zero_id(&proj);
+    proj._11 = 1.29904f;    // xScale = yScale / (4/3)
+    proj._22 = 1.73205f;    // yScale = 1 / tan(fovY/2)
+    proj._33 = 1.020408f;   // zf / (zf - zn)
+    proj._34 = 1.0f;
+    proj._43 = -1.020408f;  // -zn * zf / (zf - zn)
+    proj._44 = 0.0f;
+    mat_zero_id(&idn);
+
+    g_dev->SetTransform(D3DTS_PROJECTION, &proj);
+    g_dev->SetTransform(D3DTS_VIEW, &idn);
+    g_dev->SetTransform(D3DTS_WORLD, &idn);
+
+    if (SUCCEEDED(g_dev->GetViewport(&s_vpSaved))) s_vpHave = 1;
+    vp.X = (DWORD)g_ox;
+    vp.Y = (DWORD)g_oy;
+    vp.Width = (DWORD)(640.0f * g_sx);
+    vp.Height = (DWORD)(480.0f * g_sy);
+    vp.MinZ = 0.0f; vp.MaxZ = 1.0f;
+    g_dev->SetViewport(&vp);
+
+    g_dev->SetVertexShader(FVF3);
+    g_dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    g_dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+
+    // Linear depth fog toward the background colour: blends far pills and the
+    // back of the orb field into the scene so nothing reads as a hard cut-out.
+    {
+        float fs = 2.55f, fe = 11.0f;                  // start just behind the selected pill
+        g_dev->SetRenderState(D3DRS_FOGENABLE, TRUE);
+        g_dev->SetRenderState(D3DRS_FOGCOLOR, EOS_BG & 0x00FFFFFF);
+        g_dev->SetRenderState(D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
+        g_dev->SetRenderState(D3DRS_FOGSTART, *(DWORD*)&fs);
+        g_dev->SetRenderState(D3DRS_FOGEND, *(DWORD*)&fe);
+    }
+}
+
+void Gfx_End3D(void)
+{
+    g_dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    if (s_vpHave) { g_dev->SetViewport(&s_vpSaved); s_vpHave = 0; }
+    g_dev->SetVertexShader(QFVF);
+    g_dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+    g_dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+}
+
+// CRT-free sine/cosine (parabola + one refinement, ~0.1% error). Range-reduced
+// to [-PI,PI]. Good enough for menu-wheel rotation; no libm dependency.
+static float s_sinf(float x)
+{
+    const float PI = 3.14159265f, TWO_PI = 6.28318531f, INV2PI = 0.15915494f;
+    const float B = 1.27323954f, C = 0.40528473f, P = 0.225f;
+    int k; float ax, y, ay;
+    k = (int)(x * INV2PI); x -= (float)k * TWO_PI;     // |x| < 2PI
+    if (x > PI) x -= TWO_PI; else if (x < -PI) x += TWO_PI;
+    ax = (x < 0.0f) ? -x : x;
+    y = B * x - C * x * ax;
+    ay = (y < 0.0f) ? -y : y;
+    return P * (y * ay - y) + y;
+}
+void Gfx_SinCos(float a, float* s, float* c)
+{
+    if (s) *s = s_sinf(a);
+    if (c) *c = s_sinf(a + 1.57079633f);
+}
+
+// Flat (screen-parallel) quad -- used by the orb field.
+static void quad3(float cx, float cy, float cz, float hw, float hh, DWORD c,
+    IDirect3DTexture8* tex, float u0, float v0, float u1, float v1)
+{
+    V3 v[4];
+    v[0].x = cx - hw; v[0].y = cy + hh; v[0].z = cz; v[0].c = c; v[0].u = u0; v[0].v = v0;
+    v[1].x = cx + hw; v[1].y = cy + hh; v[1].z = cz; v[1].c = c; v[1].u = u1; v[1].v = v0;
+    v[2].x = cx - hw; v[2].y = cy - hh; v[2].z = cz; v[2].c = c; v[2].u = u0; v[2].v = v1;
+    v[3].x = cx + hw; v[3].y = cy - hh; v[3].z = cz; v[3].c = c; v[3].u = u1; v[3].v = v1;
+    g_dev->SetTexture(0, tex ? tex : s_white);
+    g_dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(V3));
+}
+
+void Gfx_Quad3D(float cx, float cy, float cz, float hw, float hh, DWORD c,
+    IDirect3DTexture8* tex, float u0, float v0, float u1, float v1)
+{
+    quad3(cx, cy, cz, hw, hh, c, tex, u0, v0, u1, v1);
+}
+
+void Gfx_Quad3DFill(float cx, float cy, float cz, float hw, float hh, DWORD c)
+{
+    quad3(cx, cy, cz, hw, hh, c, s_white, 0.0f, 0.0f, 1.0f, 1.0f);
+}
+
+void Gfx_Quad3DAdd(float cx, float cy, float cz, float hw, float hh, DWORD c,
+    IDirect3DTexture8* tex)
+{
+    g_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+    quad3(cx, cy, cz, hw, hh, c, tex ? tex : s_white, 0.0f, 0.0f, 1.0f, 1.0f);
+    g_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+}
+
+void Gfx_Orb3D(float cx, float cy, float cz, float size, DWORD color, int peak)
+{
+    // Lit sphere, alpha-blended (NOT additive) so the dark limb occludes the
+    // background and the ball reads as a solid 3D object. Tint = orb color,
+    // overall opacity = peak. LINEAR filtering keeps the sphere smooth.
+    DWORD c = (color & 0x00FFFFFF) | ((DWORD)(peak & 0xFF) << 24);
+    if (!s_ballTex) return;
+    Gfx_SetFilter(TRUE);
+    quad3(cx, cy, cz, size * 0.5f, size * 0.5f, c, s_ballTex, 0.0f, 0.0f, 1.0f, 1.0f);
+    Gfx_SetFilter(FALSE);
+}
+
+// Tilted quad. A local-space rect (centered at lcx,lcy within the item's face)
+// rotated about the world X axis by (ca=cos,sa=sin), then placed at the item
+// center (cx,cy,cz). X is unaffected by the rotation; local Y maps into world
+// Y/Z, so the surface turns in space -- this is what reads as real 3D. Pass
+// ca=1,sa=0 for a screen-parallel quad.
+void Gfx_Quad3DP(float cx, float cy, float cz, float ca, float sa,
+    float lcx, float lcy, float hw, float hh, DWORD c,
+    IDirect3DTexture8* tex, float u0, float v0, float u1, float v1)
+{
+    float lx0 = lcx - hw, lx1 = lcx + hw, ly0 = lcy + hh, ly1 = lcy - hh;
+    V3 v[4];
+    v[0].x = cx + lx0; v[0].y = cy + ly0 * ca; v[0].z = cz + ly0 * sa; v[0].c = c; v[0].u = u0; v[0].v = v0;
+    v[1].x = cx + lx1; v[1].y = cy + ly0 * ca; v[1].z = cz + ly0 * sa; v[1].c = c; v[1].u = u1; v[1].v = v0;
+    v[2].x = cx + lx0; v[2].y = cy + ly1 * ca; v[2].z = cz + ly1 * sa; v[2].c = c; v[2].u = u0; v[2].v = v1;
+    v[3].x = cx + lx1; v[3].y = cy + ly1 * ca; v[3].z = cz + ly1 * sa; v[3].c = c; v[3].u = u1; v[3].v = v1;
+    g_dev->SetTexture(0, tex ? tex : s_white);
+    g_dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(V3));
+}
+
+// Rounded, translucent 3D pill, tilted by (ca,sa). Horizontal 3-slice: a flat
+// white middle + two disc-half end-caps, so the corner radius never distorts
+// with width. 'c' carries the tint AND the alpha (transparency).
+void Gfx_PillX3D(float cx, float cy, float cz, float ca, float sa,
+    float hw, float hh, DWORD c)
+{
+    float mid = hw - hh;                 // half-width of the flat middle section
+    if (mid < 0.0f) { hw = hh; mid = 0.0f; }
+    if (mid > 0.0f)
+        Gfx_Quad3DP(cx, cy, cz, ca, sa, 0.0f, 0.0f, mid, hh, c, s_white, 0.0f, 0.0f, 1.0f, 1.0f);
+    // left cap = left half of the disc; right cap = right half.
+    Gfx_Quad3DP(cx, cy, cz, ca, sa, -(mid + hh * 0.5f), 0.0f, hh * 0.5f, hh, c, s_discTex, 0.0f, 0.0f, 0.5f, 1.0f);
+    Gfx_Quad3DP(cx, cy, cz, ca, sa, (mid + hh * 0.5f), 0.0f, hh * 0.5f, hh, c, s_discTex, 0.5f, 0.0f, 1.0f, 1.0f);
 }

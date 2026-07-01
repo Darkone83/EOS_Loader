@@ -31,7 +31,7 @@ static char* appName(char* p, const char* s) // sanitize for FATX
     while (*s) {
         c = (unsigned char)*s++;
         if (c < 0x20 || c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' || c == '"' ||
-            c == '<' || c == '>' || c == '|' || c == ' ') c = '_';
+            c == '<' || c == '>' || c == '|' || c == ' ' || c == '.') c = '_';
         *p++ = (char)c;
     }
     return p;
@@ -102,12 +102,39 @@ int Firmware_BackupBank(int bankIdx, char* outPath, int outLen)
     return FW_OK;
 }
 
+// Case-insensitive ".bin" suffix test.
+static int endsWithBin(const char* s)
+{
+    int n = 0; while (s[n]) ++n;
+    if (n < 4) return 0;
+    s += n - 4;
+    return s[0] == '.'
+        && (s[1] == 'b' || s[1] == 'B')
+        && (s[2] == 'i' || s[2] == 'I')
+        && (s[3] == 'n' || s[3] == 'N');
+}
+
+// List the firmware folder EXACTLY like the XbDiag FileExplorer (LoadDirectory):
+// FindFirstFile("<dir>\\*") + skip . / .. ; we additionally skip dirs and keep
+// only .bin in code.
 int Firmware_ListBackups(char names[][64], int maxN)
 {
-    WIN32_FIND_DATA fd; HANDLE h; int n = 0, k;
-    h = FindFirstFileA(FW_DIR "\\fw_*.bin", &fd);
+    char pattern[200];
+    WIN32_FIND_DATA fd; HANDLE h; int n = 0, k, p = 0;
+    const char* d = FW_DIR;
+
+    while (d[p] && p < 190) { pattern[p] = d[p]; ++p; }
+    if (p > 0 && pattern[p - 1] != '\\') pattern[p++] = '\\';
+    pattern[p++] = '*'; pattern[p] = 0;
+
+    h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
     do {
+        if (fd.cFileName[0] == '.' &&
+            (fd.cFileName[1] == 0 ||
+                (fd.cFileName[1] == '.' && fd.cFileName[2] == 0))) continue;   // . / ..
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;       // dirs
+        if (!endsWithBin(fd.cFileName)) continue;                          // .bin only
         if (n >= maxN) break;
         for (k = 0; k < 63 && fd.cFileName[k]; ++k) names[n][k] = fd.cFileName[k];
         names[n][k] = 0;

@@ -20,6 +20,14 @@ void Ui_PillLeft(int x, int y, int w, int h, int r, int selected, const char* la
 void Ui_PillRow(int x, int y, int w, int h, int r, int selected, int dim,
     const char* label, const char* value);
 
+// Shared 3D menu: every menu renders through this. Items are real panels on a
+// rail receding INTO the screen (selected centered + nearest), labels are 3D
+// text on the panel face (scale with depth), and the selected row uses the
+// DarkDash treatment -- dim panel, solid label, translucent highlight over the
+// text. Fully theme-driven. Opens/closes its own 3D pass; draw a backdrop
+// (and any 2D title) before it, 2D footer/status after.
+void Ui_Menu3D(const char** items, int count, int sel);
+
 // Shared metrics so screens line up.
 #define UI_PILL_H   38
 #define UI_PILL_R   19

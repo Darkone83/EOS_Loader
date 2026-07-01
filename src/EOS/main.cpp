@@ -10,6 +10,7 @@
 #include "input.h"
 #include "eos_bank.h"
 #include "eos_config.h"
+#include "eos_audio.h"
 #include "eos_eeprom_io.h"
 #include "eos_firmware_io.h"
 #include "eos_hdd.h"
@@ -31,7 +32,7 @@
 // ---------------------------------------------------------------------------
 enum AppPhase {
     PH_SPLASH = 0, PH_MENU, PH_BANKSEL, PH_BANKMGMT, PH_CONFIRM, PH_BROWSE, PH_RENAME, PH_TOOLS, PH_EE_TOOLS, PH_FW_TOOLS, PH_FW_BACKUP, PH_FW_RPICK,
-    PH_FW_RTARGET, PH_FW_RCONFIRM, PH_HDD_TOOLS, PH_HDD_INFO, PH_EE_RESTORE, PH_EE_CONFIRM, PH_FORMAT, PH_FORMAT_CONFIRM, PH_SETTINGS, PH_ABOUT
+    PH_FW_RTARGET, PH_FW_RCONFIRM, PH_HDD_TOOLS, PH_HDD_INFO, PH_EE_RESTORE, PH_EE_CONFIRM, PH_FORMAT, PH_FORMAT_CONFIRM, PH_SETTINGS, PH_ABOUT, PH_CLEARCFG
 };
 
 static AppPhase s_phase = PH_SPLASH;
@@ -55,8 +56,10 @@ static int           s_entCount = 0;
 static int           s_browseSel = 0;
 static int           s_browseScroll = 0;
 static int           s_flashTarget = -1;          // bank idx being flashed
+static int           s_browseSong = 0;           // 1 = browsing to pick a bg-music track
 static char          s_flashPath[EOS_FILE_PATH_MAX] = { 0 };
 static int           s_renameTarget = -1;         // bank idx being renamed
+static AppPhase      s_renameReturn = PH_BANKMGMT; // phase to return to after rename
 
 // forward decls (browser block is defined below, before main)
 static void DoFlash(int idx, const char* path);
@@ -133,70 +136,77 @@ static void Menu_Frame(WORD b)
     Gfx_Begin(EOS_BG); Ui_Backdrop();
     Menu_Draw();
     if (s_status[0] && GetTickCount() < s_statusUntil)
-        Font_DrawCentered(0, g_scrW, 392, s_status, EOS_PURPLE);
+        Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
 
     // network status / web-UI address, lower-left (inside the TV-safe margin so
     // it never clips on overscan). Bare IP for now -- a scheme/port prefix waits
     // until the FTP-vs-HTTP surface is settled.
     if (Net_IsUp()) {
-        Font_Draw(40, g_scrH - 56, Net_Ip(), EOS_PURPLE);
+        Font_Draw(40, g_scrH - 70, Net_Ip(), EOS_PURPLE);
     }
     else if (Net_LinkUp()) {
-        Font_Draw(40, g_scrH - 56, "Network: acquiring address...", EOS_DIM);
+        Font_Draw(40, g_scrH - 70, "Network: acquiring address...", EOS_DIM);
     }
     else {
-        Font_Draw(40, g_scrH - 56, "Network: no link", EOS_DIM);
+        Font_Draw(40, g_scrH - 70, "Network: no link", EOS_DIM);
     }
     Gfx_End();
 }
 
 // ---------------------------------------------------------------------------
-// BANK SELECT: list selectable banks; A launches (0xEF write + SMC warm reset,
-// does not return), B returns to the menu.
+// BANK SELECT: launchable banks plus a TSOP entry (last). A launches -- real
+// banks via 0xEF + SMC warm reset (D0 stays asserted, the FPGA serves the bank);
+// TSOP releases D0 and warm-resets into the onboard flash. Neither returns on
+// hardware. B returns to the menu. TSOP is always present even with zero banks.
 // ---------------------------------------------------------------------------
 static void BankSel_Frame(WORD b)
 {
     int n = Bank_LaunchCount();
-    int listY, i;
+    int cap = (n < EOS_BANK_MAX) ? n : EOS_BANK_MAX;
+    int hasDiag = Bank_XbDiagPresent();           // XbDiag entry only when installed
+    int diagIdx = hasDiag ? cap : -1;             // XbDiag slot (after the real banks)
+    int tsopIdx = cap + (hasDiag ? 1 : 0);        // TSOP is always the last item
+    int total = tsopIdx + 1;
+    int i;
 
-    if (s_bankSel >= n) s_bankSel = (n > 0) ? (n - 1) : 0;
+    if (s_bankSel >= total) s_bankSel = total - 1;
 
-    if (n > 0) {
-        if (Pressed(b, s_prevBtn, BTN_DPAD_UP))
-            s_bankSel = (s_bankSel + n - 1) % n;
-        if (Pressed(b, s_prevBtn, BTN_DPAD_DOWN))
-            s_bankSel = (s_bankSel + 1) % n;
-    }
+    if (Pressed(b, s_prevBtn, BTN_DPAD_UP))
+        s_bankSel = (s_bankSel + total - 1) % total;
+    if (Pressed(b, s_prevBtn, BTN_DPAD_DOWN))
+        s_bankSel = (s_bankSel + 1) % total;
+
     if (Pressed(b, s_prevBtn, BTN_B)) {
         GotoPhase(PH_MENU);
         return;
     }
-    if (n > 0 && Pressed(b, s_prevBtn, BTN_A)) {
-        // Select + warm-reset into the chosen bank. Does not return on HW.
-        Bank_Launch(Bank_LaunchIndex(s_bankSel));
+    if (Pressed(b, s_prevBtn, BTN_A)) {
+        // TSOP releases D0 -> onboard flash; XbDiag pages itself into SDRAM (sync)
+        // then boots; a real bank keeps D0 asserted and warm-resets so the FPGA
+        // serves it. None return on HW.
+        if (s_bankSel == tsopIdx)
+            Eos_TsopBoot();
+        else if (hasDiag && s_bankSel == diagIdx)
+            Eos_LaunchXbDiag();
+        else
+            Bank_Launch(Bank_LaunchIndex(s_bankSel));
         return;
     }
 
     Gfx_Begin(EOS_BG); Ui_Backdrop();
     Ui_TitleBar("SELECT BANK");
 
-    if (n == 0) {
-        Font_DrawCentered(0, g_scrW, 210, "No BIOS banks populated", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 248, "Flash a BIOS from Bank Management", EOS_DIM);
-        Ui_Footer("B = BACK");
-        Gfx_End();
-        return;
+    {
+        const char* names[EOS_BANK_MAX + 2];      // real banks + XbDiag + TSOP
+        for (i = 0; i < cap; ++i) names[i] = Bank_Name(Bank_LaunchIndex(i));
+        if (hasDiag) names[diagIdx] = "XbDiag Lite";
+        names[tsopIdx] = "TSOP  (onboard flash)";
+        Ui_Menu3D(names, total, s_bankSel);
     }
 
-    {
-        int w = 360, x = (g_scrW - w) / 2;
-        listY = 110;
-        for (i = 0; i < n; ++i) {
-            int idx = Bank_LaunchIndex(i);
-            int y = listY + i * UI_ROW_DY;
-            Ui_PillCentered(x, y, w, UI_PILL_H, UI_PILL_R, i == s_bankSel, Bank_Name(idx));
-        }
-    }
+    if (cap == 0 && !hasDiag)
+        Font_DrawCentered(0, g_scrW, g_scrH - 94,
+            "No BIOS banks flashed -- flash from Bank Management", EOS_DIM);
 
     Ui_Footer("A = LAUNCH   B = BACK");
     Gfx_End();
@@ -230,6 +240,9 @@ static void buildMgmtRow(char* out, int idx)
     if (Bank_IsBoot(idx)) {
         p = appendStr(out, p, "[BOOT]");
     }
+    else if (Bank_IsLocked(idx)) {
+        p = appendStr(out, p, "[LOCKED]");
+    }
     else if (Bank_Occupied(idx)) {
         p = appendStr(out, p, "[");
         p = appendStr(out, p, sizeStr(Bank_SizeCode(idx)));
@@ -243,7 +256,7 @@ static void buildMgmtRow(char* out, int idx)
 static void DoDelete(int idx)
 {
     int rc;
-    if (idx < 0 || Bank_IsBoot(idx)) { SetStatus("Protected bank"); return; }
+    if (idx < 0 || Bank_IsLocked(idx)) { SetStatus("Protected bank"); return; }
     rc = Flash_EraseBank(Bank_Ef(idx));   // erases only this bank's blocks
     if (rc == EOS_FLASH_OK) {
         Bank_ClearEntry(idx);             // empty + restore factory label
@@ -273,7 +286,7 @@ static void Confirm_Frame(WORD b)
     Font_DrawCentered(0, g_scrW, 150, "CONFIRM", EOS_PURPLE);
     Font_DrawCentered(0, g_scrW, 210, s_confirmMsg, EOS_WHITE);
     Font_DrawCentered(0, g_scrW, 250, "This cannot be undone.", EOS_DIM);
-    Font_DrawCentered(0, g_scrW, g_scrH - 60, "A = YES    B = NO", EOS_DIM);
+    Font_DrawCentered(0, g_scrW, g_scrH - 66, "A = YES    B = NO", EOS_DIM);
     Gfx_End();
 }
 
@@ -325,25 +338,14 @@ static int navSel(WORD b, int sel, int count)
 // Standard list screen: title pill + a scrolling column of pills + status line.
 static void listScreen(const char* title, const char** items, int count, int sel)
 {
-    int i, y, x, w = 380, top = 0, shown;
-    if (count > LIST_VIS) {
-        top = sel - LIST_VIS / 2;
-        if (top < 0) top = 0;
-        if (top > count - LIST_VIS) top = count - LIST_VIS;
-    }
-    shown = (count < LIST_VIS) ? count : LIST_VIS;
-
     Gfx_Begin(EOS_BG); Ui_Backdrop();
     Ui_TitleBar(title);
-    x = (g_scrW - w) / 2;
-    for (i = 0; i < shown; ++i) {
-        y = 110 + i * UI_ROW_DY;
-        Ui_PillCentered(x, y, w, UI_PILL_H, UI_PILL_R, (top + i) == sel, items[top + i]);
-    }
     if (count == 0)
-        Font_DrawCentered(0, g_scrW, 150, "(nothing here yet)", EOS_DIM);
+        Font_DrawCentered(0, g_scrW, 220, "(nothing here yet)", EOS_DIM);
+    else
+        Ui_Menu3D(items, count, sel);             // shared 3D perspective list
     if (s_status[0] && GetTickCount() < s_statusUntil)
-        Font_DrawCentered(0, g_scrW, 110 + (shown + (count == 0)) * UI_ROW_DY + 12, s_status, EOS_PURPLE);
+        Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
     Ui_Footer("D-PAD  MOVE      A  SELECT      B  BACK");
     Gfx_End();
 }
@@ -375,16 +377,39 @@ static void DoBackupEeprom(void)
 
 static void Tools_Frame(WORD b)             // top level: tool categories
 {
-    static const char* cats[4] = { "EEPROM", "Firmware", "HDD", "Format" };
+    static const char* cats[5] = { "EEPROM", "Firmware", "HDD", "Format", "Clear Settings" };
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_MENU); return; }
-    s_toolSel = navSel(b, s_toolSel, 4);
+    s_toolSel = navSel(b, s_toolSel, 5);
     if (Pressed(b, s_prevBtn, BTN_A)) {
         if (s_toolSel == 0) { s_eeToolSel = 0; GotoPhase(PH_EE_TOOLS); }
         else if (s_toolSel == 1) { s_fwToolSel = 0; GotoPhase(PH_FW_TOOLS); }
         else if (s_toolSel == 2) { HddTools_Enter(); }
-        else { Format_Enter(); }
+        else if (s_toolSel == 3) { Format_Enter(); }
+        else { GotoPhase(PH_CLEARCFG); }
     }
-    listScreen("Tools", cats, 4, s_toolSel);
+    listScreen("Tools", cats, 5, s_toolSel);
+}
+
+// Clear the two config banks (bank table 0xB + settings 0xC) back to factory.
+static void ClearCfg_Frame(WORD b)
+{
+    if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_TOOLS); return; }
+    if (Pressed(b, s_prevBtn, BTN_A)) {
+        int rc = Config_ClearAll();      // erase 0xB + 0xC, reset theme
+        Bank_ResetToFactory();           // reset live bank table so it isn't re-saved stale
+        Theme_Init();                    // re-apply the default theme now
+        SetStatus(rc == EOS_FLASH_OK ? "User settings cleared" : "Clear FAILED -- flash error");
+        GotoPhase(PH_TOOLS);
+        return;
+    }
+    Gfx_Begin(EOS_BG); Ui_Backdrop();
+    Ui_TitleBar("Clear User Settings");
+    Font_DrawCentered(0, g_scrW, 120, "Resets the bank table and settings", EOS_WHITE);
+    Font_DrawCentered(0, g_scrW, 148, "(config banks 0xB + 0xC) to factory.", EOS_DIM);
+    Font_DrawCentered(0, g_scrW, 196, "Bank names + saved settings are wiped.", EOS_PURPLE);
+    Font_DrawCentered(0, g_scrW, 224, "Flashed BIOS images are NOT touched.", EOS_DIM);
+    Font_DrawCentered(0, g_scrW, 300, "A = CLEAR      B = CANCEL", EOS_WHITE);
+    Gfx_End();
 }
 
 static void EeTools_Frame(WORD b)           // EEPROM: Backup / Restore
@@ -476,7 +501,7 @@ static void EeRestore_Frame(WORD b)
         Ui_PillCentered(x, y, w, UI_PILL_H, UI_PILL_R, i == s_eeSel, s_eeNames[i]);
     }
     if (s_status[0] && GetTickCount() < s_statusUntil)
-        Font_DrawCentered(0, g_scrW, g_scrH - 80, s_status, EOS_PURPLE);
+        Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
     Ui_Footer("D-PAD  MOVE      A  SELECT      B  BACK");
     Gfx_End();
 }
@@ -523,7 +548,7 @@ static void EeConfirm_Frame(WORD b)
 // E:\Eos\Backups\Firmware. Restore is size-matched to the target bank, erases,
 // programs, verifies every page, syncs, then marks the bank occupied + saves.
 // ---------------------------------------------------------------------------
-#define FW_LIST_MAX 24
+#define FW_LIST_MAX 64
 static char s_fwNames[FW_LIST_MAX][64];
 static int  s_fwCount = 0;
 static int  s_fwBankSel = 0;   // backup: source bank
@@ -579,7 +604,16 @@ static void FwRestPick_Frame(WORD b)
         s_fwTgtSel = 0; GotoPhase(PH_FW_RTARGET);
     }
     for (i = 0; i < s_fwCount; ++i) items[i] = s_fwNames[i];
-    listScreen("Restore Firmware", items, s_fwCount, s_fwFileSel);
+    {
+        char ttl[40]; int tp = 0;
+        const char* t = "Restore FW: ";
+        while (t[tp] && tp < 30) { ttl[tp] = t[tp]; tp++; }
+        if (s_fwCount >= 10) ttl[tp++] = (char)('0' + (s_fwCount / 10) % 10);
+        ttl[tp++] = (char)('0' + s_fwCount % 10);
+        ttl[tp++] = ' '; ttl[tp++] = 'f'; ttl[tp++] = 'i'; ttl[tp++] = 'l';
+        ttl[tp++] = 'e'; ttl[tp++] = 's'; ttl[tp] = 0;
+        listScreen(ttl, items, s_fwCount, s_fwFileSel);
+    }
 }
 
 static void FwRestTarget_Frame(WORD b)
@@ -590,6 +624,23 @@ static void FwRestTarget_Frame(WORD b)
     s_fwTgtSel = navSel(b, s_fwTgtSel, n);
     if (Pressed(b, s_prevBtn, BTN_A) && n > 0) GotoPhase(PH_FW_RCONFIRM);
     listScreen("Restore to bank", names, n, s_fwTgtSel);
+}
+
+// Pull the <name> out of "fw_<name>_<ef>_<size>_NN.bin" (strips the fw_ prefix,
+// the .bin extension, and the trailing _<ef>_<size>_<NN> fields).
+static void FwNameFromFile(const char* file, char* out, int outLen)
+{
+    int len = 0, start = 0, end, cuts, i, o, p;
+    while (file[len]) ++len;
+    if (file[0] == 'f' && file[1] == 'w' && file[2] == '_') start = 3;
+    end = len;
+    if (end >= 4 && file[end - 4] == '.') end -= 4;          // strip ".bin"
+    for (i = end - 1, cuts = 0; i > start && cuts < 3; --i)  // strip _ef_size_NN
+        if (file[i] == '_') { end = i; ++cuts; }
+    o = 0;
+    for (p = start; p < end && o < outLen - 1; ++p) out[o++] = file[p];
+    out[o] = 0;
+    if (o == 0) { out[0] = 0; }                              // fallback: empty -> keeps old name
 }
 
 static void FwRestConfirm_Frame(WORD b)
@@ -605,14 +656,23 @@ static void FwRestConfirm_Frame(WORD b)
         if (!match) { SetStatus("Size mismatch -- refused"); GotoPhase(PH_FW_TOOLS); return; }
         rc = Firmware_RestoreBank(s_fwFile, s_fwTgtSel);
         if (rc == FW_OK) {
+            char fwnm[EOS_BANK_NAMELEN];
             Bank_SetOccupied(s_fwTgtSel, 1, code);
+            // Apply the bank name from the restored file, then persist it.
+            FwNameFromFile(s_fwFile, fwnm, EOS_BANK_NAMELEN);
+            if (fwnm[0]) Bank_SetName(s_fwTgtSel, fwnm);
             Config_Save();
-            SetStatus("Firmware restored + verified");
+            SetStatus("Restored -- name the bank");
+            s_renameTarget = s_fwTgtSel;
+            s_renameReturn = PH_FW_TOOLS;
+            Osk_Open(OSK_TEXT, Bank_Name(s_fwTgtSel), EOS_BANK_NAMELEN - 1);  // pre-filled, editable
+            GotoPhase(PH_RENAME);
+            return;
         }
-        else if (rc == FW_ERR_VERIFY) SetStatus("Restore FAILED -- verify mismatch");
-        else if (rc == FW_ERR_FLASH)    SetStatus("Restore FAILED -- flash error");
-        else if (rc == FW_ERR_SIZE)     SetStatus("Restore FAILED -- size mismatch");
-        else                            SetStatus("Restore FAILED -- file error");
+        if (rc == FW_ERR_VERIFY)      SetStatus("Restore FAILED -- verify mismatch");
+        else if (rc == FW_ERR_FLASH)  SetStatus("Restore FAILED -- flash error");
+        else if (rc == FW_ERR_SIZE)   SetStatus("Restore FAILED -- size mismatch");
+        else                          SetStatus("Restore FAILED -- file error");
         GotoPhase(PH_FW_TOOLS);
         return;
     }
@@ -821,8 +881,7 @@ static void FormatConfirm_Frame(WORD b)     /* final armed confirm */
 static void BankMgmt_Frame(WORD b)
 {
     int  n = Bank_Count();
-    int  listY, i;
-    char row[64];
+    int  i;
 
     if (s_mgmtSel >= n) s_mgmtSel = (n > 0) ? n - 1 : 0;
 
@@ -836,8 +895,8 @@ static void BankMgmt_Frame(WORD b)
 
     if (Pressed(b, s_prevBtn, BTN_X)) {
         // Delete (erase) -- occupied, non-boot banks only -> confirm first.
-        if (Bank_IsBoot(s_mgmtSel)) {
-            SetStatus("Cannot delete boot bank");
+        if (Bank_IsLocked(s_mgmtSel)) {
+            SetStatus("Cannot delete locked bank");
         }
         else if (!Bank_Occupied(s_mgmtSel)) {
             SetStatus("Bank already empty");
@@ -855,8 +914,8 @@ static void BankMgmt_Frame(WORD b)
     }
     if (Pressed(b, s_prevBtn, BTN_A)) {
         // Flash a BIOS into this bank -> browse for an image file.
-        if (Bank_IsBoot(s_mgmtSel)) {
-            SetStatus("Cannot flash boot bank");
+        if (Bank_IsLocked(s_mgmtSel)) {
+            SetStatus("Cannot flash locked bank");
         }
         else {
             s_flashTarget = s_mgmtSel;
@@ -868,11 +927,12 @@ static void BankMgmt_Frame(WORD b)
     }
     if (Pressed(b, s_prevBtn, BTN_Y)) {
         // Rename this bank via the on-screen keyboard.
-        if (Bank_IsBoot(s_mgmtSel)) {
-            SetStatus("Cannot rename boot bank");
+        if (Bank_IsLocked(s_mgmtSel)) {
+            SetStatus("Cannot rename locked bank");
         }
         else {
             s_renameTarget = s_mgmtSel;
+            s_renameReturn = PH_BANKMGMT;
             Osk_Open(OSK_TEXT, Bank_Name(s_mgmtSel), EOS_BANK_NAMELEN - 1);
             GotoPhase(PH_RENAME);
             return;
@@ -882,20 +942,18 @@ static void BankMgmt_Frame(WORD b)
     Gfx_Begin(EOS_BG); Ui_Backdrop();
     Ui_TitleBar("BANK MANAGEMENT");
 
-    listY = 116;
     {
-        int w = 480, x = (g_scrW - w) / 2, dy = 38, ph = 30, pr = 15;
-        for (i = 0; i < n; ++i) {
-            int y = listY + i * dy;
-            buildMgmtRow(row, i);
-            Ui_PillCentered(x, y, w, ph, pr, i == s_mgmtSel, row);
-        }
+        static char rows[EOS_BANK_MAX][64];
+        const char* ptrs[EOS_BANK_MAX];
+        int cap = (n < EOS_BANK_MAX) ? n : EOS_BANK_MAX;
+        for (i = 0; i < cap; ++i) { buildMgmtRow(rows[i], i); ptrs[i] = rows[i]; }
+        Ui_Menu3D(ptrs, cap, s_mgmtSel);
     }
 
-    Font_DrawCentered(0, g_scrW, g_scrH - 78,
+    Font_DrawCentered(0, g_scrW, g_scrH - 66,
         "A = FLASH   X = DELETE   Y = RENAME   B = BACK", EOS_DIM);
     if (s_status[0] && GetTickCount() < s_statusUntil)
-        Font_DrawCentered(0, g_scrW, g_scrH - 50, s_status, EOS_PURPLE);
+        Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
     Gfx_End();
 }
 
@@ -974,7 +1032,7 @@ static void DoFlash(int idx, const char* path)
     int  cap, got, rc, sc, n, s;
     char nm[EOS_BANK_NAMELEN];
 
-    if (idx < 0 || Bank_IsBoot(idx)) { SetStatus("Protected bank"); return; }
+    if (idx < 0 || Bank_IsLocked(idx)) { SetStatus("Protected bank"); return; }
 
     cap = Bank_CapacityBytes(idx);
     if (cap > EOS_IMG_BUF_MAX) cap = EOS_IMG_BUF_MAX;
@@ -1012,7 +1070,10 @@ static void Browse_Frame(WORD b)
             s_browseSel = (s_browseSel + 1) % s_entCount;
     }
     if (Pressed(b, s_prevBtn, BTN_B)) {
-        if (s_browsePath[0] == 0) { GotoPhase(PH_BANKMGMT); return; }  // drive list -> back
+        if (s_browsePath[0] == 0) {
+            if (s_browseSong) { s_browseSong = 0; GotoPhase(PH_SETTINGS); return; }
+            GotoPhase(PH_BANKMGMT); return;                             // drive list -> back
+        }
         browseUp();
     }
     if (s_entCount > 0 && Pressed(b, s_prevBtn, BTN_A)) {
@@ -1021,6 +1082,13 @@ static void Browse_Frame(WORD b)
             browseInto(e->name);
         }
         else {
+            if (s_browseSong) {
+                buildFullPath(s_flashPath, e->name);   // reuse as path scratch
+                Config_SetBgmPath(s_flashPath);        // persist the selected track
+                s_browseSong = 0;
+                GotoPhase(PH_SETTINGS);                // re-lands on THEME (s_returnTheme)
+                return;
+            }
             // file selected -> confirm flashing it into the target bank
             int p;
             buildFullPath(s_flashPath, e->name);
@@ -1081,14 +1149,45 @@ static void Rename_Frame(WORD b)
             Bank_SetName(s_renameTarget, name);
             SetStatus(Config_Save() == EOS_FLASH_OK ? "Renamed" : "Renamed; cfg save FAILED");
         }
-        GotoPhase(PH_BANKMGMT);
+        GotoPhase(s_renameReturn);
         return;
     }
-    if (r == -1) { GotoPhase(PH_BANKMGMT); return; }
+    if (r == -1) { GotoPhase(s_renameReturn); return; }
 
     Gfx_Begin(EOS_BG); Ui_Backdrop();
     Osk_Draw();
     Gfx_End();
+}
+
+// Start / stop / restart background music to match the persisted settings.
+// Called at boot and on leaving Settings -- NOT per frame (StartMusic is heavy).
+static void audioSync(void)
+{
+    static int  s_aReady = 0;
+    static char s_aPath[EOS_BGM_PATH_MAX] = { 0 };
+    int on = Config_GetBgmOn();
+    const char* path = Config_GetBgmPath();
+    int i;
+
+    if (!s_aReady) { if (!Audio_Init()) return; s_aReady = 1; }
+
+    if (on && path[0]) {
+        int changed = 0;
+        for (i = 0; i < EOS_BGM_PATH_MAX - 1; ++i) {
+            if (s_aPath[i] != path[i]) { changed = 1; break; }
+            if (!path[i]) break;
+        }
+        if (!Audio_MusicPlaying() || changed) {
+            Audio_SetMusicPath(path);
+            Audio_StartMusic(1);
+            for (i = 0; i < EOS_BGM_PATH_MAX - 1 && path[i]; ++i) s_aPath[i] = path[i];
+            s_aPath[i] = 0;
+        }
+    }
+    else {
+        if (Audio_MusicPlaying()) Audio_StopMusic();
+        s_aPath[0] = 0;
+    }
 }
 
 void __cdecl main() {
@@ -1098,6 +1197,7 @@ void __cdecl main() {
     File_MountDrives();  // bind HDD partitions so E:/F:/... resolve for browsing
     Config_Load();       // pull persisted bank table from the Eos config bank
     Theme_Init();        // apply the saved theme (recolors the whole UI)
+    audioSync();         // start background music if enabled in settings
     // (exercises the real read path; graceful on fresh chip)
     Net_Start();         // bring the network up; DHCP resolves over the next frames
     Ftp_Init();          // FTP service: deferred bind once the link resolves
@@ -1119,6 +1219,7 @@ void __cdecl main() {
         if (!Net_IsUp() && Http_IsUp()) Http_Stop();
         Http_Poll();
         Ftp_Tick();   // FTP service (start/stop tracks the link internally)
+        Audio_Update();   // service the DirectSound mixer (required every frame)
 
         if (s_phase == PH_SPLASH)   Splash_Frame(b);
         else if (s_phase == PH_BANKSEL)  BankSel_Frame(b);
@@ -1137,13 +1238,21 @@ void __cdecl main() {
         else if (s_phase == PH_HDD_INFO)    HddInfo_Frame(b);
         else if (s_phase == PH_FORMAT)         Format_Frame(b);
         else if (s_phase == PH_FORMAT_CONFIRM) FormatConfirm_Frame(b);
+        else if (s_phase == PH_CLEARCFG)       ClearCfg_Frame(b);
         else if (s_phase == PH_EE_RESTORE) EeRestore_Frame(b);
         else if (s_phase == PH_EE_CONFIRM) EeConfirm_Frame(b);
         else if (s_phase == PH_ABOUT)    About_Frame(b);
         else if (s_phase == PH_SETTINGS) {
             Gfx_Begin(EOS_BG); Ui_Backdrop();
             Gfx_SetFilter(FALSE);                 // POINT sampling for text/menu
-            if (Settings_Frame(b, s_prevBtn)) GotoPhase(PH_MENU);
+            {
+                int sr = Settings_Frame(b, s_prevBtn);
+                if (sr == 1) { GotoPhase(PH_MENU); audioSync(); }
+                else if (sr == 2) {   // THEME -> pick a background-music track
+                    s_browseSong = 1; s_browsePath[0] = 0; browseRefresh();
+                    GotoPhase(PH_BROWSE);
+                }
+            }
             Gfx_End();
         }
         else                             Menu_Frame(b);

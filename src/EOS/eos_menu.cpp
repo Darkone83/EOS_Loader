@@ -54,15 +54,9 @@ int Menu_Step(WORD now, WORD prev)
 
 void Menu_Draw()
 {
-    int i, y, x, w;
-    Splash_Draw(g_scrW / 2, 70, 96, EOS_WHITE);   // logo header (no title pill)
+    Splash_Draw(g_scrW / 2, 62, 84, EOS_WHITE);   // logo header (headroom for the column)
 
-    w = 360;
-    x = (g_scrW - w) / 2;
-    for (i = 0; i < EOS_MENU_COUNT; ++i) {
-        y = ROW_Y0 + i * UI_ROW_DY;
-        Ui_PillCentered(x, y, w, UI_PILL_H, UI_PILL_R, i == s_sel, s_items[i]);
-    }
+    Ui_Menu3D(s_items, EOS_MENU_COUNT, s_sel);     // shared 3D perspective menu
 
     Ui_Footer("D-PAD  MOVE      A  SELECT");
 }

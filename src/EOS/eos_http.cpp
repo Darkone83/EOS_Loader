@@ -5,6 +5,7 @@
 #include "eos_bank.h"
 #include "eos_config.h"
 #include "eos_flash.h"
+#include "eos_eeprom_io.h"
 #include "eos_logo_data.h"   // EOS_LOGO_W/H, EOS_LOGO_PAL[15][3], EOS_LOGO_4BPP[]
 
 #define HTTP_PORT      80
@@ -16,7 +17,7 @@
 
 enum { ST_IDLE = 0, ST_HDR, ST_BODY, ST_SEND };
 enum { M_GET = 0, M_POST };
-enum { R_NONE = 0, R_PAGE, R_LOGO, R_BANKS, R_RENAME, R_DELETE, R_FLASH, R_LAUNCH };
+enum { R_NONE = 0, R_PAGE, R_LOGO, R_BANKS, R_RENAME, R_DELETE, R_FLASH, R_LAUNCH, R_EEPROM, R_RESET };
 
 static SOCKET s_listen = INVALID_SOCKET;
 static SOCKET s_conn = INVALID_SOCKET;
@@ -99,7 +100,8 @@ static const char* k_page =
 "#msg.show{opacity:1;}\n"
 "</style></head><body>\n"
 "<header><img src='/logo.bmp' alt=''><div><h1>EOS</h1><div class=sub>BIOS bank manager</div></div></header>\n"
-"<div class=grid id=grid></div><div id=msg></div>\n"
+"<div class=grid id=grid></div>\n"
+"<div class=grid id=sys></div><div id=msg></div>\n"
 "<script>\n"
 "const SZ=['256K','512K','1MB'];\n"
 "function msg(t){let m=document.getElementById('msg');m.textContent=t;m.classList.add('show');setTimeout(function(){m.classList.remove('show');},2500);}\n"
@@ -139,6 +141,37 @@ static const char* k_page =
 "async function ren(i,cur){let n=prompt('Bank name:',cur);if(n==null)return;await fetch('/api/rename?b='+i,{method:'POST',body:n});msg('Renamed');load();}\n"
 "async function del(i){if(!confirm('Delete this bank?'))return;await fetch('/api/delete?b='+i,{method:'POST'});msg('Deleted');load();}\n"
 "async function go(i){if(!confirm('Launch this bank? The console will reboot.'))return;fetch('/api/launch?b='+i,{method:'POST'});msg('Launching...');}\n"
+"async function eeBackup(){\n"
+" let r=await fetch('/api/eeprom');\n"
+" if(!r.ok){msg('EEPROM read failed');return;}\n"
+" let b=await r.blob();let u=URL.createObjectURL(b);\n"
+" let a=document.createElement('a');a.href=u;a.download='eeprom.bin';a.click();\n"
+" URL.revokeObjectURL(u);msg('EEPROM backed up');\n"
+"}\n"
+"let ei=document.createElement('input');ei.type='file';ei.accept='.bin';\n"
+"ei.onchange=async function(){\n"
+" let f=ei.files[0];if(!f)return;\n"
+" if(!confirm('Restore this EEPROM? It overwrites the console EEPROM.'))return;\n"
+" let buf=await f.arrayBuffer();\n"
+" let r=await fetch('/api/eeprom',{method:'POST',body:buf});\n"
+" msg(r.ok?'EEPROM restored':'Restore failed: '+(await r.text()));\n"
+"};\n"
+"function eeRestore(){ei.value='';ei.click();}\n"
+"async function resetSettings(){\n"
+" if(!confirm('Reset loader settings to defaults? Banks are not touched.'))return;\n"
+" await fetch('/api/reset',{method:'POST'});msg('Settings reset');\n"
+"}\n"
+"function sysCard(){\n"
+" let c=document.createElement('div');c.className='card';\n"
+" let h=document.createElement('h2');h.textContent='System';c.appendChild(h);\n"
+" let bd=document.createElement('span');bd.className='badge';bd.textContent='EEPROM / SETTINGS';c.appendChild(bd);\n"
+" let row=document.createElement('div');row.className='row';\n"
+" row.appendChild(btn('Backup EEPROM','',eeBackup));\n"
+" row.appendChild(btn('Restore EEPROM','',eeRestore));\n"
+" row.appendChild(btn('Reset Settings','danger',resetSettings));\n"
+" c.appendChild(row);return c;\n"
+"}\n"
+"document.getElementById('sys').appendChild(sysCard());\n"
 "load();\n"
 "</script></body></html>\n";
 
@@ -241,6 +274,8 @@ static void parseReq(void)
     else if (strEqN(path, "/api/delete", 11)) s_route = R_DELETE;
     else if (strEqN(path, "/api/flash", 10)) s_route = R_FLASH;
     else if (strEqN(path, "/api/launch", 11)) s_route = R_LAUNCH;
+    else if (strEqN(path, "/api/eeprom", 11)) s_route = R_EEPROM;
+    else if (strEqN(path, "/api/reset", 10))  s_route = R_RESET;
     else if (strEqN(path, "/logo.bmp", 9)) s_route = R_LOGO;
     else if (path[0] == '/' && (path[1] == ' ' || path[1] == '?')) s_route = R_PAGE;
 
@@ -304,6 +339,22 @@ static void process(void)
         s_launch = s_bank;                 // warm-reset after the response is flushed
         respondText("200 OK", "launching"); return;
     }
+    if (s_route == R_EEPROM) {
+        if (s_method == M_GET) {
+            if (Eeprom_ReadImage(s_rx) != EOS_EE_OK) { respondText("500 Error", "eeprom read failed"); return; }
+            respond("200 OK", "application/octet-stream", (const char*)s_rx, EOS_EEPROM_SIZE);
+            return;
+        }
+        if (s_err == 400) { respondText("400 Bad Request", "eeprom must be 256 bytes"); return; }
+        if (s_rxStore != EOS_EEPROM_SIZE) { respondText("400 Bad Request", "short image"); return; }
+        if (Eeprom_ImageValid(s_rx) != EOS_EE_OK) { respondText("400 Bad Request", "invalid eeprom image"); return; }
+        if (Eeprom_WriteImage(s_rx) != EOS_EE_OK) { respondText("500 Error", "eeprom write failed"); return; }
+        respondText("200 OK", "ok"); return;
+    }
+    if (s_route == R_RESET) {
+        Config_ResetSettings();
+        respondText("200 OK", "settings reset"); return;
+    }
     respondText("404 Not Found", "not found");
 }
 
@@ -323,6 +374,9 @@ static void beginBody(void)
         if (cap > HTTP_RX_MAX) cap = HTTP_RX_MAX;
         if (s_clen > cap) { s_err = 413; s_store = 0; }   // drain then 413
     }
+    else if (s_route == R_EEPROM) {
+        if (s_clen != EOS_EEPROM_SIZE) { s_err = 400; s_store = 0; }   // EEPROM image is exactly 256B
+    }
     else if (s_route == R_RENAME) {
         // cap to the name buffer; extra drained
     }
@@ -336,8 +390,8 @@ static void stashBody(const char* src, int len)
 {
     int cap, room, i;
     if (!s_store) { s_rxRecv += len; return; }
-    if (s_route == R_FLASH) {
-        cap = HTTP_RX_MAX;
+    if (s_route == R_FLASH || s_route == R_EEPROM) {
+        cap = (s_route == R_EEPROM) ? EOS_EEPROM_SIZE : HTTP_RX_MAX;
         room = cap - s_rxStore; if (room > len) room = len;
         for (i = 0; i < room; ++i) s_rx[s_rxStore + i] = (unsigned char)src[i];
         s_rxStore += room;

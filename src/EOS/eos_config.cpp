@@ -22,12 +22,25 @@
 #define CFG_VERIFY_FAIL (-2)
 
 #define BANKS_VER   1
-#define SET_VER     1
+#define SET_VER     2
 #define OLD_SET_OFF 240           /* theme offset in the legacy combined "EOSC" page */
 
 static int s_themeIdx = 0;        /* cached setting, loaded by Config_Load */
+static int s_bgmOn = 0;        /* background music enabled */
+static char s_bgmPath[EOS_BGM_PATH_MAX] = { 0 };  /* selected track path */
 
 int Config_GetThemeIdx(void) { return s_themeIdx; }
+
+int         Config_GetBgmOn(void) { return s_bgmOn ? 1 : 0; }
+const char* Config_GetBgmPath(void) { return s_bgmPath; }
+void Config_SetBgmOn(int on) { s_bgmOn = on ? 1 : 0; Config_SaveSettings(); }
+void Config_SetBgmPath(const char* path)
+{
+    int i = 0;
+    if (path) for (; path[i] && i < EOS_BGM_PATH_MAX - 1; ++i) s_bgmPath[i] = path[i];
+    s_bgmPath[i] = 0;
+    Config_SaveSettings();
+}
 
 // --- shared helpers ----------------------------------------------------------
 static void putSum(unsigned char* buf)
@@ -140,9 +153,37 @@ int Config_SaveSettings(void)
     for (i = 0; i < 256; ++i) buf[i] = 0;
     buf[0] = 'E'; buf[1] = 'O'; buf[2] = 'S'; buf[3] = 'S';
     buf[4] = SET_VER;
-    buf[5] = (unsigned char)s_themeIdx;            /* [6..253] reserved for future */
+    buf[5] = (unsigned char)s_themeIdx;
+    buf[6] = (unsigned char)s_bgmOn;               /* background music on/off */
+    {
+        int i = 0;
+        while (s_bgmPath[i] && i < EOS_BGM_PATH_MAX - 1) { buf[7 + i] = (unsigned char)s_bgmPath[i]; ++i; }
+        buf[7 + i] = 0;                            /* NUL-terminated track path [7..253] */
+    }
     putSum(buf);
     return writePage(EOS_SETTINGS_BANK, buf);
+}
+
+// Reset ONLY the user settings (theme, background track, ...) to defaults and
+// persist to the settings bank (0xC). Unlike Config_ClearAll this leaves the
+// bank table (0xB) untouched, so a settings reset never disturbs flashed BIOSes.
+int Config_ResetSettings(void)
+{
+    s_themeIdx = 0;
+    s_bgmOn = 0;
+    s_bgmPath[0] = 0;
+    return Config_SaveSettings();
+}
+
+// Erase BOTH config banks back to blank (bank table 0xB + settings 0xC) and
+// reset the in-memory theme. Caller should also reset the in-memory bank table
+// via Bank_ResetToFactory() so a later save can't write the stale table back.
+int Config_ClearAll(void)
+{
+    int r1 = Flash_EraseBank(EOS_CONFIG_BANK);
+    int r2 = Flash_EraseBank(EOS_SETTINGS_BANK);
+    s_themeIdx = 0;
+    return (r1 == EOS_FLASH_OK && r2 == EOS_FLASH_OK) ? EOS_FLASH_OK : -1;
 }
 
 // Load settings from 0xC. If absent (blank/new), keep whatever Config_LoadBanks
@@ -157,6 +198,12 @@ static void loadSettings(void)
     if (buf[4] < 1 || !sumOk(buf)) return;
     s_themeIdx = buf[5];
     if (s_themeIdx < 0 || s_themeIdx > CFG_THEME_MAX) s_themeIdx = 0;
+    if (buf[4] >= 2) {
+        int i;
+        s_bgmOn = buf[6] ? 1 : 0;
+        for (i = 0; i < EOS_BGM_PATH_MAX - 1 && buf[7 + i]; ++i) s_bgmPath[i] = (char)buf[7 + i];
+        s_bgmPath[i] = 0;
+    }
 }
 
 void Config_SetThemeIdx(int idx)

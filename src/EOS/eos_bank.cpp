@@ -10,6 +10,7 @@
 // RXDK / MSVC2003 constraints: declarations before statements, file-scope
 // statics, no CRT string funcs.
 #include "eos_bank.h"
+#include "eos_flash.h"
 
 struct EosBank {
     unsigned char ef;
@@ -17,6 +18,7 @@ struct EosBank {
     char          defname[EOS_BANK_NAMELEN];   // factory label, restored on clear
     unsigned char occupied;
     unsigned char size_code;
+    unsigned char locked;      // 1 = system bank: no user delete / flash / rename
 };
 
 static EosBank s_banks[EOS_BANK_MAX];
@@ -29,7 +31,8 @@ static void copyName(char* dst, const char* src)
     dst[i] = 0;
 }
 
-static void addBank(unsigned char ef, const char* nm, unsigned char occ, unsigned char sz)
+static void addBank(unsigned char ef, const char* nm, unsigned char occ, unsigned char sz,
+    unsigned char lock)
 {
     if (s_count >= EOS_BANK_MAX) return;
     s_banks[s_count].ef = ef;
@@ -37,6 +40,7 @@ static void addBank(unsigned char ef, const char* nm, unsigned char occ, unsigne
     copyName(s_banks[s_count].defname, nm);   // remember the factory label
     s_banks[s_count].occupied = occ;
     s_banks[s_count].size_code = sz;
+    s_banks[s_count].locked = lock;
     ++s_count;
 }
 
@@ -45,12 +49,18 @@ static void ensureInit(void)
     if (s_count) return;
     // Default bank set. Config_Load overrides names/occupancy/size from the Eos
     // flash config bank when a valid record is present.
-    addBank(0x1, "EOS Loader", 1, EOS_BANK_SIZE_256K);  // boot bank (this menu)
-    addBank(0x3, "Bank 1", 0, EOS_BANK_SIZE_256K);  // user 256K @ virtual 0x000000
-    addBank(0x4, "Bank 2", 0, EOS_BANK_SIZE_256K);  // user 256K @ virtual 0x040000
-    addBank(0x5, "Bank 3", 0, EOS_BANK_SIZE_256K);  // user 256K @ virtual 0x080000
-    addBank(0x6, "Bank 4", 0, EOS_BANK_SIZE_256K);  // user 256K @ virtual 0x0C0000
-    addBank(0xA, "Recovery", 1, EOS_BANK_SIZE_256K);  // recovery   @ virtual 0x1C0000
+    addBank(0x1, "EOS Loader", 1, EOS_BANK_SIZE_256K, 1);  // boot bank (this menu)
+    addBank(0x3, "Bank 1", 0, EOS_BANK_SIZE_256K, 0);  // user 256K @ virtual 0x000000
+    addBank(0x4, "Bank 2", 0, EOS_BANK_SIZE_256K, 0);  // user 256K @ virtual 0x040000
+    addBank(0x5, "Bank 3", 0, EOS_BANK_SIZE_256K, 0);  // user 256K @ virtual 0x080000
+    addBank(0x6, "Bank 4", 0, EOS_BANK_SIZE_256K, 0);  // user 256K @ virtual 0x0C0000
+    addBank(0xA, "Recovery", 1, EOS_BANK_SIZE_256K, 1);  // recovery   @ virtual 0x1C0000
+}
+
+void Bank_ResetToFactory(void)
+{
+    s_count = 0;     // drop the live table, re-add the default bank set
+    ensureInit();
 }
 
 int Bank_Count(void) { ensureInit(); return s_count; }
@@ -114,6 +124,13 @@ int Bank_IsBoot(int idx)
     ensureInit();
     if (idx < 0 || idx >= s_count) return 0;
     return (s_banks[idx].ef == 0x1) ? 1 : 0;
+}
+
+int Bank_IsLocked(int idx)
+{
+    ensureInit();
+    if (idx < 0 || idx >= s_count) return 1;   // out-of-range treated as locked (safe)
+    return s_banks[idx].locked ? 1 : 0;
 }
 
 int Bank_LaunchCount(void)
@@ -228,6 +245,66 @@ void Bank_Launch(int idx)
     smbus_write_byte(0x10, 0x02, 0x01);
 
     // SMC pulls the reset within ~ms; spin so we never fall through
+    for (;;) {}
+}
+
+// Eos_TsopBoot -- release D0 and warm-reset so the box boots the onboard TSOP.
+// Sets the FPGA's persistent stock-boot bit (flash-cmd index 0x08 via 0xEC/0xED,
+// data bit0 = 1). That bit lives in the FPGA cold-reset domain, so it survives
+// the warm reset; D0 is released before the MCPX re-samples it and the console
+// boots stock instead of Eos. A COLD power cycle reconfigures the FPGA, clears
+// the bit, and Eos boots again -- one-shot and self-recovering. Does not return.
+void Eos_TsopBoot(void)
+{
+    volatile int s;
+
+    // 1) persistent stock-boot bit: 0xEC = index 0x08 (BOOT), 0xED = 0x01 (bit0)
+    io_out8(0x00EC, 0x08);
+    io_out8(0x00ED, 0x01);
+
+    // 2) settle so the LPC writes commit before the reset
+    for (s = 0; s < 200000; ++s) {}
+
+    // 3) same SMC warm reset Bank_Launch uses (PIC 0x10, cmd 0x02, 0x01 = warm)
+    smbus_write_byte(0x10, 0x02, 0x01);
+
+    for (;;) {}
+}
+
+// Bank_XbDiagPresent -- 1 if XbDiag Lite is installed in bank 0xD. Probes page 0
+// of the slot ONCE (cached): an all-0xFF page means blank / not installed. Gates
+// whether the launch menu shows XbDiag at all. If the FPGA bitstream lacks 0xD
+// support the read is refused and this returns 0 (XbDiag stays hidden).
+static int s_diagChecked = 0;
+static int s_diagPresent = 0;
+int Bank_XbDiagPresent(void)
+{
+    unsigned char pg[256];
+    int i, rc;
+    if (s_diagChecked) return s_diagPresent;
+    s_diagChecked = 1;
+    rc = Flash_ReadPage(0xD, 0, pg);
+    if (rc == EOS_FLASH_OK) {
+        for (i = 0; i < 256; ++i) {
+            if (pg[i] != 0xFF) { s_diagPresent = 1; break; }
+        }
+    }
+    return s_diagPresent;
+}
+
+// Eos_LaunchXbDiag -- page XbDiag Lite (bank 0xD) into the served SDRAM copy, then
+// select + SMC warm-reset into it. Flash_Sync blocks until the flash->SDRAM reload
+// finishes, so the image is resident before the MCPX reads it. Real banks skip this
+// (they live in the resident preload); XbDiag sits past it and is paged in on demand.
+// Does not return on hardware.
+void Eos_LaunchXbDiag(void)
+{
+    volatile int s;
+
+    Flash_Sync(0xD);                      // reload 0xD flash -> SDRAM, waits for done
+    io_out8(0x00EF, 0xD);                 // select for serve (persists across warm reset)
+    for (s = 0; s < 200000; ++s) {}
+    smbus_write_byte(0x10, 0x02, 0x01);   // SMC warm reset -> boots XbDiag
     for (;;) {}
 }
 

@@ -102,6 +102,9 @@
     <ClCompile Include="eos_fotmat.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="eos_audio.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Text Include="Media\Copy Assets Here.txt">
@@ -197,6 +200,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="eos_format.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="minimp3.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="eos_audio.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

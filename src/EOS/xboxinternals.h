@@ -141,7 +141,7 @@ typedef struct DRIVER_OBJECT
 {
 	const int16_t Type;
 	const int16_t Size;
-	struct _DEVICE_OBJECT *DeviceObject;
+	struct _DEVICE_OBJECT* DeviceObject;
 	// ...
 }
 DRIVER_OBJECT;
@@ -162,28 +162,28 @@ typedef struct STRING {
 } STRING;
 
 typedef struct {
-    BYTE        abSeed[20];                     // Last random seed
-    IN_ADDR     ina;                            // Static IP address (0 for DHCP)
-    IN_ADDR     inaMask;                        // Static IP subnet mask
-    IN_ADDR     inaGateway;                     // Static gateway IP address
-    IN_ADDR     inaDnsPrimary;                  // Static primary DNS server IP address
-    IN_ADDR     inaDnsSecondary;                // Static secondary DNS server IP address
-    char        achDhcpHostName[64];            // Host name for DHCP ("" means no host name)
-    char        achPppUserName[64];             // User name for PPPoE ("" means no PPPoE)
-    char        achPppPassword[64];             // User password for PPPoE
-    char        achPppServer[64];               // Server name for PPPoE ("" ok)
-    BYTE        abReserved[192];                // Reserved (makes structure 492 bytes)
-    DWORD       dwSigEnd;                       // XNET_CONFIG_PARAMS_SIGEND
+	BYTE        abSeed[20];                     // Last random seed
+	IN_ADDR     ina;                            // Static IP address (0 for DHCP)
+	IN_ADDR     inaMask;                        // Static IP subnet mask
+	IN_ADDR     inaGateway;                     // Static gateway IP address
+	IN_ADDR     inaDnsPrimary;                  // Static primary DNS server IP address
+	IN_ADDR     inaDnsSecondary;                // Static secondary DNS server IP address
+	char        achDhcpHostName[64];            // Host name for DHCP ("" means no host name)
+	char        achPppUserName[64];             // User name for PPPoE ("" means no PPPoE)
+	char        achPppPassword[64];             // User password for PPPoE
+	char        achPppServer[64];               // Server name for PPPoE ("" ok)
+	BYTE        abReserved[192];                // Reserved (makes structure 492 bytes)
+	DWORD       dwSigEnd;                       // XNET_CONFIG_PARAMS_SIGEND
 } XXNetConfigParams;
 
-typedef struct   
-{   
+typedef struct
+{
 	DWORD	Data_00;            // Check Block Start   
-	DWORD	Data_04;   
-	DWORD	Data_08;   
-	DWORD	Data_0c;   
+	DWORD	Data_04;
+	DWORD	Data_08;
+	DWORD	Data_0c;
 	DWORD	Data_10;            // Check Block End   
-  
+
 	DWORD	V1_IP;              // 0x14   
 	DWORD	V1_Subnetmask;      // 0x18   
 	DWORD	V1_Defaultgateway;  // 0x1c   
@@ -191,15 +191,15 @@ typedef struct
 	DWORD	V1_DNS2;            // 0x24   
 
 	DWORD	Data_28;            // Check Block Start   
-	DWORD	Data_2c;   
-	DWORD	Data_30;   
-	DWORD	Data_34;   
+	DWORD	Data_2c;
+	DWORD	Data_30;
+	DWORD	Data_34;
 	DWORD	Data_38;            // Check Block End   
 
 	DWORD	V2_Tag;             // V2 Tag "XBV2"   
- 
+
 	DWORD	Flag;				// 0x40   
-	DWORD	Data_44;   
+	DWORD	Data_44;
 
 	DWORD	V2_IP;              // 0x48   
 	DWORD	V2_Subnetmask;      // 0x4c   
@@ -207,7 +207,7 @@ typedef struct
 	DWORD	V2_DNS1;            // 0x54   
 	DWORD	V2_DNS2;            // 0x58   
 
-	DWORD   Data_xx[0x200-0x5c];
+	DWORD   Data_xx[0x200 - 0x5c];
 
 } XNetConfigParams;
 
@@ -215,14 +215,14 @@ typedef struct
 #define XDK_NETWORK_CONFIG_MANUAL_DNS 0x00000008
 
 typedef struct {
-    DWORD       dwFlags;                        // See XNET_STATUS_* below
-    IN_ADDR     ina;                            // IP address
-    IN_ADDR     inaMask;                        // IP subnet mask
-    IN_ADDR     inaGateway;                     // Gateway IP address
-    IN_ADDR     inaDnsPrimary;                  // Primary DNS server IP address
-    IN_ADDR     inaDnsSecondary;                // Secondary DNS server IP address
-    IN_ADDR     inaDhcpServer;                  // IP address of DHCP server
-    char        achPppServer[64][4];            // PPPoE concentrators discovered
+	DWORD       dwFlags;                        // See XNET_STATUS_* below
+	IN_ADDR     ina;                            // IP address
+	IN_ADDR     inaMask;                        // IP subnet mask
+	IN_ADDR     inaGateway;                     // Gateway IP address
+	IN_ADDR     inaDnsPrimary;                  // Primary DNS server IP address
+	IN_ADDR     inaDnsSecondary;                // Secondary DNS server IP address
+	IN_ADDR     inaDhcpServer;                  // IP address of DHCP server
+	char        achPppServer[64][4];            // PPPoE concentrators discovered
 } XNetConfigStatus;
 
 //typedef struct XNetConfigStatus
@@ -275,53 +275,53 @@ typedef struct {
 #define SMC_COMMAND_OVERRIDE_RESET_ON_TRAY_OPEN 0x19
 #define SMC_RESET_ON_TRAY_OPEN_NONSECURE_MODE 0x01
 
-typedef struct OBJECT_ATTRIBUTES 
+typedef struct OBJECT_ATTRIBUTES
 {
-    HANDLE RootDirectory;
-    STRING*	ObjectName;
-    ULONG Attributes;
+	HANDLE RootDirectory;
+	STRING* ObjectName;
+	ULONG Attributes;
 } OBJECT_ATTRIBUTES;
 
 typedef struct IO_STATUS_BLOCK {
-    union {
-        NTSTATUS Status;
-        PVOID Pointer;
-    };
-    ULONG_PTR Information;
-} IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
+	union {
+		NTSTATUS Status;
+		PVOID Pointer;
+	};
+	ULONG_PTR Information;
+} IO_STATUS_BLOCK, * PIO_STATUS_BLOCK;
 
 #define FAT_VOLUME_NAME_LENGTH          32
 #define FAT_ONLINE_DATA_LENGTH          2048
 typedef struct _FAT_VOLUME_METADATA {
-    ULONG Signature;
-    ULONG SerialNumber;
-    ULONG SectorsPerCluster;
-    ULONG RootDirFirstCluster;
-    WCHAR VolumeName[FAT_VOLUME_NAME_LENGTH];
-    UCHAR OnlineData[FAT_ONLINE_DATA_LENGTH];
-    // Unused space in the block is filled with 0xFF bytes.
-} FAT_VOLUME_METADATA, *PFAT_VOLUME_METADATA;
+	ULONG Signature;
+	ULONG SerialNumber;
+	ULONG SectorsPerCluster;
+	ULONG RootDirFirstCluster;
+	WCHAR VolumeName[FAT_VOLUME_NAME_LENGTH];
+	UCHAR OnlineData[FAT_ONLINE_DATA_LENGTH];
+	// Unused space in the block is filled with 0xFF bytes.
+} FAT_VOLUME_METADATA, * PFAT_VOLUME_METADATA;
 
 typedef enum _FSINFOCLASS {
-    FileFsVolumeInformation = 1,
-    FileFsLabelInformation,
-    FileFsSizeInformation,
-    FileFsDeviceInformation,
-    FileFsAttributeInformation,
-    FileFsControlInformation,
-    FileFsFullSizeInformation,
-    FileFsObjectIdInformation,
-    FileFsMaximumInformation
-} FS_INFORMATION_CLASS, *PFS_INFORMATION_CLASS;
+	FileFsVolumeInformation = 1,
+	FileFsLabelInformation,
+	FileFsSizeInformation,
+	FileFsDeviceInformation,
+	FileFsAttributeInformation,
+	FileFsControlInformation,
+	FileFsFullSizeInformation,
+	FileFsObjectIdInformation,
+	FileFsMaximumInformation
+} FS_INFORMATION_CLASS, * PFS_INFORMATION_CLASS;
 
 typedef struct _FILE_FS_SIZE_INFORMATION {
-    LARGE_INTEGER TotalAllocationUnits;
-    LARGE_INTEGER AvailableAllocationUnits;
-    ULONG SectorsPerAllocationUnit;
-    ULONG BytesPerSector;
-} FILE_FS_SIZE_INFORMATION, *PFILE_FS_SIZE_INFORMATION;
+	LARGE_INTEGER TotalAllocationUnits;
+	LARGE_INTEGER AvailableAllocationUnits;
+	ULONG SectorsPerAllocationUnit;
+	ULONG BytesPerSector;
+} FILE_FS_SIZE_INFORMATION, * PFILE_FS_SIZE_INFORMATION;
 
-typedef VOID (WINAPI *PIO_APC_ROUTINE) (PVOID ApcContext, IO_STATUS_BLOCK* IoStatusBlock, ULONG Reserved);
+typedef VOID(WINAPI* PIO_APC_ROUTINE) (PVOID ApcContext, IO_STATUS_BLOCK* IoStatusBlock, ULONG Reserved);
 
 #define InitializeObjectAttributes( p, n, a, r ) { \
     (p)->RootDirectory = r;                             \
@@ -329,7 +329,7 @@ typedef VOID (WINAPI *PIO_APC_ROUTINE) (PVOID ApcContext, IO_STATUS_BLOCK* IoSta
     (p)->ObjectName = n;                                \
     }
 
-extern "C" 
+extern "C"
 {
 	extern STRING* XeImageFileName;
 	extern STRING* HalDiskModelNumber;

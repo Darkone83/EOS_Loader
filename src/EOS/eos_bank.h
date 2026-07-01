@@ -20,6 +20,7 @@
 #define EOS_BANK_SIZE_512K 1
 #define EOS_BANK_SIZE_1MB  2
 
+void          Bank_ResetToFactory(void);  // reset live table to factory defaults
 int           Bank_Count(void);
 const char* Bank_Name(int idx);
 unsigned char Bank_Ef(int idx);            // 0xEF value for this bank (low nibble = bank)
@@ -35,6 +36,7 @@ void Bank_ClearEntry(int idx);
 
 // Launch list = populated banks, excluding the boot/loader bank we're in.
 int  Bank_IsBoot(int idx);                 // 1 = this is the boot/loader bank (0x1)
+int  Bank_IsLocked(int idx);               // 1 = system bank (boot/recovery/diag): no user manage
 int  Bank_LaunchCount(void);               // # of launchable (occupied, non-boot) banks
 int  Bank_LaunchIndex(int n);              // table index of the nth launchable bank, -1 if none
 
@@ -50,6 +52,18 @@ void Bank_SetResting(void);
 // Select the bank in the FPGA (0xEF write) then SMC warm-reset into it.
 // Does not return on real hardware.
 void Bank_Launch(int idx);
+
+// Release D0 (set the FPGA stock-boot bit at flash-cmd index 0x08) then SMC
+// warm-reset so the console boots the onboard TSOP instead of Eos. The bit
+// survives the warm reset; a COLD power cycle clears it and returns to Eos.
+// Does not return on real hardware.
+void Eos_TsopBoot(void);
+
+// XbDiag Lite (bank 0xD): shown in the launch menu only when installed. Launched
+// via a flash sync (page it into SDRAM) then select + warm reset -- not the plain
+// select a real bank uses.
+int  Bank_XbDiagPresent(void);             // 1 = XbDiag Lite installed in slot 0xD
+void Eos_LaunchXbDiag(void);               // sync 0xD -> select -> warm reset (no return)
 
 // --- diagnostics ---
 // Write a bank's 0xEF value WITHOUT resetting (so the FPGA bank reg + readback

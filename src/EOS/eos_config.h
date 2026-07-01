@@ -21,7 +21,17 @@ int Config_Save(void);
 
 // Serialize the SETTINGS block to bank 0xC. The bank table is untouched.
 int Config_SaveSettings(void);
+int Config_ClearAll(void);   // factory-reset both config banks
+int Config_ResetSettings(void);   // reset settings block (0xC) only; banks untouched
 
 // --- persisted loader settings (stored in the settings block, bank 0xC) ------
 int  Config_GetThemeIdx(void);
 void Config_SetThemeIdx(int idx);   // clamps, persists settings only
+
+// Background music (persisted in the settings block). Enable flag + one selected
+// track path. Setters persist immediately (settings bank only).
+#define EOS_BGM_PATH_MAX 224
+int         Config_GetBgmOn(void);
+void        Config_SetBgmOn(int on);
+const char* Config_GetBgmPath(void);
+void        Config_SetBgmPath(const char* path);

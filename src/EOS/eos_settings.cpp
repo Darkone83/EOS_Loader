@@ -18,6 +18,7 @@
 #include "eos_nvram.h"
 #include "eos_clock.h"
 #include "eos_theme.h"
+#include "eos_config.h"
 #include "dd_net.h"
 #include "input.h"
 
@@ -43,6 +44,8 @@ static int       s_sub = SUB_HUB;
 static int       s_sel = 0;
 static int       s_row = 0;            // row cursor inside an editor
 static int       s_themePreview = 0;
+static int       s_bgmWork = 0;   // working bg-music on/off (persisted on exit)
+static int       s_returnTheme = 0;   // 1 = re-enter THEME after the song browser
 static EosEeprom s_eep;
 static EosConsole s_con;
 static DWORD     s_vflags = 0;         // working video flags
@@ -98,7 +101,6 @@ static void rowPill(int y, int selected, int dim, const char* label, const char*
 // ---- hub -------------------------------------------------------------------
 static int hubFrame(WORD b, WORD prev)
 {
-    int i, y;
     if (Pressed(b, prev, BTN_DPAD_UP))   s_sel = (s_sel + HUB_COUNT - 1) % HUB_COUNT;
     if (Pressed(b, prev, BTN_DPAD_DOWN)) s_sel = (s_sel + 1) % HUB_COUNT;
     if (Pressed(b, prev, BTN_B)) return 1;
@@ -119,14 +121,12 @@ static int hubFrame(WORD b, WORD prev)
             s_vstdArm = 0; s_grArm = 0; s_regMsg = 0; break;
         case 4: s_sub = SUB_NETWORK; networkEnter(); break;
         case 5: s_sub = SUB_DATETIME; Clock_Get(&s_dt); s_dtField = 0; break;
-        case 6: s_sub = SUB_THEME; s_themePreview = Theme_Index(); break;
+        case 6: s_sub = SUB_THEME; s_themePreview = Theme_Index();
+            s_bgmWork = Config_GetBgmOn(); s_row = 0; break;
         }
     }
     titleBar("SETTINGS");
-    for (i = 0; i < HUB_COUNT; ++i) {
-        y = LIST_Y0 + i * LIST_DY;
-        rowPill(y, i == s_sel, 0, k_hub[i], 0);
-    }
+    Ui_Menu3D(k_hub, HUB_COUNT, s_sel);
     footer("D-PAD  MOVE      A  OPEN      B  BACK");
     return 0;
 }
@@ -528,40 +528,89 @@ static int datetimeFrame(WORD b, WORD prev)
 }
 
 // ---- theme -----------------------------------------------------------------
+static int sAppendS(char* d, int p, const char* srcs)
+{
+    int i = 0; while (srcs[i]) { d[p++] = srcs[i]; ++i; } return p;
+}
+
+// THEME screen: theme select + background-music enable + single-track select.
+// Row 0 Theme (L/R cycles+preview), Row 1 Background Music (L/R toggles), Row 2
+// Track (A opens the song browser -> returns 2). B commits theme+bgm and backs out.
 static int themeFrame(WORD b, WORD prev)
 {
-    int  n = Theme_Count(), sw, x0, y;
-    const char* name;
-    char idxstr[20]; int p, t;
+    int n = Theme_Count(), j, last;
+    char line[96]; int p; DWORD col;
+    const char* nm; const char* tk; const char* base;
 
-    if (Pressed(b, prev, BTN_DPAD_LEFT) || Pressed(b, prev, BTN_DPAD_UP)) { s_themePreview = (s_themePreview + n - 1) % n; Theme_Preview(s_themePreview); }
-    if (Pressed(b, prev, BTN_DPAD_RIGHT) || Pressed(b, prev, BTN_DPAD_DOWN)) { s_themePreview = (s_themePreview + 1) % n;     Theme_Preview(s_themePreview); }
-    if (Pressed(b, prev, BTN_A) || Pressed(b, prev, BTN_B)) { Theme_Commit(); s_sub = SUB_HUB; return 0; }
+    if (Pressed(b, prev, BTN_DPAD_UP))   s_row = (s_row + 2) % 3;
+    if (Pressed(b, prev, BTN_DPAD_DOWN)) s_row = (s_row + 1) % 3;
+
+    if (s_row == 0) {
+        if (Pressed(b, prev, BTN_DPAD_LEFT)) { s_themePreview = (s_themePreview + n - 1) % n; Theme_Preview(s_themePreview); }
+        if (Pressed(b, prev, BTN_DPAD_RIGHT)) { s_themePreview = (s_themePreview + 1) % n;     Theme_Preview(s_themePreview); }
+    }
+    else if (s_row == 1) {
+        if (Pressed(b, prev, BTN_DPAD_LEFT) || Pressed(b, prev, BTN_DPAD_RIGHT)) s_bgmWork ^= 1;
+    }
+
+    if (s_row == 2 && Pressed(b, prev, BTN_A)) {
+        s_returnTheme = 1;          /* come back to THEME after the browse */
+        return 2;                   /* main.cpp opens the single-track browser */
+    }
+    if (Pressed(b, prev, BTN_B) || (Pressed(b, prev, BTN_A) && s_row != 2)) {
+        Theme_Commit();
+        Config_SetBgmOn(s_bgmWork); /* persist bg-music enable */
+        s_sub = SUB_HUB;
+        return 0;
+    }
 
     titleBar("THEME");
-    name = Theme_Name(s_themePreview);
-    Font_DrawCentered(0, g_scrW, 150, name ? name : "?", EOS_WHITE);
+    nm = Theme_Name(s_themePreview);
+    tk = Config_GetBgmPath();
 
-    p = 0; t = s_themePreview + 1; p += uitoa((unsigned)t, idxstr + p);
-    idxstr[p++] = ' '; idxstr[p++] = '/'; idxstr[p++] = ' '; p += uitoa((unsigned)n, idxstr + p); idxstr[p] = 0;
-    Font_DrawCentered(0, g_scrW, 178, idxstr, EOS_DIM);
+    col = (s_row == 0) ? EOS_WHITE : EOS_DIM;
+    p = sAppendS(line, 0, "Theme:            "); p = sAppendS(line, p, nm ? nm : "?"); line[p] = 0;
+    Font_DrawCentered(0, g_scrW, 150, line, col);
 
-    sw = 80; x0 = (g_scrW - (sw * 4 + 30)) / 2; y = 230;
-    Gfx_FillRounded(x0, y, sw, 70, 14, EOS_PURPLE);
-    Gfx_FillRounded(x0 + sw + 10, y, sw, 70, 14, EOS_WHITE);
-    Gfx_FillRounded(x0 + (sw + 10) * 2, y, sw, 70, 14, EOS_DIM);
-    Gfx_FillRounded(x0 + (sw + 10) * 3, y, sw, 70, 14, EOS_PURPLE);
-    Font_DrawCentered(0, g_scrW, y + 90, "Accent   Text   Dim   Accent", EOS_DIM);
-    footer("D-PAD  CHANGE      A  APPLY      B  BACK");
+    col = (s_row == 1) ? EOS_WHITE : EOS_DIM;
+    p = sAppendS(line, 0, "Background Music:  "); p = sAppendS(line, p, s_bgmWork ? "On" : "Off"); line[p] = 0;
+    Font_DrawCentered(0, g_scrW, 185, line, col);
+
+    base = tk; last = -1;
+    for (j = 0; tk[j]; ++j) if (tk[j] == '\\' || tk[j] == '/') last = j;
+    if (last >= 0) base = tk + last + 1;
+    col = (s_row == 2) ? EOS_WHITE : EOS_DIM;
+    p = sAppendS(line, 0, "Track:            "); p = sAppendS(line, p, (base && base[0]) ? base : "(none)"); line[p] = 0;
+    Font_DrawCentered(0, g_scrW, 220, line, col);
+
+    {
+        int sw = 80, x0 = (g_scrW - (sw * 4 + 30)) / 2, sy = 258;
+        Gfx_FillRounded(x0, sy, sw, 62, 12, EOS_PURPLE);
+        Gfx_FillRounded(x0 + (sw + 10), sy, sw, 62, 12, EOS_WHITE);
+        Gfx_FillRounded(x0 + (sw + 10) * 2, sy, sw, 62, 12, EOS_DIM);
+        Gfx_FillRounded(x0 + (sw + 10) * 3, sy, sw, 62, 12, EOS_PURPLE);
+        Font_DrawCentered(0, g_scrW, sy + 74, "Accent    Text    Dim    Accent", EOS_DIM);
+    }
+
+    footer("D-PAD  MOVE / CHANGE      A  SELECT      B  BACK");
     return 0;
 }
 
 // ---- entry / dispatch ------------------------------------------------------
 void Settings_Enter(void)
 {
-    s_sub = SUB_HUB;
-    s_sel = 0;
-    s_row = 0;
+    if (s_returnTheme) {
+        /* returning from the song browser: keep the working theme/bgm state that
+           survived the detour; just land back on the Track row. */
+        s_returnTheme = 0;
+        s_sub = SUB_THEME;
+        s_row = 2;
+    }
+    else {
+        s_sub = SUB_HUB;
+        s_sel = 0;
+        s_row = 0;
+    }
     Eeprom_Read(&s_eep);
 }
 

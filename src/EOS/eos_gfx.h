@@ -59,3 +59,36 @@ void Gfx_GlowRounded(int x, int y, int w, int h, int r, DWORD color);
 void Gfx_GlowSoft(int cx, int cy, int w, int h, DWORD color, int peak);
 
 void Gfx_SetFilter(BOOL linear);   // TRUE=LINEAR (logo), FALSE=POINT (text/menu)
+
+// ----- Real 3D perspective pass ----------------------------------------
+// Switches the pipeline from the 2D XYZRHW blitter to true fixed-function T&L:
+// a perspective projection + identity view, untransformed XYZ geometry, with
+// the viewport locked to the 4:3 design area so it lines up with the 2D chrome.
+// Open with Gfx_Begin3D(), draw quads, close with Gfx_End3D() (restores 2D).
+void Gfx_Begin3D(void);
+void Gfx_End3D(void);
+
+// Camera-facing quad at world (cx,cy,cz), half extents (hw,hh), tinted by the
+// vertex diffuse color (alpha honored). Fill = solid white tex; Add = additive
+// (glow/highlight). Orb3D billboards the soft glow sprite additively.
+void Gfx_Quad3D(float cx, float cy, float cz, float hw, float hh, DWORD c,
+    IDirect3DTexture8* tex, float u0, float v0, float u1, float v1);
+void Gfx_Quad3DFill(float cx, float cy, float cz, float hw, float hh, DWORD c);
+void Gfx_Quad3DAdd(float cx, float cy, float cz, float hw, float hh, DWORD c,
+    IDirect3DTexture8* tex);
+void Gfx_Orb3D(float cx, float cy, float cz, float size, DWORD color, int peak);
+
+// CRT-free sine/cosine (range-reduced; ~0.1% error). For wheel rotation.
+void Gfx_SinCos(float a, float* s, float* c);
+
+// Tilted quad: a local rect (centered at lcx,lcy on the item face) rotated about
+// the world X axis by (ca=cos a, sa=sin a), placed at (cx,cy,cz). ca=1,sa=0 ->
+// screen-parallel. This is the primitive that makes surfaces turn in space.
+void Gfx_Quad3DP(float cx, float cy, float cz, float ca, float sa,
+    float lcx, float lcy, float hw, float hh, DWORD c,
+    IDirect3DTexture8* tex, float u0, float v0, float u1, float v1);
+
+// Rounded, translucent 3D pill (3-slice: flat middle + disc end-caps), tilted
+// by (ca,sa). 'c' carries tint + alpha so pills are properly see-through.
+void Gfx_PillX3D(float cx, float cy, float cz, float ca, float sa,
+    float hw, float hh, DWORD c);
