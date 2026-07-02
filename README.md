@@ -130,9 +130,8 @@ folder** — it is a required, separate tool, not part of this loader source. Bu
 loader produces `default.xbe`; `eos_pack.py` is what turns that into a flashable image.
 
 The Eos board boots a **2 MB Xenium-style BIOS image** with the loader XBE embedded
-(LZ4-compressed) in the XeniumOS bank, and a borrowed Cerbios kernel + bank geometry kept
-byte-for-byte. `eos_pack.py` swaps **only** the embedded XBE into a known-good template, so
-the kernel's XBE-location expectations stay satisfied.
+(LZ4-compressed). `eos_pack.py` swaps **only** the embedded XBE into a known-good template
+, so the kernel's XBE-location expectations stay satisfied.
 
 ```bash
 python3 eos_pack.py pack <template.bin> default.xbe eos.bin   # build the image
@@ -140,8 +139,7 @@ python3 eos_pack.py verify eos.bin                             # round-trip chec
 python3 eos_pack.py unpack eos.bin out.xbe                     # pull an XBE back out
 ```
 
-- `<template.bin>` must be the **2 MB Xenium image** (e.g. `Xenium_Prometheos_V1_5_0.bin`) —
-  not the 256 K Cerbios `.bin` or the 1 MB RP2040 image.
+- `<template.bin>` must be the **2 MB Xenium image** (e.g. `Xenium_Prometheos_V1_5_0.bin`).
 - The XBE is placed at the XeniumOS bank (`0x100000`); descriptor is `u32 decompressed_size,
   u32 compressed_size` then the raw LZ4 block. Kernel sits at `0x180000`.
 - Budget: descriptor + compressed XBE must fit **0x80000 (512 KB)** — `pack` errors on
@@ -169,7 +167,7 @@ eos_firmware_io           firmware/loader image I/O
 
 eos_bank                  bank register control + locked-bank flag + TSOP boot
 eos_flash                 flash engine bridge
-eos_hdd / eos_fotmat      drive info + HDD staging/format  (+ eos_format.h)
+eos_hdd / eos_format      drive info + HDD staging/format  (+ eos_format.h)
 dd_mount / eos_file       mount lifecycle + file ops
 
 eos_eeprom                EEPROM read/decode/edit/repair/restore
@@ -178,7 +176,7 @@ eos_eeprom_crypto         EEPROM HMAC/crypto
 
 eos_config / eos_settings config + settings hub (theme, background music)
 eos_clock / eos_nvram     clock + NVRAM
-eos_fotl                  float->int helper (MSVC2003 /GL: __ftol2_sse)
+eos_ftol                  float->int helper (MSVC2003 /GL: __ftol2_sse)
 
 minimp3.h                 bundled MP3 decoder (background music)
 stb_image.h               bundled image decoder
@@ -187,11 +185,6 @@ Media/                    runtime media assets (background-music tracks, etc.)
 ```
 
 > **minimp3.h and stb_image.h are bundled** — link `dsound.lib` for the audio engine.
->
-> **Heads-up — two filenames are typo'd** (the code inside is correct): `eos_fotmat.cpp` is
-> the HDD format unit (`eos_format.cpp` internally) and `eos_fotl.cpp` is the ftol shim
-> (`eos_ftol.cpp` internally). Rename them if you want the filenames to match; the build just
-> needs them included either way.
 
 ---
 
