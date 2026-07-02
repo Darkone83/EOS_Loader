@@ -1,5 +1,11 @@
 # Eos — Loader
 
+<div align=center>
+
+<img src="https://github.com/Darkone83/EOS_Loader/blob/main/images/EOS.png" width=400><img src="https://github.com/Darkone83/EOS_Loader/blob/main/images/Darkone83.png" width=500>
+
+</div>
+
 The on-console app for your Eos-modded Original Xbox. Power on and you land in the Eos
 loader: pick which BIOS runs, flash new BIOS images over the network, back up and manage the
 EEPROM, set up a fresh hard drive, and personalise the UI — all from the couch with a
