@@ -72,6 +72,15 @@ const char* Bank_Name(int idx)
     return s_banks[idx].name;
 }
 
+// Table index whose bank EF matches `ef`, or -1 if none. Reverse of Bank_Ef.
+int Bank_IndexForEf(unsigned char ef)
+{
+    int i;
+    ensureInit();
+    for (i = 0; i < s_count; ++i) if (s_banks[i].ef == ef) return i;
+    return -1;
+}
+
 unsigned char Bank_Ef(int idx)
 {
     ensureInit();
@@ -226,6 +235,18 @@ void Bank_SetResting(void)
     io_out8(0x00EF, 0x01);   // boot bank = safe resting selection
 }
 
+// Launch selecting an EXPLICIT 0xEF value (for oversized banks whose serve EF
+// differs from their table nibble: 0x7/0x8 = 512K halves, 0x9 = 1MB, mapped to
+// the resident new-region SDRAM copy). Same warm-reset path as Bank_Launch.
+void Bank_LaunchEf(unsigned char ef)
+{
+    volatile int s;
+    io_out8(0x00EF, ef);
+    for (s = 0; s < 200000; ++s) {}
+    smbus_write_byte(0x10, 0x02, 0x01);
+    for (;;) {}
+}
+
 void Bank_Launch(int idx)
 {
     unsigned char ef;
@@ -291,6 +312,10 @@ int Bank_XbDiagPresent(void)
     }
     return s_diagPresent;
 }
+
+// Force the next Bank_XbDiagPresent() to re-probe (call after erasing 0xD).
+void Bank_XbDiagRecheck(void) { s_diagChecked = 0; s_diagPresent = 0; }
+
 
 // Eos_LaunchXbDiag -- page XbDiag Lite (bank 0xD) into the served SDRAM copy, then
 // select + SMC warm-reset into it. Flash_Sync blocks until the flash->SDRAM reload

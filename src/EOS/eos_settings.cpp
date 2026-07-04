@@ -13,7 +13,7 @@
 #include "eos_font.h"
 #include "eos_eeprom.h"
 #include "eos_eeprom_io.h"
-#include "eos_eeprom_crypto.h"
+#include "eos_ee_data.h"   // decrypted EEPROM read/write (video/region)
 #include "eos_console.h"
 #include "eos_nvram.h"
 #include "eos_clock.h"
@@ -112,11 +112,13 @@ static int hubFrame(WORD b, WORD prev)
         case 2: s_sub = SUB_AUDIO;  s_aflags = Nvram_GetAudioFlags(); break;
         case 3: s_sub = SUB_REGION; Eeprom_Read(&s_eep);
             s_dvd = Nvram_GetDvdRegion(); s_lang = Nvram_GetLanguage();
-            s_vstdSel = (Eeprom_GetVideoStandardRaw() == EOS_VS_PAL) ? 1 : 0;
+            s_vstdSel = (s_eep.avRegion == EE_VS_NTSC_J) ? 1
+                : (s_eep.avRegion == EE_VS_PAL_I) ? 2
+                : (s_eep.avRegion == EE_VS_PAL_M) ? 3 : 0;
             {
-                int gr = Eeprom_GetGameRegion();
-                s_grOk = (gr > 0);
-                s_grSel = (gr == EOS_XBE_JP) ? 1 : (gr == EOS_XBE_EU) ? 2 : 0;
+                int gr = (int)s_eep.gameRegion;
+                s_grOk = (s_eep.gameValid && gr > 0);
+                s_grSel = (gr == EE_REGION_JAPAN) ? 1 : (gr == EE_REGION_EURO) ? 2 : 0;
             }
             s_vstdArm = 0; s_grArm = 0; s_regMsg = 0; break;
         case 4: s_sub = SUB_NETWORK; networkEnter(); break;
@@ -276,16 +278,15 @@ static int regionFrame(WORD b, WORD prev)
     if (Pressed(b, prev, BTN_DPAD_DOWN)) { s_row = (s_row + 1) % rows; s_vstdArm = 0; s_grArm = 0; }
 
     if (s_row == 0) {                      // VIDEO STANDARD -- EEPROM factory write
-        if (Pressed(b, prev, BTN_DPAD_RIGHT) || Pressed(b, prev, BTN_DPAD_LEFT)) {
-            s_vstdSel ^= 1; s_vstdArm = 0; s_regMsg = 0;
-        }
+        if (Pressed(b, prev, BTN_DPAD_RIGHT)) { s_vstdSel = (s_vstdSel + 1) % 4; s_vstdArm = 0; s_regMsg = 0; }
+        if (Pressed(b, prev, BTN_DPAD_LEFT)) { s_vstdSel = (s_vstdSel + 3) % 4; s_vstdArm = 0; s_regMsg = 0; }
         if (Pressed(b, prev, BTN_A)) {
             if (!s_vstdArm) { s_vstdArm = 1; }     // first A arms; second A writes
             else {
-                char bk[96]; int rc;
-                rc = Eeprom_SetVideoStandard(s_vstdSel ? EOS_VS_PAL : EOS_VS_NTSC, bk, (int)sizeof(bk));
-                s_regMsg = (rc == EOS_EE_OK) ? "Written -- reboot to apply"
-                    : "Write FAILED -- aborted (HDD?)";
+                static const DWORD vsMap[4] =
+                { EE_VS_NTSC_M, EE_VS_NTSC_J, EE_VS_PAL_I, EE_VS_PAL_M };
+                int rc = EeData_SetVideoStd(vsMap[s_vstdSel]);
+                s_regMsg = rc ? "Written -- reboot to apply" : "Write FAILED -- aborted";
                 s_vstdArm = 0;
             }
         }
@@ -296,13 +297,10 @@ static int regionFrame(WORD b, WORD prev)
         if (Pressed(b, prev, BTN_A)) {
             if (!s_grArm) { s_grArm = 1; }
             else {
-                char bk[96]; int reg, rc;
-                reg = (s_grSel == 1) ? EOS_XBE_JP : (s_grSel == 2) ? EOS_XBE_EU : EOS_XBE_NA;
-                rc = Eeprom_SetGameRegion(reg, bk, (int)sizeof(bk));
-                s_regMsg = (rc == EOS_RGN_OK) ? "Region written -- reboot to apply"
-                    : (rc == EOS_RGN_ERR_CRYPTO) ? "Unsupported EEPROM -- not written"
-                    : (rc == EOS_RGN_ERR_BACKUP) ? "Backup failed -- not written"
-                    : "Write FAILED -- not applied";
+                int reg = (s_grSel == 1) ? EE_REGION_JAPAN : (s_grSel == 2) ? EE_REGION_EURO : EE_REGION_NA;
+                int rc = EeData_SetGameRegion((DWORD)reg);
+                s_regMsg = rc ? "Region written -- reboot to apply"
+                    : "Unsupported/again -- not written";
                 s_grArm = 0;
             }
         }
@@ -320,7 +318,10 @@ static int regionFrame(WORD b, WORD prev)
     for (i = 0; i < rows; ++i) {
         const char* label; const char* val; int dim = 0;
         y = LIST_Y0 + i * LIST_DY;
-        if (i == 0) { label = "Video Standard";   val = s_vstdSel ? "PAL" : "NTSC"; }
+        if (i == 0) {
+            static const char* vsName[4] = { "NTSC-M", "NTSC-J", "PAL-I", "PAL-M" };
+            label = "Video Standard";   val = vsName[s_vstdSel & 3];
+        }
         else if (i == 1) {
             if (s_grOk) {
                 label = "Game Region";

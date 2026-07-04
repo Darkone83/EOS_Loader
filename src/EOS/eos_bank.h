@@ -24,6 +24,7 @@ void          Bank_ResetToFactory(void);  // reset live table to factory default
 int           Bank_Count(void);
 const char* Bank_Name(int idx);
 unsigned char Bank_Ef(int idx);            // 0xEF value for this bank (low nibble = bank)
+int           Bank_IndexForEf(unsigned char ef);  // reverse: table index for an EF, -1 if none
 void          Bank_SetName(int idx, const char* name);  // rename (persisted via Config_Save)
 
 // Occupancy + size (drives populated-only launch list vs all-banks management).
@@ -53,6 +54,9 @@ void Bank_SetResting(void);
 // Does not return on real hardware.
 void Bank_Launch(int idx);
 
+// Launch selecting an explicit 0xEF value (oversized banks: 0x7/0x8/0x9).
+void Bank_LaunchEf(unsigned char ef);
+
 // Release D0 (set the FPGA stock-boot bit at flash-cmd index 0x08) then SMC
 // warm-reset so the console boots the onboard TSOP instead of Eos. The bit
 // survives the warm reset; a COLD power cycle clears it and returns to Eos.
@@ -63,6 +67,7 @@ void Eos_TsopBoot(void);
 // via a flash sync (page it into SDRAM) then select + warm reset -- not the plain
 // select a real bank uses.
 int  Bank_XbDiagPresent(void);             // 1 = XbDiag Lite installed in slot 0xD
+void Bank_XbDiagRecheck(void);             // clear the XbDiag-present cache (after erase)
 void Eos_LaunchXbDiag(void);               // sync 0xD -> select -> warm reset (no return)
 
 // --- diagnostics ---

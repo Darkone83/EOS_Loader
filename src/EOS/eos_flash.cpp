@@ -15,6 +15,8 @@
 #define IDX_GO           0x05
 #define IDX_STATUS       0x06
 #define IDX_LASTSTAT     0x07
+#define IDX_DESCRELOAD   0x0D
+#define IDX_ERASEBLK     0x0E
 
 // --- ops --------------------------------------------------------------------
 #define OP_ERASE         0
@@ -27,6 +29,7 @@
 #define ST_DONE          0x02
 #define ST_REFUSED       0x04
 #define ST_RELOAD        0x08   // SDRAM reload in progress (post-flash)
+#define ST_NRGN_READY    0x20   // ext-region resident in SDRAM (bit5)
 
 // Bound on the busy-poll. Each iteration is an LPC I/O read (~1us); a worst-case
 // 1MB bank erase is a few seconds, so this is generous headroom, not a tuned value.
@@ -171,6 +174,27 @@ int Flash_Sync(int bankEf)
     return waitReload();             // SDRAM copy now matches flash
 }
 
+// Sync the NEW REGION (bank 0x0) flash -> SDRAM. The backend maps this bank's
+// reload to the dedicated new-region SDRAM home (NRGN_SD, 0x400000), which is
+// clear of the loader's own serve window -- so unlike the old assumption, this
+// is safe and is REQUIRED: oversized banks are served from that SDRAM copy, so
+// without this sync a freshly-flashed large bank isn't resident until a cold
+// boot re-runs the preload. Issuing it here makes the bank launchable at once.
+int Flash_SyncNewRegion(void)
+{
+    return Flash_Sync(0x00);         // bank 0x0 -> backend routes to NRGN_SD
+}
+
+// Read STATUS bit5: 1 = the ext region is resident in SDRAM (a large bank can
+// be served). Lets the loader confirm the post-flash sync actually completed.
+int Flash_NewRegionReady(void)
+{
+    unsigned char st;
+    io_out8(EOS_PORT_INDEX, IDX_STATUS);
+    st = io_in8(EOS_PORT_DATA);
+    return (st & ST_NRGN_READY) ? 1 : 0;
+}
+
 int Flash_WriteImage(int bankEf, const unsigned char* data, int len)
 {
     int           rc, pages, page, off, i;
@@ -194,5 +218,92 @@ int Flash_WriteImage(int bankEf, const unsigned char* data, int len)
     return Flash_Sync(bankEf);
 }
 
+// Same as Flash_WriteImage but WITHOUT the trailing SDRAM sync. Used for the
+// new region (bank 0x0) and the descriptor block (bank 0xF): these are NOT part
+// of the live serve buffer, and syncing them would reload their contents over
+// the SDRAM window the running loader is served from -> loader hang. They are
+// served fresh from flash on the warm-reset that selects them.
+int Flash_WriteImageNoSync(int bankEf, const unsigned char* data, int len)
+{
+    return Flash_WriteImageAtNoSync(bankEf, 0, data, len);
+}
+
+// Write `len` bytes starting at page `startPage` within the bank, no sync. Used
+// to place an oversized bank at a specific half of the new region (e.g. the 2nd
+// 512K starts at page 0x800 = byte 0x80000). Erases only the 64K blocks the
+// image spans, starting at startPage's block, so a write to half 1 does not
+// disturb half 0.
+int Flash_WriteImageAtNoSync(int bankEf, int startPage, const unsigned char* data, int len)
+{
+    int           rc, pages, page, off, i;
+    unsigned char pg[256];
+    int           firstBlock, lastByte, blk;
+
+    // Erase the 64K blocks this image covers (block = 256 pages). We erase per
+    // 64K block within the bank via targeted page-0-of-block programming is not
+    // possible, so we rely on the bank erase for full-region banks. For the new
+    // region we must erase only the covered half; do it by erasing each covered
+    // 64K block through the engine's block-erase using the block's base page.
+    firstBlock = startPage / 256;                 // 256 pages per 64K block
+    lastByte = startPage * 256 + len - 1;
+    for (blk = firstBlock; blk <= lastByte / 65536; ++blk) {
+        rc = Flash_EraseBlock(bankEf, blk);
+        if (rc != EOS_FLASH_OK) return rc;
+    }
+
+    pages = (len + 255) / 256;
+    for (page = 0; page < pages; ++page) {
+        off = page * 256;
+        for (i = 0; i < 256; ++i)
+            pg[i] = (off + i < len) ? data[off + i] : 0xFF;
+        rc = Flash_ProgramPage(bankEf, startPage + page, pg);
+        if (rc != EOS_FLASH_OK) return rc;
+    }
+    return EOS_FLASH_OK;
+}
+
 unsigned char Flash_RawStatus(void) { return regr(IDX_STATUS); }
 unsigned char Flash_LastFlashSR(void) { return regr(IDX_LASTSTAT); }
+
+// Trigger the FPGA to re-read the bank-layout descriptor block (bank 0xF) after
+// the loader has written it. Writing IDX_DESCRELOAD pulses a re-read in the FPGA
+// bank engine; geometry (base/size for user slots) updates without a reboot.
+// Erase a single 64K block within a bank. `block` is the block index (0 = the
+// bank's first 64K, 1 = next, ...). Used to place one 512K half of the new
+// region without erasing the other half. Arms block-erase mode, sets the page
+// to the block's base page (block*256), fires ERASE (which erases just that
+// one block), then disarms the mode.
+int Flash_EraseBlock(int bankEf, int block)
+{
+    int page = block * 256;   // 256 pages per 64K block
+    int rc;
+    regw(IDX_ERASEBLK, 1);                                  // arm block-erase
+    regw(IDX_OP, (unsigned char)OP_ERASE);
+    regw(IDX_BANK, (unsigned char)(bankEf & 0x0F));
+    regw(IDX_PAGELO, (unsigned char)(page & 0xFF));
+    regw(IDX_PAGEHI, (unsigned char)((page >> 8) & 0x1F));
+    regw(IDX_GO, 1);
+    rc = waitDone();
+    regw(IDX_ERASEBLK, 0);                                  // disarm
+    return rc;
+}
+
+void Flash_ReloadDescriptor(void)
+{
+    volatile long t;
+    unsigned char st;
+
+    regw(IDX_DESCRELOAD, 1);   // pulse: FPGA re-reads the descriptor block
+
+    // The re-read grabs the flash bus (the engine goes busy for ~64 bytes of
+    // SPI). We MUST wait for it to finish before any following flash op, or that
+    // op races the in-progress reload on the shared engine and the console hangs.
+    // Poll STATUS until busy clears (bounded). The reload starts a cycle or two
+    // after the pulse, so give it a moment to assert busy, then wait for idle.
+    for (t = 0; t < 2000; ++t) {}                 // let the reload assert busy
+    io_out8(EOS_PORT_INDEX, IDX_STATUS);
+    for (t = 0; t < POLL_LIMIT; ++t) {
+        st = io_in8(EOS_PORT_DATA);
+        if (!(st & ST_BUSY)) break;                // engine idle -> reload done
+    }
+}

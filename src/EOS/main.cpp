@@ -5,10 +5,12 @@
 // bank register over LPC IO + warm-reset, and the FPGA serves the chosen bank.
 #include "eos_gfx.h"
 #include "eos_font.h"
+#include "eos_console.h"   // Console_ReadLive for the persistent HUD
 #include "eos_splash.h"
 #include "eos_menu.h"
 #include "input.h"
 #include "eos_bank.h"
+#include "eos_descriptor.h"
 #include "eos_config.h"
 #include "eos_audio.h"
 #include "eos_eeprom_io.h"
@@ -40,6 +42,46 @@ static DWORD    s_phaseT0 = 0;
 static WORD     s_prevBtn = 0;
 static int      s_bankSel = 0;   // highlighted bank in PH_BANKSEL
 static int      s_mgmtSel = 0;   // highlighted bank in PH_BANKMGMT
+static EosLayout s_layout;        // dynamic bank layout (descriptor mirror)
+static int       s_layoutOk = 0;  // 1 = a valid descriptor is loaded
+static int       s_extReady = 0;  // DEBUG: STATUS bit5 after last large flash
+
+// Map a bank TABLE index to a descriptor SLOT (0..3), or -1 if the bank is not
+// a user bank. Table: idx0=boot, idx1..4=user banks 1..4, idx5=recovery. So a
+// user bank's descriptor slot is (idx - 1). Only banks with EF 0x3..0x6 qualify.
+static int descSlotForBank(int idx)
+{
+    unsigned char ef = Bank_Ef(idx);
+    if (ef >= 0x3 && ef <= 0x6) return (int)(ef - 0x3);   // 0x3->0 .. 0x6->3
+    return -1;
+}
+
+// Heal a stale descriptor against actual bank occupancy. A bank flashed before
+// the descriptor recorded it (e.g. an older 256K flash, or descriptor drift)
+// leaves its slot FREE while the bank table says occupied -> the bank would show
+// EMPTY and be counted as free. For each user bank that IS occupied but whose
+// descriptor slot is FREE, mark the slot NATIVE (256K). Only touches FREE slots,
+// so ext anchors/shadows are never disturbed. Persists only if something changed.
+static void reconcileDescriptor(void)
+{
+    int i;
+    // DISPLAY-ONLY heal. We correct the in-memory layout so the bank list and
+    // free-slot count reflect real occupancy, but we NEVER write the descriptor
+    // back to flash here. Writing it would make the FPGA's descriptor_valid go
+    // true and route previously-static 256K banks through the dynamic geometry
+    // path -- which regressed bank boot. A descriptor is only ever persisted by
+    // an actual ext-bank flash (the only thing that truly needs one).
+    if (!s_layoutOk) { Desc_InitEmpty(&s_layout); s_layoutOk = 1; }
+    for (i = 0; i < Bank_Count(); ++i) {
+        int slot = descSlotForBank(i);
+        if (slot < 0) continue;                       // not a user bank
+        if (s_layout.slot[slot].state == EOS_SLOT_FREE && Bank_Occupied(i)) {
+            s_layout.slot[slot].state = EOS_SLOT_NATIVE;
+            s_layout.slot[slot].sizeCode = EOS_SZC_256K;
+            s_layout.slot[slot].physBase = 0;
+        }
+    }
+}
 
 // pending destructive action awaiting confirmation (PH_CONFIRM)
 enum PendingAct { ACT_NONE = 0, ACT_DELETE, ACT_FLASH };
@@ -69,6 +111,99 @@ static void browseRefresh(void);
 static char  s_status[64] = { 0 };
 static DWORD s_statusUntil = 0;
 
+// ---- persistent top-right info HUD -----------------------------------------
+// CPU temp / MB (ambient) temp / RAM used-free, refreshed on a timer (SMBus is
+// shared, so we poll every ~2s rather than every frame) and drawn on top of
+// every screen via the Gfx_End overlay hook.
+static EosLive s_live = { -1, -1, 0, 0, 0 };
+static DWORD   s_liveNext = 0;      // next GetTickCount() at which to re-poll
+static int     s_liveRev16 = 0;     // 1 once we know this is a 1.6 board
+
+static void hudPoll(void)
+{
+    DWORD now = GetTickCount();
+    if (now < s_liveNext) return;
+    s_liveNext = now + 2000;         // 2s cadence
+    Console_ReadLive(&s_live, s_liveRev16);
+}
+
+// Draw one right-aligned "Label: value" line at y; returns next y.
+#define HUD_K 0.72f   // HUD text scale (smaller than body text, no clipping)
+
+static int hudLine(int right, int y, const char* label, const char* val, DWORD col)
+{
+    int wv = Font_TextWidthScaled(val, HUD_K);
+    int lx = right - 128;                          // label left-aligned in frame
+    Font_DrawScaled(lx, y, label, EOS_PURPLE, HUD_K);
+    Font_DrawScaled(right - wv, y, val, col, HUD_K);
+    return y + 17;                                 // tighter line pitch for scaled text
+}
+
+static void hudDraw(void)
+{
+    int right = g_scrW - 20;
+    int y = 16;
+    char buf[16];
+    int n;
+
+    if (s_phase == PH_SPLASH) return;   // keep the branded splash clean
+
+    hudPoll();
+
+    // Thin frame (outline, not a solid fill) so labels/values stay legible over
+    // any theme. Sized for the scaled 3-line block.
+    {
+        int bx = g_scrW - 150, by = 10, bw = 140, bh = 62;
+        DWORD fr = EOS_PURPLE;
+        Gfx_Fill((float)bx, (float)by, (float)bw, 1.0f, fr); // top
+        Gfx_Fill((float)bx, (float)(by + bh - 1), (float)bw, 1.0f, fr); // bottom
+        Gfx_Fill((float)bx, (float)by, 1.0f, (float)bh, fr); // left
+        Gfx_Fill((float)(bx + bw - 1), (float)by, 1.0f, (float)bh, fr); // right
+    }
+
+    // CPU temp
+    if (s_live.tempOK && s_live.cpuTempC >= 0) {
+        n = 0;
+        if (s_live.cpuTempC >= 100) buf[n++] = (char)('0' + s_live.cpuTempC / 100);
+        if (s_live.cpuTempC >= 10)  buf[n++] = (char)('0' + (s_live.cpuTempC / 10) % 10);
+        buf[n++] = (char)('0' + s_live.cpuTempC % 10);
+        buf[n++] = ' '; buf[n++] = 'C'; buf[n] = 0;
+        y = hudLine(right, y, "CPU", buf, EOS_WHITE);
+    }
+    else {
+        y = hudLine(right, y, "CPU", "-- C", EOS_DIM);
+    }
+
+    // MB (ambient) temp
+    if (s_live.tempOK && s_live.mbTempC >= 0) {
+        n = 0;
+        if (s_live.mbTempC >= 100) buf[n++] = (char)('0' + s_live.mbTempC / 100);
+        if (s_live.mbTempC >= 10)  buf[n++] = (char)('0' + (s_live.mbTempC / 10) % 10);
+        buf[n++] = (char)('0' + s_live.mbTempC % 10);
+        buf[n++] = ' '; buf[n++] = 'C'; buf[n] = 0;
+        y = hudLine(right, y, "MB", buf, EOS_WHITE);
+    }
+    else {
+        y = hudLine(right, y, "MB", "-- C", EOS_DIM);
+    }
+
+    // RAM used / total (e.g. "12/128MB"). Total reads 64 or 128 on Xbox.
+    {
+        int u = s_live.ramUsedMB, t = s_live.ramTotalMB;
+        char* p = buf;
+        if (u >= 100) *p++ = (char)('0' + u / 100);
+        if (u >= 10)  *p++ = (char)('0' + (u / 10) % 10);
+        *p++ = (char)('0' + u % 10);
+        *p++ = '/';
+        if (t >= 100) *p++ = (char)('0' + t / 100);
+        if (t >= 10)  *p++ = (char)('0' + (t / 10) % 10);
+        *p++ = (char)('0' + t % 10);
+        *p++ = 'M'; *p++ = 'B'; *p = 0;
+        y = hudLine(right, y, "RAM", buf, EOS_WHITE);
+    }
+}
+
+
 static void SetStatus(const char* msg)
 {
     int i = 0; for (; msg[i] && i < 63; ++i) s_status[i] = msg[i];
@@ -86,8 +221,8 @@ static void GotoPhase(AppPhase p)
     s_phase = p;
     s_phaseT0 = GetTickCount();
     if (p == PH_MENU)     Menu_Init();
-    if (p == PH_BANKSEL)  s_bankSel = 0;
-    if (p == PH_BANKMGMT) s_mgmtSel = 0;
+    if (p == PH_BANKSEL) { s_bankSel = 0; s_layoutOk = Desc_Load(&s_layout); reconcileDescriptor(); }
+    if (p == PH_BANKMGMT) { s_mgmtSel = 0; s_layoutOk = Desc_Load(&s_layout); reconcileDescriptor(); }
     if (p == PH_SETTINGS) Settings_Enter();
 }
 
@@ -188,8 +323,12 @@ static void BankSel_Frame(WORD b)
             Eos_TsopBoot();
         else if (hasDiag && s_bankSel == diagIdx)
             Eos_LaunchXbDiag();
-        else
+        else {
+            // Every bank launches NORMALLY. If the descriptor marks this bank as
+            // an oversized anchor, the FPGA redirects its serve to the ext-region
+            // SDRAM copy -- no special launch EF needed here.
             Bank_Launch(Bank_LaunchIndex(s_bankSel));
+        }
         return;
     }
 
@@ -243,25 +382,114 @@ static void buildMgmtRow(char* out, int idx)
     else if (Bank_IsLocked(idx)) {
         p = appendStr(out, p, "[LOCKED]");
     }
-    else if (Bank_Occupied(idx)) {
-        p = appendStr(out, p, "[");
-        p = appendStr(out, p, sizeStr(Bank_SizeCode(idx)));
-        p = appendStr(out, p, " READY]");
-    }
     else {
-        p = appendStr(out, p, "[EMPTY]");
+        /* Dynamic layout: for the 4 visible user slots, reflect the descriptor
+           (a shadowed slot is greyed as unavailable, an oversized anchor shows
+           its true 512K/1MB size). Falls back to the legacy occupancy display
+           when no descriptor is loaded. */
+        int handled = 0;
+        int slot = descSlotForBank(idx);
+        if (s_layoutOk && slot >= 0) {
+            int st = s_layout.slot[slot].state;
+            if (st == EOS_SLOT_SHADOW) {
+                p = appendStr(out, p, "[--- UNAVAILABLE ---]");
+                handled = 1;
+            }
+            else if (st == EOS_SLOT_ANCHOR) {
+                p = appendStr(out, p, "[");
+                p = appendStr(out, p, sizeStr(s_layout.slot[slot].sizeCode));
+                p = appendStr(out, p, " READY]");
+                handled = 1;
+            }
+            else if (st == EOS_SLOT_NATIVE) {
+                p = appendStr(out, p, "[256K READY]");
+                handled = 1;
+            }
+            // EOS_SLOT_FREE: do NOT force [EMPTY] here. The descriptor is only the
+            // source of truth for ext banks (shadow/anchor) and native marks; a
+            // FREE slot may still hold a 256K BIOS flashed before it was recorded
+            // in the descriptor. Fall through to the real bank-table occupancy so
+            // banks 3/4 (or any bank with a blank descriptor slot) show correctly.
+        }
+        if (!handled) {
+            if (Bank_Occupied(idx)) {
+                p = appendStr(out, p, "[");
+                p = appendStr(out, p, sizeStr(Bank_SizeCode(idx)));
+                p = appendStr(out, p, " READY]");
+            }
+            else {
+                p = appendStr(out, p, "[EMPTY]");
+            }
+        }
     }
 }
 
 static void DoDelete(int idx)
 {
-    int rc;
+    int rc, slot;
     if (idx < 0 || Bank_IsLocked(idx)) { SetStatus("Protected bank"); return; }
-    rc = Flash_EraseBank(Bank_Ef(idx));   // erases only this bank's blocks
+
+    slot = descSlotForBank(idx);   // descriptor slot 0..3, or -1 if not a user bank
+
+    // If the descriptor marks this slot as oversized (anchor or shadow), clear it
+    // descriptor-first: find the owning anchor, erase its new-region blocks, and
+    // free the whole footprint. Also the recovery path for stuck descriptor state.
+    if (slot >= 0 && Desc_Load(&s_layout) && s_layout.valid &&
+        s_layout.slot[slot].state != EOS_SLOT_FREE &&
+        s_layout.slot[slot].state != EOS_SLOT_NATIVE) {
+        int anchor = slot, span, j;
+
+        // If this is a shadow, walk back (in slot space) to its owning anchor.
+        if (s_layout.slot[slot].state == EOS_SLOT_SHADOW) {
+            while (anchor > 0 && s_layout.slot[anchor].state != EOS_SLOT_ANCHOR) --anchor;
+        }
+
+        if (s_layout.slot[anchor].state == EOS_SLOT_ANCHOR) {
+            unsigned int base = s_layout.slot[anchor].physBase;
+            span = Desc_SlotsFor(s_layout.slot[anchor].sizeCode);
+            // Erase the anchor's new-region blocks if physBase is sane.
+            if (base >= EOS_NEWRGN_BASE && base < (EOS_NEWRGN_BASE + 0x100000)) {
+                int firstBlk = (int)((base - EOS_NEWRGN_BASE) / 0x10000);
+                int nblk = (span == 4) ? 16 : 8;
+                int bk;
+                for (bk = 0; bk < nblk && (firstBlk + bk) < 16; ++bk)
+                    Flash_EraseBlock(EOS_BANK_NEWREGION, firstBlk + bk);
+            }
+        }
+        else {
+            span = 1;   // no anchor found -> just clear this one slot
+            anchor = slot;
+        }
+
+        // Free the footprint in slot space; clear the matching bank table entries.
+        // The bank table index for descriptor slot S is the bank whose EF==0x3+S.
+        for (j = 0; j < span && (anchor + j) < EOS_DESC_SLOTS; ++j) {
+            int tblIdx;
+            s_layout.slot[anchor + j].state = EOS_SLOT_FREE;
+            s_layout.slot[anchor + j].sizeCode = EOS_SZC_256K;
+            s_layout.slot[anchor + j].physBase = 0;
+            tblIdx = Bank_IndexForEf((unsigned char)(0x3 + anchor + j));
+            if (tblIdx >= 0) Bank_ClearEntry(tblIdx);
+        }
+        Desc_Save(&s_layout);
+        Config_Save();
+        SetStatus("Bank cleared");
+        return;
+    }
+
+    // normal 256K bank (native or plain) -- default range, exactly as before.
+    rc = Flash_EraseBank(Bank_Ef(idx));
     if (rc == EOS_FLASH_OK) {
-        Bank_ClearEntry(idx);             // empty + restore factory label
-        rc = Config_Save();
-        SetStatus(rc == EOS_FLASH_OK ? "Bank cleared" : "Erased; cfg save FAILED");
+        if (slot >= 0 && Desc_Load(&s_layout) && s_layout.valid &&
+            s_layout.slot[slot].state == EOS_SLOT_NATIVE) {
+            s_layout.slot[slot].state = EOS_SLOT_FREE;
+            s_layout.slot[slot].sizeCode = EOS_SZC_256K;
+            s_layout.slot[slot].physBase = 0;
+            Desc_Save(&s_layout);
+        }
+        Bank_ClearEntry(idx);
+        Config_Save();
+        SetStatus("Bank cleared");
     }
     else {
         SetStatus("Erase FAILED");
@@ -290,7 +518,6 @@ static void Confirm_Frame(WORD b)
     Gfx_End();
 }
 
-#define EOS_LOADER_VERSION "1.0"
 
 static void About_Frame(WORD b)
 {
@@ -397,8 +624,10 @@ static void ClearCfg_Frame(WORD b)
     if (Pressed(b, s_prevBtn, BTN_A)) {
         int rc = Config_ClearAll();      // erase 0xB + 0xC, reset theme
         Bank_ResetToFactory();           // reset live bank table so it isn't re-saved stale
+        Desc_Erase();                    // wipe descriptor -> back to legacy geometry
+        Flash_EraseBank(EOS_BANK_NEWREGION);  // clear the oversized-bank region too
         Theme_Init();                    // re-apply the default theme now
-        SetStatus(rc == EOS_FLASH_OK ? "User settings cleared" : "Clear FAILED -- flash error");
+        SetStatus(rc == EOS_FLASH_OK ? "Settings + descriptor cleared" : "Clear FAILED -- flash error");
         GotoPhase(PH_TOOLS);
         return;
     }
@@ -894,11 +1123,16 @@ static void BankMgmt_Frame(WORD b)
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_MENU); return; }
 
     if (Pressed(b, s_prevBtn, BTN_X)) {
-        // Delete (erase) -- occupied, non-boot banks only -> confirm first.
+        // Delete (erase) non-boot banks -> confirm first. Deletable if the bank
+        // is occupied OR the descriptor still marks this slot (anchor/shadow/
+        // native) -- so a stuck descriptor entry on a blank bank can be cleared.
+        int dslot = descSlotForBank(s_mgmtSel);
+        int descMarked = (s_layoutOk && dslot >= 0 &&
+            s_layout.slot[dslot].state != EOS_SLOT_FREE);
         if (Bank_IsLocked(s_mgmtSel)) {
             SetStatus("Cannot delete locked bank");
         }
-        else if (!Bank_Occupied(s_mgmtSel)) {
+        else if (!Bank_Occupied(s_mgmtSel) && !descMarked) {
             SetStatus("Bank already empty");
         }
         else {
@@ -913,7 +1147,10 @@ static void BankMgmt_Frame(WORD b)
         }
     }
     if (Pressed(b, s_prevBtn, BTN_A)) {
-        // Flash a BIOS into this bank -> browse for an image file.
+        // Flash a BIOS into this bank -> browse for an image file. Large BIOSes
+        // auto-place into a free new-region half regardless of the selected bank;
+        // a 256K goes into this specific bank, so only block 256K-into-shadow
+        // (which DoFlash also guards). Selection is permissive; DoFlash decides.
         if (Bank_IsLocked(s_mgmtSel)) {
             SetStatus("Cannot flash locked bank");
         }
@@ -941,6 +1178,17 @@ static void BankMgmt_Frame(WORD b)
 
     Gfx_Begin(EOS_BG); Ui_Backdrop();
     Ui_TitleBar("BANK MANAGEMENT");
+
+    {
+        /* free-slot / 1MB-budget indicator (dynamic bank layout) */
+        char hdr[48]; int hp = 0; int freeSlots;
+        freeSlots = s_layoutOk ? Desc_FreeSlots(&s_layout) : 4;
+        hp = appendStr(hdr, hp, "User banks:  ");
+        hdr[hp++] = (char)("0123456789"[freeSlots & 0x0F]);
+        hp = appendStr(hdr, hp, " of 4 free  (1MB budget)");
+        hdr[hp] = 0;
+        Font_DrawCentered(0, g_scrW, 92, hdr, EOS_DIM);
+    }
 
     {
         static char rows[EOS_BANK_MAX][64];
@@ -1029,32 +1277,133 @@ static int sizeCodeForLen(int len)
 
 static void DoFlash(int idx, const char* path)
 {
-    int  cap, got, rc, sc, n, s;
+    int  got, rc, sc, n, s;
     char nm[EOS_BANK_NAMELEN];
 
     if (idx < 0 || Bank_IsLocked(idx)) { SetStatus("Protected bank"); return; }
 
-    cap = Bank_CapacityBytes(idx);
-    if (cap > EOS_IMG_BUF_MAX) cap = EOS_IMG_BUF_MAX;
-
-    got = File_ReadInto(path, s_imgBuf, cap);
-    if (got < 0) { SetStatus("Read failed / too big for bank"); return; }
+    // Read the file. Up to 1MB so a large BIOS can be read even though the
+    // target slot's nominal capacity is 256K (it will go to the new region).
+    got = File_ReadInto(path, s_imgBuf, EOS_IMG_BUF_MAX);
+    if (got < 0) { SetStatus("Read failed / too big (max 1MB)"); return; }
     if (got == 0) { SetStatus("Empty file"); return; }
 
-    rc = Flash_WriteImage(Bank_Ef(idx), s_imgBuf, got);
-    if (rc != EOS_FLASH_OK) { SetStatus("Flash FAILED"); return; }
-
     sc = sizeCodeForLen(got);
-    Bank_SetOccupied(idx, 1, sc);
 
-    // name the slot after the file (last component, extension stripped)
+    // bank name from the file (last path component, extension stripped)
     n = mLen(path); s = n;
     while (s > 0 && path[s - 1] != '\\') --s;
     fileToBankName(nm, EOS_BANK_NAMELEN, path + s);
-    if (nm[0]) Bank_SetName(idx, nm);
 
-    rc = Config_Save();
-    SetStatus(rc == EOS_FLASH_OK ? "Flashed OK" : "Flashed; cfg save FAILED");
+    if (sc == EOS_BANK_SIZE_256K) {
+        // -------- 256K: DEFAULT range, exactly as before. No descriptor. -----
+        // A 256K goes into THIS specific bank. Block it if this bank is currently
+        // part of an oversized bank (its own anchor, or a shadow of one) -- the
+        // user must delete that oversized bank first.
+        int dslot = descSlotForBank(idx);
+        if (dslot >= 0 && Desc_Load(&s_layout) && s_layout.valid &&
+            (s_layout.slot[dslot].state == EOS_SLOT_SHADOW ||
+                s_layout.slot[dslot].state == EOS_SLOT_ANCHOR)) {
+            SetStatus("Bank used by an oversized BIOS - delete it first");
+            return;
+        }
+        rc = Flash_WriteImage(Bank_Ef(idx), s_imgBuf, got);
+        if (rc != EOS_FLASH_OK) { SetStatus("Flash FAILED"); return; }
+        Bank_SetOccupied(idx, 1, sc);
+        if (nm[0]) Bank_SetName(idx, nm);
+        // Record this 256K in the descriptor as NATIVE so the budget/auto-place
+        // logic sees the slot as consumed. Without this, a later large-bank
+        // auto-place would treat this slot as FREE and overwrite it.
+        if (dslot >= 0) {
+            if (!Desc_Load(&s_layout) || !s_layout.valid) Desc_InitEmpty(&s_layout);
+            s_layout.slot[dslot].state = EOS_SLOT_NATIVE;
+            s_layout.slot[dslot].sizeCode = EOS_SZC_256K;
+            s_layout.slot[dslot].physBase = 0;
+            Desc_Save(&s_layout);
+        }
+        Config_Save();
+        SetStatus("Flashed OK");
+        return;
+    }
+
+    // -------- large BIOS (512K / 1MB): goes to the NEW REGION -----------------
+    // Virtually mapped to the selected slot. Bytes written to the new region at
+    // an offset derived from the slot; descriptor records the anchor + shadows.
+    {
+        int szc = (sc == EOS_BANK_SIZE_1MB) ? EOS_SZC_1MB : EOS_SZC_512K;
+        int need = Desc_SlotsFor(szc);
+        int slot = -1;   // auto-chosen anchor slot
+        unsigned int nrbase;
+        int startPage, j;
+
+        if (descSlotForBank(idx) < 0) { SetStatus("Not a user bank"); return; }
+        if (!Desc_Load(&s_layout) || !s_layout.valid) Desc_InitEmpty(&s_layout);
+
+        // AUTO-PLACE: find the first valid free anchor for this size, ignoring
+        // which bank the user selected. 512K anchors on an even slot (0 or 2) with
+        // both it and the next slot free; 1MB needs all four slots free at slot 0.
+        if (szc == EOS_SZC_1MB) {
+            int allFree = 1;
+            for (j = 0; j < EOS_DESC_SLOTS; ++j)
+                if (s_layout.slot[j].state != EOS_SLOT_FREE) { allFree = 0; break; }
+            if (allFree) slot = 0;
+        }
+        else {
+            int cand;
+            for (cand = 0; cand <= 2; cand += 2) {   // even slots 0, 2
+                if (s_layout.slot[cand].state == EOS_SLOT_FREE &&
+                    s_layout.slot[cand + 1].state == EOS_SLOT_FREE) {
+                    slot = cand; break;
+                }
+            }
+        }
+        if (slot < 0) {
+            SetStatus((szc == EOS_SZC_1MB) ? "1MB needs all banks free" : "No free pair - free some banks");
+            return;
+        }
+
+        // new-region offset: slots 0/1 -> +0, slots 2/3 -> +512K; 1MB -> +0
+        nrbase = (szc == EOS_SZC_1MB) ? EOS_NEWRGN_BASE
+            : (slot >= 2) ? (EOS_NEWRGN_BASE + EOS_NEWRGN_HALF)
+            : EOS_NEWRGN_BASE;
+        startPage = (int)((nrbase - EOS_NEWRGN_BASE) / 256);
+
+        SetStatus("Writing new region...");
+        rc = Flash_WriteImageAtNoSync(EOS_BANK_NEWREGION, startPage, s_imgBuf, got);
+        if (rc != EOS_FLASH_OK) { SetStatus("Flash FAILED (new region)"); return; }
+
+        // Page the freshly-written new region into its SDRAM home so the bank is
+        // launchable now, without needing a cold power-cycle to re-run preload.
+        Flash_SyncNewRegion();
+        s_extReady = Flash_NewRegionReady();   // DEBUG: did the ext region go resident?
+
+        SetStatus("Writing descriptor...");
+        s_layout.slot[slot].state = EOS_SLOT_ANCHOR;
+        s_layout.slot[slot].sizeCode = (unsigned char)szc;
+        s_layout.slot[slot].physBase = nrbase;
+        for (j = 1; j < need; ++j) {
+            s_layout.slot[slot + j].state = EOS_SLOT_SHADOW;
+            s_layout.slot[slot + j].sizeCode = EOS_SZC_256K;
+            s_layout.slot[slot + j].physBase = 0;
+        }
+        if (Desc_Save(&s_layout) != EOS_FLASH_OK) { SetStatus("Descriptor write FAILED"); return; }
+
+        // Mark occupancy on the ACTUAL anchor bank (the auto-chosen slot), not
+        // the bank the user happened to select. The anchor bank's table index is
+        // the one whose EF == 0x3 + slot. Its shadow banks are also marked so the
+        // UI/launch list stay consistent.
+        {
+            int anchorTbl = Bank_IndexForEf((unsigned char)(0x3 + slot));
+            if (anchorTbl >= 0) {
+                Bank_SetOccupied(anchorTbl, 1, sc);
+                if (nm[0]) Bank_SetName(anchorTbl, nm);
+            }
+        }
+        Config_Save();
+        SetStatus(s_extReady ? "Flashed OK (large) - ext RESIDENT"
+            : "Flashed (large) - ext NOT resident!");
+        return;
+    }
 }
 
 static void Browse_Frame(WORD b)
@@ -1196,6 +1545,8 @@ void __cdecl main() {
     Bank_SetResting();   // boot bank = safe resting selection
     File_MountDrives();  // bind HDD partitions so E:/F:/... resolve for browsing
     Config_Load();       // pull persisted bank table from the Eos config bank
+    Bank_XbDiagPresent(); // prime the XbDiag probe cache at boot: the one-time
+    // flash read happens here, never in the web request path
     Theme_Init();        // apply the saved theme (recolors the whole UI)
     audioSync();         // start background music if enabled in settings
     // (exercises the real read path; graceful on fresh chip)
@@ -1204,6 +1555,16 @@ void __cdecl main() {
     Ftp_Want(1);         // enable FTP (2 sessions, xbox/xbox, passive, port 21)
     if (!Font_Init()) { Gfx_Shutdown(); return; }
     if (!Splash_Init()) { Font_Shutdown(); Gfx_Shutdown(); return; }
+
+    // Persistent top-right HUD (CPU/MB temp, RAM). Detect a 1.6 board once so
+    // the temp read uses the PIC path (no ADM1032 on 1.6), then draw it on top
+    // of every frame via the Gfx overlay hook.
+    {
+        EosConsole con;
+        Console_Read(&con);
+        s_liveRev16 = (con.revStr && con.revStr[0] == '1' && con.revStr[2] == '6') ? 1 : 0;
+    }
+    Gfx_SetOverlay(hudDraw);
 
     GotoPhase(PH_SPLASH);
 

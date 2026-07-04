@@ -8,8 +8,8 @@
 
 The on-console app for your Eos-modded Original Xbox. Power on and you land in the Eos
 loader: pick which BIOS runs, flash new BIOS images over the network, back up and manage the
-EEPROM, set up a fresh hard drive, and personalise the UI — all from the couch with a
-controller, or from a browser on your PC.
+EEPROM, run firmware and hard-drive tools, watch live console telemetry, and personalise the
+UI — all from the couch with a controller, or from a browser on your PC.
 
 > Team Resurgent · Darkone83 · **Private — do not distribute**
 
@@ -17,15 +17,22 @@ controller, or from a browser on your PC.
 
 ## What you can do
 
-- **Choose your BIOS** — switch between BIOS banks on the Eos board, or boot the console's
-  original **TSOP** BIOS.
+- **Choose your BIOS** — switch between BIOS banks on the Eos board, boot the console's
+  original **TSOP** BIOS, or launch **XbDiag Lite** when it's installed.
 - **Flash BIOS images** — push a new BIOS to a bank over FTP or the web control panel, then
-  commit it.
-- **Web control panel** — a browser page for bank management, plus **EEPROM backup / restore**
-  and a settings reset.
+  commit it. Supports **256K, 512K, and 1MB** images; oversized banks are auto-placed into
+  the dynamic new-region layout.
+- **Firmware backup / restore** — dump any bank to a file and restore it, per bank.
+- **Web control panel** — a browser page for bank management, plus **EEPROM backup / restore**,
+  system info, XbDiag management, and a settings reset.
 - **FTP server** — move banks and files to and from the console over your network.
-- **EEPROM tools** — read, decode, edit, repair, back up, and restore the Xbox EEPROM.
+- **EEPROM tools** — read, decode, edit, repair, back up, and restore the Xbox EEPROM,
+  including **video standard** (NTSC-M/J, PAL-I/M) and **game / DVD region** editing.
+- **HDD tools** — drive info, plus **ATA security lock / unlock** (bind a drive to this
+  console or remove security).
 - **Hard-drive setup** — stage a fresh drive with the standard Xbox partitions.
+- **Live telemetry HUD** — a top-right overlay shows **CPU / motherboard temperature** and
+  **RAM** while you use the loader.
 - **Personalise it** — themes and background music, an on-screen keyboard, plus network,
   clock, and NVRAM settings.
 
@@ -35,8 +42,8 @@ controller, or from a browser on your PC.
 
 The console cold-boots straight into the Eos loader UI. Navigate with the **D-pad**, **A**
 selects, **B** goes back. The main menu gets you to **Banks**, **Tools**, and **Settings**,
-and the loader shows live Eos serve state so you can see the chip working. From here you
-choose what actually runs.
+and a top-right HUD shows live console telemetry (CPU / motherboard temperature and RAM). From
+here you choose what actually runs.
 
 ---
 
@@ -46,10 +53,13 @@ choose what actually runs.
 
 The **Banks** screen lists the BIOS banks on your Eos board. Select one to make it active and
 launch it — a warm reset boots into the chosen BIOS. Protected banks (the boot loader and
-recovery) are marked **[LOCKED]** and can't be deleted or overwritten by accident.
+recovery) are marked **[LOCKED]** and can't be deleted or overwritten by accident. When
+**XbDiag Lite** is installed on the board, it also appears here as a launchable entry.
 
 To **flash a new BIOS**: get the image onto the console (FTP or the web panel), pick a target
-bank, and commit — the loader writes it to the Eos flash and can serve it live.
+bank, and commit — the loader writes it to the Eos flash and can serve it live. **256K, 512K,
+and 1MB** images are supported; larger images are automatically placed into the board's
+dynamic new-region layout and the bank management screen shows the free-slot budget.
 
 To **boot the stock BIOS**: choose the **TSOP** entry in the bank list. Eos steps aside and
 the Xbox boots its original onboard BIOS; a normal power cycle returns you to Eos.
@@ -59,9 +69,12 @@ the Xbox boots its original onboard BIOS; a normal power cycle returns you to Eo
 Point a browser at the console's IP address for a control panel with:
 
 - **Bank management** — rename, delete, and flash banks from your desktop.
+- **System info** — console revision, CPU speed, RAM, encoder, serial, MAC, video standard,
+  region, language, and bank/slot usage.
 - **Backup EEPROM** — download your console's EEPROM as a file. **Do this once and keep it
   safe** — it's your console's identity.
 - **Restore EEPROM** — upload a saved EEPROM image back (validated before it's written).
+- **XbDiag** — when XbDiag Lite is installed, the panel shows it and can clear it from its bank.
 - **Reset Settings** — return the loader's own settings to defaults; your banks are left
   untouched.
 
@@ -71,6 +84,29 @@ Connect an FTP client to the console's IP — default user **`xbox`**, password 
 port **21** (all changeable in Settings). Up to two sessions at once; a third gets
 "all sessions in use." Use it to upload BIOS images and move files.
 
+### Tools
+
+**Tools** groups the maintenance functions: **EEPROM**, **Firmware**, **HDD**, **Format**, and
+**Clear Settings**.
+
+### EEPROM tools
+
+Read, decode, edit, repair, back up, and restore the Xbox EEPROM — the crypto is handled for
+you (HMAC-validated). Editable fields include the **video standard** (NTSC-M, NTSC-J, PAL-I,
+PAL-M) and the **game / DVD region**. **Back up before you edit.** A bad EEPROM write can stop
+the console booting, and the backup is how you recover.
+
+### Firmware tools
+
+**Backup** dumps a chosen bank's flash to a file on the drive, and **Restore** writes a saved
+firmware image back to a size-matched bank (erased, programmed, and verified page-by-page).
+
+### HDD tools
+
+**Drive Info** shows the model, serial, size, and ATA security state. **Lock** binds the drive
+to this console's key; **Unlock** removes security. Both are armed (press twice) to prevent an
+accidental change.
+
 ### Hard-drive setup (Format)
 
 **Tools → Format** stages a fresh Xbox drive: it lays down the standard partitions
@@ -79,15 +115,15 @@ port **21** (all changeable in Settings). Up to two sessions at once; a third ge
 > ⚠️ **This wipes the entire drive.** Only run it on a drive you intend to erase, and test on
 > a scratch disk first.
 
-### EEPROM tools
+### Clear Settings
 
-Read, decode, edit, repair, back up, and restore the Xbox EEPROM — the crypto is handled for
-you (HMAC-validated). **Back up before you edit.** A bad EEPROM write can stop the console
-booting, and the backup is how you recover.
+Resets the loader's config banks (bank table + settings) to factory. Bank names and saved
+settings are wiped; flashed BIOS images are not touched.
 
 ### Settings
 
 - **Network** — IP / DHCP and the FTP credentials.
+- **Video / Audio / Region** — EEPROM-backed video standard, and game / DVD region editing.
 - **Clock / NVRAM** — console time and NVRAM values.
 - **Themes** — recolour the loader UI.
 - **Background music** — turn it on and pick a track to play in the loader.
@@ -154,31 +190,34 @@ python3 eos_pack.py unpack eos.bin out.xbe                     # pull an XBE bac
 ### Source layout
 
 ```
-main.cpp                  entry point + frame loop
+main.cpp                  entry point + frame loop + telemetry HUD overlay
 eos_menu / eos_ui         menu system + UI
 eos_gfx / eos_font        rendering + fonts (eos_font_data.h, eos_logo_data.h)
 eos_splash / eos_theme    splash + themeable styling
 eos_audio                 background-music engine (minimp3 -> DirectSound)
-eos_osk / eos_console     on-screen keyboard + console/log
+eos_osk                   on-screen keyboard
+eos_console               console read (revision, CPU MHz, temps, RAM) for the HUD
 input                     controller input
 
 dd_ftp                    FTP server (2-session)
-eos_http                  HTTP server + OTA + web EEPROM backup/restore + reset
+eos_http                  HTTP server + OTA + web EEPROM backup/restore + sysinfo + reset
 dd_net                    networking
-eos_firmware_io           firmware/loader image I/O
+eos_firmware_io           firmware/loader image I/O + per-bank backup/restore
 
-eos_bank                  bank register control + locked-bank flag + TSOP boot
+eos_bank                  bank register control + locked-bank flag + TSOP boot + XbDiag detect
+eos_descriptor            dynamic bank geometry descriptor (256K/512K/1MB slot layout)
 eos_flash                 flash engine bridge
-eos_hdd / eos_fotmat      drive info + HDD staging/format  (+ eos_format.h)
+eos_hdd / eos_format      drive info + ATA security + HDD staging/format
 dd_mount / eos_file       mount lifecycle + file ops
 
 eos_eeprom                EEPROM read/decode/edit/repair/restore
 eos_eeprom_io             EEPROM transport
-eos_eeprom_crypto         EEPROM HMAC/crypto
+eos_ee_crypto             EEPROM SHA-1 / HMAC / RC4 / CRC (ported crypto core)
+eos_ee_data               EEPROM raw-image decode/encode (video std, region, serial, MAC)
 
-eos_config / eos_settings config + settings hub (theme, background music)
+eos_config / eos_settings config + settings hub (video/region, theme, background music)
 eos_clock / eos_nvram     clock + NVRAM
-eos_fotl                  float->int helper (MSVC2003 /GL: __ftol2_sse)
+eos_ftoi                  float->int helper (MSVC2003 /GL: __ftol2_sse)
 
 minimp3.h                 bundled MP3 decoder (background music)
 stb_image.h               bundled image decoder
@@ -188,10 +227,9 @@ Media/                    runtime media assets (background-music tracks, etc.)
 
 > **minimp3.h and stb_image.h are bundled** — link `dsound.lib` for the audio engine.
 >
-> **Heads-up — two filenames are typo'd** (the code inside is correct): `eos_fotmat.cpp` is
-> the HDD format unit (`eos_format.cpp` internally) and `eos_fotl.cpp` is the ftol shim
-> (`eos_ftol.cpp` internally). Rename them if you want the filenames to match; the build just
-> needs them included either way.
+> The EEPROM crypto lives in `eos_ee_crypto` + `eos_ee_data` (raw 256-byte image decode with
+> HMAC-validated security block). An older `eos_eeprom_crypto.cpp` remains on disk but is **not
+> part of the build** (excluded from the project) — it has been superseded.
 
 ---
 

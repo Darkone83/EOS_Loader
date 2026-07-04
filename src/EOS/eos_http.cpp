@@ -3,9 +3,12 @@
 #include <winsockx.h>
 #include "eos_http.h"
 #include "eos_bank.h"
+#include "eos_descriptor.h"
 #include "eos_config.h"
 #include "eos_flash.h"
 #include "eos_eeprom_io.h"
+#include "eos_eeprom.h"
+#include "eos_console.h"
 #include "eos_logo_data.h"   // EOS_LOGO_W/H, EOS_LOGO_PAL[15][3], EOS_LOGO_4BPP[]
 
 #define HTTP_PORT      80
@@ -17,7 +20,7 @@
 
 enum { ST_IDLE = 0, ST_HDR, ST_BODY, ST_SEND };
 enum { M_GET = 0, M_POST };
-enum { R_NONE = 0, R_PAGE, R_LOGO, R_BANKS, R_RENAME, R_DELETE, R_FLASH, R_LAUNCH, R_EEPROM, R_RESET };
+enum { R_NONE = 0, R_PAGE, R_LOGO, R_BANKS, R_RENAME, R_DELETE, R_FLASH, R_LAUNCH, R_EEPROM, R_RESET, R_SYSINFO, R_CLRXBDIAG };
 
 static SOCKET s_listen = INVALID_SOCKET;
 static SOCKET s_conn = INVALID_SOCKET;
@@ -30,6 +33,16 @@ static int    s_rxRecv, s_rxStore, s_store, s_err;
 static int    s_launch = -1;
 
 static unsigned char s_rx[HTTP_RX_MAX];
+static EosLayout     g_lay;   // scratch layout for descriptor updates on flash
+
+// Map a bank table index to a descriptor slot (0..3) or -1. User banks have
+// EF 0x3..0x6 -> slot 0..3. (Same mapping as the loader UI.)
+static int httpDescSlot(int idx)
+{
+    unsigned char ef = Bank_Ef(idx);
+    if (ef >= 0x3 && ef <= 0x6) return (int)(ef - 0x3);
+    return -1;
+}
 static char   s_json[HTTP_JSON_MAX];
 static char   s_resp[HTTP_RESP_MAX];
 static char   s_name[80];
@@ -81,11 +94,11 @@ static const char* k_page =
 ":root{--p:rgb(168,85,247);--bg:#0a0a0f;--card:#15151c;--dim:#6a6a78;--txt:#e8e8ef;}\n"
 "*{box-sizing:border-box;font-family:system-ui,sans-serif;}\n"
 "body{margin:0;background:var(--bg);color:var(--txt);}\n"
-"header{display:flex;align-items:center;gap:16px;padding:20px;border-bottom:1px solid #222;}\n"
+"header{display:flex;align-items:center;gap:16px;padding:20px;border-bottom:1px solid #222;max-width:1100px;margin:0 auto;}\n"
 "header img{width:72px;height:72px;}\n"
 "h1{font-size:22px;margin:0;letter-spacing:4px;color:var(--p);}\n"
 ".sub{color:var(--dim);font-size:12px;}\n"
-".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;padding:20px;}\n"
+".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;padding:20px;max-width:1100px;margin:0 auto;}\n"
 ".card{background:var(--card);border:1px solid #24242e;border-radius:10px;padding:16px;}\n"
 ".card h2{font-size:16px;margin:0 0 8px;word-break:break-all;}\n"
 ".badge{display:inline-block;font-size:11px;padding:2px 9px;border-radius:20px;border:1px solid #333;color:var(--dim);}\n"
@@ -96,10 +109,17 @@ static const char* k_page =
 "button:hover{border-color:var(--p);}\n"
 "button.danger:hover{border-color:#e05050;color:#e05050;}\n"
 "button.go:hover{border-color:#39d98a;color:#39d98a;}\n"
+".info{margin:10px 0 4px;}\n"
+".kv{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid #1e1e28;font-size:13px;}\n"
+".kv:last-child{border-bottom:none;}\n"
+".kv .k{color:var(--dim);}\n"
+".kv .v{color:var(--txt);font-variant-numeric:tabular-nums;}\n"
+"@media(max-width:520px){.grid{grid-template-columns:1fr;padding:14px;}header{padding:14px;}header img{width:56px;height:56px;}h1{font-size:19px;}.row{gap:6px;}button{flex:1 1 auto;}}\n"
 "#msg{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#1d1d27;border:1px solid var(--p);padding:10px 18px;border-radius:8px;opacity:0;transition:.2s;pointer-events:none;}\n"
 "#msg.show{opacity:1;}\n"
 "</style></head><body>\n"
 "<header><img src='/logo.bmp' alt=''><div><h1>EOS</h1><div class=sub>BIOS bank manager</div></div></header>\n"
+"<div id=budget style='max-width:1100px;margin:0 auto;padding:8px 20px 0;color:#9a9aa8;font-size:13px;'></div>\n"
 "<div class=grid id=grid></div>\n"
 "<div class=grid id=sys></div><div id=msg></div>\n"
 "<script>\n"
@@ -110,10 +130,14 @@ static const char* k_page =
 " let c=document.createElement('div');c.className='card';\n"
 " let h=document.createElement('h2');h.textContent=b.name;c.appendChild(h);\n"
 " let bd=document.createElement('span');\n"
+" let shadow=(b.slot===3);\n"
 " if(b.boot){bd.className='badge boot';bd.textContent='BOOT';}\n"
+" else if(shadow){bd.className='badge';bd.textContent='UNAVAILABLE';}\n"
+" else if(b.slot===2){bd.className='badge ready';bd.textContent=SZ[b.dsize>=0?b.dsize:b.size]+' READY';}\n"
 " else if(b.occ){bd.className='badge ready';bd.textContent=SZ[b.size]+' READY';}\n"
 " else{bd.className='badge';bd.textContent='EMPTY';}\n"
 " c.appendChild(bd);\n"
+" if(shadow){c.style.opacity='0.45';c.appendChild(document.createElement('div'));return c;}\n"
 " let row=document.createElement('div');row.className='row';\n"
 " if(!b.boot){\n"
 "  row.appendChild(btn('Flash','',function(){pick(b.i);}));\n"
@@ -126,6 +150,8 @@ static const char* k_page =
 "async function load(){\n"
 " let r=await fetch('/api/banks');let j=await r.json();\n"
 " let g=document.getElementById('grid');g.innerHTML='';\n"
+" let hdr=document.getElementById('budget');\n"
+" if(hdr)hdr.textContent='User banks: '+(j.freeSlots!==undefined?j.freeSlots:4)+' of 4 free  (1MB budget)';\n"
 " for(const b of j.banks)g.appendChild(card(b));\n"
 "}\n"
 "let fi=document.createElement('input');fi.type='file';fi.accept='.bin';let fb=-1;\n"
@@ -161,17 +187,49 @@ static const char* k_page =
 " if(!confirm('Reset loader settings to defaults? Banks are not touched.'))return;\n"
 " await fetch('/api/reset',{method:'POST'});msg('Settings reset');\n"
 "}\n"
-"function sysCard(){\n"
+"async function clearXbdiag(){\n"
+" if(!confirm('Erase XbDiag Lite from bank 0xD?'))return;\n"
+" let r=await fetch('/api/clrxbdiag');msg(r.ok?'XbDiag cleared':'Clear failed');loadSys();\n"
+"}\n"
+"function kv(k,v){let d=document.createElement('div');d.className='kv';\n"
+" let a=document.createElement('span');a.className='k';a.textContent=k;\n"
+" let b=document.createElement('span');b.className='v';b.textContent=v;\n"
+" d.appendChild(a);d.appendChild(b);return d;}\n"
+"async function loadSys(){\n"
+" let host=document.getElementById('sys');host.innerHTML='';\n"
+" let s={};try{let r=await fetch('/api/sysinfo');s=await r.json();}catch(e){}\n"
 " let c=document.createElement('div');c.className='card';\n"
 " let h=document.createElement('h2');h.textContent='System';c.appendChild(h);\n"
-" let bd=document.createElement('span');bd.className='badge';bd.textContent='EEPROM / SETTINGS';c.appendChild(bd);\n"
+" let info=document.createElement('div');info.className='info';\n"
+" info.appendChild(kv('Loader',s.loader||'?'));\n"
+" info.appendChild(kv('Console',(s.rev||'?')+(s.cpuMhz?'  '+s.cpuMhz+' MHz':'')));\n"
+" info.appendChild(kv('RAM',(s.ramMB?s.ramMB+' MB':'?')));\n"
+" info.appendChild(kv('Encoder',s.encoder||'?'));\n"
+" info.appendChild(kv('Serial',s.serial||'?'));\n"
+" info.appendChild(kv('MAC',s.mac||'?'));\n"
+" info.appendChild(kv('Video',s.video||'?'));\n"
+" info.appendChild(kv('Region',(s.region||'?')+(s.dvd?'  /  '+s.dvd:'')));\n"
+" info.appendChild(kv('Language',s.lang||'?'));\n"
+" info.appendChild(kv('Banks used',(s.usedBanks!==undefined?s.usedBanks:'?')+' / 4'));\n"
+" info.appendChild(kv('Free slots',s.freeSlots!==undefined?s.freeSlots:'?'));\n"
+" info.appendChild(kv('Ext region',s.extReady?'Resident':'Not loaded'));\n"
+" c.appendChild(info);\n"
 " let row=document.createElement('div');row.className='row';\n"
 " row.appendChild(btn('Backup EEPROM','',eeBackup));\n"
 " row.appendChild(btn('Restore EEPROM','',eeRestore));\n"
-" row.appendChild(btn('Reset Settings','danger',resetSettings));\n"
-" c.appendChild(row);return c;\n"
+" c.appendChild(row);\n"
+" let row2=document.createElement('div');row2.className='row';\n"
+" row2.appendChild(btn('Reset Settings','danger',resetSettings));\n"
+" c.appendChild(row2);\n"
+" if(s.xbdiag){\n"
+"  info.appendChild(kv('XbDiag Lite','Installed (bank 0xD)'));\n"
+"  let row3=document.createElement('div');row3.className='row';\n"
+"  row3.appendChild(btn('Clear XbDiag','danger',clearXbdiag));\n"
+"  c.appendChild(row3);\n"
+" }\n"
+" host.appendChild(c);\n"
 "}\n"
-"document.getElementById('sys').appendChild(sysCard());\n"
+"loadSys();\n"
 "load();\n"
 "</script></body></html>\n";
 
@@ -179,7 +237,26 @@ static const char* k_page =
 static int buildBanks(char* o)
 {
     int p = 0, i, n = Bank_Count();
-    p += appS(o + p, "{\"banks\":[");
+    EosLayout lay; int layOk = Desc_Load(&lay);
+
+    // DISPLAY-ONLY heal: correct the in-memory layout so the bank list and free
+    // count reflect real occupancy, but NEVER write the descriptor to flash --
+    // doing so flips the FPGA to descriptor_valid and routes static 256K banks
+    // through the dynamic path, which regressed bank boot. Only an actual
+    // ext-bank flash persists a descriptor.
+    if (!layOk) { Desc_InitEmpty(&lay); layOk = 1; }
+    for (i = 0; i < n; ++i) {
+        int slot = httpDescSlot(i);
+        if (slot >= 0 && lay.slot[slot].state == EOS_SLOT_FREE && Bank_Occupied(i)) {
+            lay.slot[slot].state = EOS_SLOT_NATIVE;
+            lay.slot[slot].sizeCode = EOS_SZC_256K;
+            lay.slot[slot].physBase = 0;
+        }
+    }
+
+    p += appS(o + p, "{\"freeSlots\":");
+    p += appI(o + p, Desc_FreeSlots(&lay));
+    p += appS(o + p, ",\"banks\":[");
     for (i = 0; i < n; ++i) {
         if (i) o[p++] = ',';
         p += appS(o + p, "{\"i\":");    p += appI(o + p, i);
@@ -188,9 +265,79 @@ static int buildBanks(char* o)
         p += appS(o + p, ",\"occ\":");  p += appI(o + p, Bank_Occupied(i));
         p += appS(o + p, ",\"size\":"); p += appI(o + p, Bank_SizeCode(i));
         p += appS(o + p, ",\"boot\":"); p += appI(o + p, Bank_IsBoot(i));
+        p += appS(o + p, ",\"slot\":");
+        {
+            int ds = httpDescSlot(i);
+            p += appI(o + p, (layOk && ds >= 0) ? lay.slot[ds].state : -1);
+        }
+        p += appS(o + p, ",\"dsize\":");
+        {
+            int ds = httpDescSlot(i);
+            p += appI(o + p, (layOk && ds >= 0) ? lay.slot[ds].sizeCode : -1);
+        }
         o[p++] = '}';
     }
     p += appS(o + p, "]}");
+    o[p] = 0; return p;
+}
+
+// ---- JSON: system info -----------------------------------------------------
+static int buildSysInfo(char* o)
+{
+    int p = 0, i, occ = 0;
+    EosLayout lay; int layOk = Desc_Load(&lay);
+    EosEeprom ee;
+    EosConsole con;
+    char macbuf[20];
+
+    // Console (SMC/SMBus + kernel) and EEPROM (kernel decrypted) reads. Neither
+    // touches the FPGA flash-command engine, so this is safe while banks serve.
+    Console_Read(&con);
+    Eeprom_Read(&ee);
+    if (ee.macValid) Eeprom_MacStr(&ee, macbuf); else { macbuf[0] = '?'; macbuf[1] = 0; }
+
+    for (i = 0; i < Bank_Count(); ++i)
+        if (httpDescSlot(i) >= 0 && Bank_Occupied(i)) ++occ;
+
+    p += appS(o + p, "{\"loader\":\"");
+    p += appS(o + p, EOS_LOADER_VERSION);
+
+    // console identity
+    p += appS(o + p, "\",\"rev\":\"");
+    p += appJson(o + p, con.revStr ? con.revStr : "?");
+    p += appS(o + p, "\",\"cpuMhz\":");
+    p += appI(o + p, con.cpuMhz);
+    p += appS(o + p, ",\"ramMB\":");
+    p += appI(o + p, (int)con.ramMB);
+    p += appS(o + p, ",\"encoder\":\"");
+    p += appJson(o + p, con.encStr ? con.encStr : "?");
+
+    // eeprom identity
+    p += appS(o + p, "\",\"serial\":\"");
+    p += appJson(o + p, ee.valid ? ee.serial : "?");
+    p += appS(o + p, "\",\"mac\":\"");
+    p += appJson(o + p, macbuf);
+    p += appS(o + p, "\",\"video\":\"");
+    p += appJson(o + p, Eeprom_VideoStandardStr(&ee));
+    p += appS(o + p, "\",\"region\":\"");
+    p += appJson(o + p, Eeprom_GameRegionStr(&ee));
+    p += appS(o + p, "\",\"dvd\":\"");
+    p += appJson(o + p, Eeprom_DvdRegionStr(&ee));
+    p += appS(o + p, "\",\"lang\":\"");
+    p += appJson(o + p, Eeprom_LanguageStr(&ee));
+
+    // loader/bank state
+    p += appS(o + p, "\",\"usedBanks\":");
+    p += appI(o + p, occ);
+    p += appS(o + p, ",\"freeSlots\":");
+    p += appI(o + p, layOk ? Desc_FreeSlots(&lay) : 4);
+    p += appS(o + p, ",\"extReady\":");
+    p += appI(o + p, Flash_NewRegionReady());
+    // XbDiag Lite presence -- cached probe (primed at boot), NOT a live flash
+    // read here. Drives the web UI's XbDiag row + Clear button.
+    p += appS(o + p, ",\"xbdiag\":");
+    p += appI(o + p, Bank_XbDiagPresent());
+    p += appS(o + p, "}");
     o[p] = 0; return p;
 }
 
@@ -276,6 +423,8 @@ static void parseReq(void)
     else if (strEqN(path, "/api/launch", 11)) s_route = R_LAUNCH;
     else if (strEqN(path, "/api/eeprom", 11)) s_route = R_EEPROM;
     else if (strEqN(path, "/api/reset", 10))  s_route = R_RESET;
+    else if (strEqN(path, "/api/sysinfo", 12)) s_route = R_SYSINFO;
+    else if (strEqN(path, "/api/clrxbdiag", 14)) s_route = R_CLRXBDIAG;
     else if (strEqN(path, "/logo.bmp", 9)) s_route = R_LOGO;
     else if (path[0] == '/' && (path[1] == ' ' || path[1] == '?')) s_route = R_PAGE;
 
@@ -307,6 +456,15 @@ static void process(void)
 
     if (s_route == R_PAGE) { respond("200 OK", "text/html", k_page, aLen(k_page)); return; }
     if (s_route == R_BANKS) { int len = buildBanks(s_json); respond("200 OK", "application/json", s_json, len); return; }
+    if (s_route == R_SYSINFO) { int len = buildSysInfo(s_json); respond("200 OK", "application/json", s_json, len); return; }
+    if (s_route == R_CLRXBDIAG) {
+        int i, xd = -1;
+        for (i = 0; i < Bank_Count(); ++i) if ((Bank_Ef(i) & 0x0F) == 0x0D) { xd = i; break; }
+        if (xd < 0) { respondText("404 Not Found", "no XbDiag bank"); return; }
+        if (Flash_EraseBank(0x0D) != EOS_FLASH_OK) { respondText("500 Error", "erase failed"); return; }
+        Bank_ClearEntry(xd); Config_Save();
+        respondText("200 OK", "XbDiag cleared"); return;
+    }
     if (s_route == R_LOGO) { int len = buildLogoBmp(s_rx); respond("200 OK", "image/bmp", (const char*)s_rx, len); return; }
 
     if (s_route == R_RENAME) {
@@ -316,8 +474,39 @@ static void process(void)
         respondText("200 OK", "ok"); return;
     }
     if (s_route == R_DELETE) {
+        int dslot = httpDescSlot(s_bank);
         if (s_bank < 0 || s_bank >= n || Bank_IsBoot(s_bank) || !Bank_Occupied(s_bank)) { respondText("400 Bad Request", "bad bank"); return; }
+
+        // Large bank (anchor): erase its new-region blocks + clear descriptor.
+        // Otherwise a normal 256K bank in the default range -- erase as before.
+        if (dslot >= 0 && Desc_Load(&g_lay) && g_lay.valid &&
+            g_lay.slot[dslot].state == EOS_SLOT_ANCHOR) {
+            int span = Desc_SlotsFor(g_lay.slot[dslot].sizeCode);
+            unsigned int base = g_lay.slot[dslot].physBase;
+            int nblk = (span == 4) ? 16 : 8;
+            int bk, j;
+            if (base >= EOS_NEWRGN_BASE && base < (EOS_NEWRGN_BASE + 0x100000)) {
+                int firstBlk = (int)((base - EOS_NEWRGN_BASE) / 0x10000);
+                for (bk = 0; bk < nblk && (firstBlk + bk) < 16; ++bk)
+                    if (Flash_EraseBlock(EOS_BANK_NEWREGION, firstBlk + bk) != EOS_FLASH_OK) { respondText("500 Error", "erase failed"); return; }
+            }
+            for (j = 0; j < span && (dslot + j) < EOS_DESC_SLOTS; ++j) {
+                int tbl;
+                g_lay.slot[dslot + j].state = EOS_SLOT_FREE;
+                g_lay.slot[dslot + j].sizeCode = EOS_SZC_256K;
+                g_lay.slot[dslot + j].physBase = 0;
+                tbl = Bank_IndexForEf((unsigned char)(0x3 + dslot + j));
+                if (tbl >= 0) Bank_ClearEntry(tbl);
+            }
+            Desc_Save(&g_lay); Config_Save();
+            respondText("200 OK", "ok"); return;
+        }
+
         if (Flash_EraseBank(Bank_Ef(s_bank)) == EOS_FLASH_OK) {
+            if (dslot >= 0 && Desc_Load(&g_lay) && g_lay.valid && g_lay.slot[dslot].state == EOS_SLOT_NATIVE) {
+                g_lay.slot[dslot].state = EOS_SLOT_FREE; g_lay.slot[dslot].sizeCode = EOS_SZC_256K; g_lay.slot[dslot].physBase = 0;
+                Desc_Save(&g_lay);
+            }
             Bank_ClearEntry(s_bank); Config_Save();
             respondText("200 OK", "ok");
         }
@@ -327,12 +516,74 @@ static void process(void)
     if (s_route == R_FLASH) {
         int sc;
         if (s_bank < 0 || s_bank >= n || Bank_IsBoot(s_bank)) { respondText("400 Bad Request", "bad bank"); return; }
-        if (s_err == 413) { respondText("413 Too Large", "image exceeds bank capacity"); return; }
+        if (s_err == 413) { respondText("413 Too Large", "image exceeds 1MB budget"); return; }
         if (s_clen <= 0) { respondText("400 Bad Request", "no image"); return; }
-        if (Flash_WriteImage(Bank_Ef(s_bank), s_rx, s_clen) != EOS_FLASH_OK) { respondText("500 Error", "flash failed"); return; }
         sc = (s_clen <= 256 * 1024) ? EOS_BANK_SIZE_256K : (s_clen <= 512 * 1024) ? EOS_BANK_SIZE_512K : EOS_BANK_SIZE_1MB;
-        Bank_SetOccupied(s_bank, 1, sc); Config_Save();
-        respondText("200 OK", "ok"); return;
+
+        if (sc == EOS_BANK_SIZE_256K) {
+            // 256K: DEFAULT range, exactly as before. No descriptor.
+            int dslot = httpDescSlot(s_bank);
+            if (dslot >= 0 && Desc_Load(&g_lay) && g_lay.valid &&
+                (g_lay.slot[dslot].state == EOS_SLOT_SHADOW || g_lay.slot[dslot].state == EOS_SLOT_ANCHOR)) {
+                respondText("409 Conflict", "bank used by an oversized BIOS - delete it first"); return;
+            }
+            if (Flash_WriteImage(Bank_Ef(s_bank), s_rx, s_clen) != EOS_FLASH_OK) { respondText("500 Error", "flash failed"); return; }
+            Bank_SetOccupied(s_bank, 1, sc);
+            // Record NATIVE in the descriptor so auto-place won't overwrite it.
+            if (dslot >= 0) {
+                if (!Desc_Load(&g_lay) || !g_lay.valid) Desc_InitEmpty(&g_lay);
+                g_lay.slot[dslot].state = EOS_SLOT_NATIVE;
+                g_lay.slot[dslot].sizeCode = EOS_SZC_256K;
+                g_lay.slot[dslot].physBase = 0;
+                Desc_Save(&g_lay);
+            }
+            Config_Save();
+            respondText("200 OK", "ok"); return;
+        }
+
+        // large BIOS -> new region, auto-placed into a free half
+        {
+            int szc = (sc == EOS_BANK_SIZE_1MB) ? EOS_SZC_1MB : EOS_SZC_512K;
+            int need = Desc_SlotsFor(szc);
+            int slot = -1, cand, allFree;
+            unsigned int nrbase;
+            int startPage, j;
+            if (httpDescSlot(s_bank) < 0) { respondText("400 Bad Request", "not a user slot"); return; }
+            if (!Desc_Load(&g_lay) || !g_lay.valid) Desc_InitEmpty(&g_lay);
+
+            // auto-place: 1MB needs all 4 free; 512K takes the first free even pair
+            if (szc == EOS_SZC_1MB) {
+                allFree = 1;
+                for (j = 0; j < EOS_DESC_SLOTS; ++j)
+                    if (g_lay.slot[j].state != EOS_SLOT_FREE) { allFree = 0; break; }
+                if (allFree) slot = 0;
+            }
+            else {
+                for (cand = 0; cand <= 2; cand += 2)
+                    if (g_lay.slot[cand].state == EOS_SLOT_FREE && g_lay.slot[cand + 1].state == EOS_SLOT_FREE) { slot = cand; break; }
+            }
+            if (slot < 0) { respondText("409 Conflict", (szc == EOS_SZC_1MB) ? "need all banks free" : "no free pair - free some banks"); return; }
+
+            nrbase = (szc == EOS_SZC_1MB) ? EOS_NEWRGN_BASE
+                : (slot >= 2) ? (EOS_NEWRGN_BASE + EOS_NEWRGN_HALF)
+                : EOS_NEWRGN_BASE;
+            startPage = (int)((nrbase - EOS_NEWRGN_BASE) / 256);
+            if (Flash_WriteImageAtNoSync(EOS_BANK_NEWREGION, startPage, s_rx, s_clen) != EOS_FLASH_OK) { respondText("500 Error", "flash failed (new region)"); return; }
+            Flash_SyncNewRegion();   // page into SDRAM so it's launchable now
+            g_lay.slot[slot].state = EOS_SLOT_ANCHOR;
+            g_lay.slot[slot].sizeCode = (unsigned char)szc;
+            g_lay.slot[slot].physBase = nrbase;
+            for (j = 1; j < need; ++j) {
+                g_lay.slot[slot + j].state = EOS_SLOT_SHADOW; g_lay.slot[slot + j].sizeCode = EOS_SZC_256K; g_lay.slot[slot + j].physBase = 0;
+            }
+            if (Desc_Save(&g_lay) != EOS_FLASH_OK) { respondText("500 Error", "descriptor write failed"); return; }
+            {
+                int anchorTbl = Bank_IndexForEf((unsigned char)(0x3 + slot));
+                if (anchorTbl >= 0) Bank_SetOccupied(anchorTbl, 1, sc);
+            }
+            Config_Save();
+            respondText("200 OK", "ok"); return;
+        }
     }
     if (s_route == R_LAUNCH) {
         if (s_bank < 0 || s_bank >= n || Bank_IsBoot(s_bank) || !Bank_Occupied(s_bank)) { respondText("400 Bad Request", "bad bank"); return; }
@@ -370,8 +621,9 @@ static void beginBody(void)
 {
     s_rxRecv = 0; s_rxStore = 0; s_store = 1; s_err = 0;
     if (s_route == R_FLASH) {
-        int cap = Bank_CapacityBytes(s_bank >= 0 ? s_bank : 0);
-        if (cap > HTTP_RX_MAX) cap = HTTP_RX_MAX;
+        // Accept up to the full 1MB budget; an oversized image is routed to the
+        // new region and the slot-fit (free-run) check happens in the handler.
+        int cap = HTTP_RX_MAX;
         if (s_clen > cap) { s_err = 413; s_store = 0; }   // drain then 413
     }
     else if (s_route == R_EEPROM) {
@@ -485,6 +737,8 @@ void Http_Poll(void)
         if (s_launch >= 0) {
             int bank = s_launch;
             closeConn();
+            // Every bank launches normally; the FPGA redirects an oversized anchor
+            // to the ext-region SDRAM copy.
             Bank_Launch(bank);            // 0xEF + SMC warm reset -- does not return
             return;
         }

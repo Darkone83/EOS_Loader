@@ -19,17 +19,19 @@
     <ClCompile Include="eos_clock.cpp" />
     <ClCompile Include="eos_config.cpp" />
     <ClCompile Include="eos_console.cpp" />
+    <ClCompile Include="eos_descriptor.cpp" />
     <ClCompile Include="eos_eeprom.cpp" />
-    <ClCompile Include="eos_eeprom_crypto.cpp" />
     <ClCompile Include="eos_eeprom_io.cpp" />
+    <ClCompile Include="eos_ee_crypto.cpp" />
+    <ClCompile Include="eos_ee_data.cpp" />
     <ClCompile Include="eos_file.cpp" />
     <ClCompile Include="eos_firmware_io.cpp" />
     <ClCompile Include="eos_flash.cpp" />
     <ClCompile Include="eos_font.cpp" />
-    <ClCompile Include="eos_fotl.cpp">
+    <ClCompile Include="eos_ftoi.cpp">
       <WholeProgramOptimization Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">false</WholeProgramOptimization>
     </ClCompile>
-    <ClCompile Include="eos_fotmat.cpp" />
+    <ClCompile Include="eos_format.cpp" />
     <ClCompile Include="eos_gfx.cpp" />
     <ClCompile Include="eos_hdd.cpp" />
     <ClCompile Include="eos_http.cpp" />
@@ -55,9 +57,11 @@
     <ClInclude Include="eos_clock.h" />
     <ClInclude Include="eos_config.h" />
     <ClInclude Include="eos_console.h" />
+    <ClInclude Include="eos_descriptor.h" />
     <ClInclude Include="eos_eeprom.h" />
-    <ClInclude Include="eos_eeprom_crypto.h" />
     <ClInclude Include="eos_eeprom_io.h" />
+    <ClInclude Include="eos_ee_crypto.h" />
+    <ClInclude Include="eos_ee_data.h" />
     <ClInclude Include="eos_file.h" />
     <ClInclude Include="eos_firmware_io.h" />
     <ClInclude Include="eos_flash.h" />

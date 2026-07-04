@@ -37,6 +37,7 @@ bool Gfx_Init();
 void Gfx_Shutdown();
 void Gfx_Begin(DWORD clear_argb);   // Clear + BeginScene
 void Gfx_End();                     // EndScene + Present
+void Gfx_SetOverlay(void (*cb)(void));  // persistent overlay drawn every frame (HUD)
 
 // Create a managed linear ARGB texture from a CPU pixel buffer (row-major,
 // w*h DWORDs, 0xAARRGGBB). Returns NULL on failure.

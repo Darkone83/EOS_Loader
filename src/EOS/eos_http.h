@@ -16,7 +16,12 @@
 //   POST /api/launch?b=N                           -> warm-reset into bank N
 #pragma once
 
-void Http_Start(void);   // bind + listen on :8008 (call once the net is up)
+// Loader version string, shared by the on-screen UI and the web UI.
+#ifndef EOS_LOADER_VERSION
+#define EOS_LOADER_VERSION "1.0"
+#endif
+
+void Http_Start(void);   // bind + listen on :80 (call once the net is up)
 void Http_Stop(void);    // close listener + any active connection
 int  Http_IsUp(void);    // 1 if listening
-void Http_Poll(void);    // advance accept/recv/process/send (non-blocking)#pragma once
+void Http_Poll(void);    // advance accept/recv/process/send (non-blocking)

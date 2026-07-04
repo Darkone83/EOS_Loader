@@ -36,7 +36,7 @@
     <ClCompile Include="eos_gfx.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="eos_fotl.cpp">
+    <ClCompile Include="eos_ftoi.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="eos_bank.cpp">
@@ -90,19 +90,25 @@
     <ClCompile Include="eos_firmware_io.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="eos_eeprom_crypto.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="eos_hdd.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="dd_ftp.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="eos_fotmat.cpp">
+    <ClCompile Include="eos_format.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="eos_audio.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="eos_descriptor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="eos_ee_data.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="eos_ee_crypto.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -190,9 +196,6 @@
     <ClInclude Include="eos_firmware_io.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="eos_eeprom_crypto.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="eos_hdd.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -206,6 +209,15 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="eos_audio.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="eos_descriptor.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="eos_ee_data.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="eos_ee_crypto.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

@@ -34,10 +34,26 @@ int Flash_ReadPage(int bankEf, int page, unsigned char* out256);
 // the bank's capacity. Returns 0 on success.
 int Flash_WriteImage(int bankEf, const unsigned char* data, int len);
 
+// Write an image WITHOUT the trailing SDRAM sync -- for the new region (0x0)
+// and descriptor (0xF), which must not disturb the live serve buffer.
+int Flash_WriteImageNoSync(int bankEf, const unsigned char* data, int len);
+
+// Write `len` bytes starting at page `startPage` within the bank, no sync.
+int Flash_WriteImageAtNoSync(int bankEf, int startPage, const unsigned char* data, int len);
+
+// Erase a single 64K block (index) within a bank. For placing one new-region half.
+int Flash_EraseBlock(int bankEf, int block);
+
 // Reload a bank's flash contents into the served SDRAM copy. WriteImage calls
 // this for you; exposed for a standalone "refresh after flashing" action.
 int Flash_Sync(int bankEf);
+int Flash_SyncNewRegion(void);   // sync bank 0x0 -> SDRAM NRGN_SD (post large-flash)
+int Flash_NewRegionReady(void);  // STATUS bit5: ext region resident in SDRAM
 
 // Raw register reads (diagnostics / progress UI).
 unsigned char Flash_RawStatus(void);    // {.., refused, done, busy}
 unsigned char Flash_LastFlashSR(void);  // flash status register from the last poll
+
+// Tell the FPGA to re-read the bank-layout descriptor (bank 0xF) after writing
+// it, so dynamic bank geometry updates live (no reboot needed).
+void Flash_ReloadDescriptor(void);

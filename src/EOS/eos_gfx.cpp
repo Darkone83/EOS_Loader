@@ -248,8 +248,15 @@ void Gfx_Begin(DWORD clear_argb)
     SetState2D();
 }
 
+// Optional overlay hook: drawn on top of every frame, inside the open scene,
+// just before EndScene/Present. Lets a persistent HUD render across all screens
+// without editing each screen's draw path. NULL = no overlay.
+static void (*s_overlayCb)(void) = 0;
+void Gfx_SetOverlay(void (*cb)(void)) { s_overlayCb = cb; }
+
 void Gfx_End()
 {
+    if (s_overlayCb) s_overlayCb();
     g_dev->EndScene();
     g_dev->Present(NULL, NULL, NULL, NULL);
 }
