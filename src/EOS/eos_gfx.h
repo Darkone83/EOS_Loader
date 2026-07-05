@@ -32,6 +32,8 @@ extern int         g_scrW;
 extern int         g_scrH;
 extern BOOL        g_isWide;
 extern const char* g_videoMode;
+extern int         g_bbW;          // native backbuffer width  (1280 @720p)
+extern int         g_bbH;          // native backbuffer height (720 @720p)
 
 bool Gfx_Init();
 void Gfx_Shutdown();

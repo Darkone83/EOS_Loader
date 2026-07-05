@@ -84,6 +84,27 @@ static void orbsDraw(void)
 // Solid base fill, then the real 3D parallax field behind everything.
 void Ui_Backdrop(void)
 {
+    IDirect3DTexture8* bg = Theme_BgTex();
+    if (bg) {
+        // Fullscreen image backdrop. Swizzled POT texture; the used region is
+        // the sub-rect (0,0)..(u1,v1), drawn over the whole 640x480 design
+        // backbuffer which the NV2A scales to the output mode (480i/480p/720p).
+        // Tint is pure white (0xFFFFFFFF), NOT EOS_WHITE -- the diffuse modulates
+        // the texture and a themed near-white would tint the photo.
+        int dim;
+        Gfx_SetFilter(TRUE);   // smooth scale to the output mode
+        Gfx_DrawTex(bg, 0, 0, (float)g_scrW, (float)g_scrH,
+            0, 0, Theme_BgU1(), Theme_BgV1(), 0xFFFFFFFF);
+        Gfx_SetFilter(FALSE);
+
+        dim = Theme_BgDim();
+        if (dim > 0)
+            Gfx_Fill(0, 0, (float)g_scrW, (float)g_scrH,
+                EOS_ARGB((dim * 255) / 100, 0, 0, 0));
+        return;                // image mode: no orbs
+    }
+
+    // Default: flat fill + animated orbs.
     Gfx_Fill(0, 0, (float)g_scrW, (float)g_scrH, EOS_BG);
     orbsStep();
     Gfx_Begin3D();

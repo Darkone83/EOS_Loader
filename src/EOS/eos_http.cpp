@@ -10,6 +10,7 @@
 #include "eos_eeprom.h"
 #include "eos_console.h"
 #include "eos_logo_data.h"   // EOS_LOGO_W/H, EOS_LOGO_PAL[15][3], EOS_LOGO_4BPP[]
+#include "eos_file.h"        // File_ListDir/Exists/ReadInto, EosFileEntry (custom themes)
 
 #define HTTP_PORT      80
 #define HTTP_REQ_MAX   8192
@@ -20,7 +21,10 @@
 
 enum { ST_IDLE = 0, ST_HDR, ST_BODY, ST_SEND };
 enum { M_GET = 0, M_POST };
-enum { R_NONE = 0, R_PAGE, R_LOGO, R_BANKS, R_RENAME, R_DELETE, R_FLASH, R_LAUNCH, R_EEPROM, R_RESET, R_SYSINFO, R_CLRXBDIAG };
+enum {
+    R_NONE = 0, R_PAGE, R_LOGO, R_BANKS, R_RENAME, R_DELETE, R_FLASH, R_LAUNCH, R_EEPROM, R_RESET, R_SYSINFO, R_CLRXBDIAG,
+    R_THEMES, R_TINI, R_TFILE, R_TDEL
+};   // custom-theme web tools (Phase 4)
 
 static SOCKET s_listen = INVALID_SOCKET;
 static SOCKET s_conn = INVALID_SOCKET;
@@ -46,6 +50,8 @@ static int httpDescSlot(int idx)
 static char   s_json[HTTP_JSON_MAX];
 static char   s_resp[HTTP_RESP_MAX];
 static char   s_name[80];
+static char   s_tFolder[64], s_tName[64];       // theme route query params
+static HANDLE s_upFile = INVALID_HANDLE_VALUE;  // streaming theme-file upload
 
 // send segments: headers then body
 static const char* s_txH; static int s_txHLen, s_txHOff;
@@ -117,11 +123,34 @@ static const char* k_page =
 "@media(max-width:520px){.grid{grid-template-columns:1fr;padding:14px;}header{padding:14px;}header img{width:56px;height:56px;}h1{font-size:19px;}.row{gap:6px;}button{flex:1 1 auto;}}\n"
 "#msg{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#1d1d27;border:1px solid var(--p);padding:10px 18px;border-radius:8px;opacity:0;transition:.2s;pointer-events:none;}\n"
 "#msg.show{opacity:1;}\n"
+".modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);align-items:center;justify-content:center;z-index:50;padding:16px;}\n"
+".modalcard{background:var(--card);border:1px solid var(--p);border-radius:10px;padding:20px;max-width:460px;width:100%;max-height:90vh;overflow:auto;}\n"
+".modalcard h2{margin:0 0 12px;color:var(--p);font-size:18px;}\n"
+".modalcard label{display:block;margin:9px 0;font-size:12px;color:var(--dim);}\n"
+".modalcard input{background:#0f0f16;border:1px solid #2c2c38;border-radius:6px;color:var(--txt);padding:6px;}\n"
+".modalcard input#mname,.modalcard input[type=file]{width:100%;display:block;margin-top:4px;}\n"
+".modalcard input[type=color]{width:46px;height:28px;padding:2px;vertical-align:middle;cursor:pointer;}\n"
+".modalcard input[type=range]{width:70%;padding:0;vertical-align:middle;}\n"
+"#colors{display:grid;grid-template-columns:1fr 1fr;gap:2px 10px;}\n"
+"#colors label{display:flex;align-items:center;justify-content:space-between;}\n"
+"#mprog{color:var(--p);font-size:12px;min-height:16px;margin-top:8px;}\n"
+"#themecard .kv .k{overflow:hidden;text-overflow:ellipsis;}\n"
+"#themecard .kv button{padding:4px 9px;font-size:12px;margin-left:6px;}\n"
 "</style></head><body>\n"
 "<header><img src='/logo.bmp' alt=''><div><h1>EOS</h1><div class=sub>BIOS bank manager</div></div></header>\n"
 "<div id=budget style='max-width:1100px;margin:0 auto;padding:8px 20px 0;color:#9a9aa8;font-size:13px;'></div>\n"
 "<div class=grid id=grid></div>\n"
 "<div class=grid id=sys></div><div id=msg></div>\n"
+"<div id=modal class=modal><div class=modalcard>\n"
+" <h2 id=mtitle>Create Theme</h2>\n"
+" <label>Name<input id=mname></label>\n"
+" <div id=colors></div>\n"
+" <label>Background dim <input id=mdim type=range min=0 max=100 value=40> <span id=mdimv>40</span></label>\n"
+" <label>Background image (png or jpg)<input id=mbg type=file accept=image/png,image/jpeg></label>\n"
+" <label>Music (mp3, optional)<input id=mmus type=file accept=audio/mpeg,.mp3></label>\n"
+" <div id=mprog></div>\n"
+" <div class=row><button id=msave class=go>Save</button><button id=mcancel class=danger>Cancel</button></div>\n"
+"</div></div>\n"
 "<script>\n"
 "const SZ=['256K','512K','1MB'];\n"
 "function msg(t){let m=document.getElementById('msg');m.textContent=t;m.classList.add('show');setTimeout(function(){m.classList.remove('show');},2500);}\n"
@@ -228,9 +257,43 @@ static const char* k_page =
 "  c.appendChild(row3);\n"
 " }\n"
 " host.appendChild(c);\n"
+" await renderThemes();\n"
 "}\n"
+"const CK=[['bg_top','BG Top'],['bg_bottom','BG Bottom'],['panel','Panel'],['accent','Accent'],['glow','Glow'],['text','Text'],['text_dim','Text Dim']];\n"
+"const CDEF={bg_top:'#0a0a0f',bg_bottom:'#05050a',panel:'#15151c',accent:'#a855f7',glow:'#c77dff',text:'#e8e8ef',text_dim:'#6a6a78'};\n"
+"let editFolder=null,curBg='',curMus='';\n"
+"function showModal(on){document.getElementById('modal').style.display=on?'flex':'none';}\n"
+"function extOf(fn){let i=fn.lastIndexOf('.');return i>=0?fn.slice(i).toLowerCase():'';}\n"
+"function normColor(c){c=(c||'').trim().toLowerCase();if(c.length==7&&c[0]=='#'){let ok=true;for(let i=1;i<7;i++){let h=c[i];if(!((h>='0'&&h<='9')||(h>='a'&&h<='f')))ok=false;}if(ok)return c;}return '#888888';}\n"
+"function parseIni(t){let o={};for(const ln of t.split('\\n')){let s=ln.trim();if(!s||s[0]=='#'||s[0]==';')continue;let e=s.indexOf('=');if(e<0)continue;o[s.slice(0,e).trim().toLowerCase()]=s.slice(e+1).trim();}return o;}\n"
+"function buildColorInputs(){let w=document.getElementById('colors');w.innerHTML='';for(const kc of CK){let l=document.createElement('label');l.textContent=kc[1];let ci=document.createElement('input');ci.type='color';ci.id='c_'+kc[0];ci.value=CDEF[kc[0]]||'#888888';l.appendChild(ci);w.appendChild(l);}}\n"
+"function initModal(){document.getElementById('msave').addEventListener('click',saveTheme);document.getElementById('mcancel').addEventListener('click',function(){showModal(false);});let dm=document.getElementById('mdim');dm.addEventListener('input',function(){document.getElementById('mdimv').textContent=dm.value;});}\n"
+"async function renderThemes(){let host=document.getElementById('sys');let old=document.getElementById('themecard');if(old)old.remove();let t={themes:[]};try{let r=await fetch('/api/themes');t=await r.json();}catch(e){}\n"
+" let c=document.createElement('div');c.className='card';c.id='themecard';let h=document.createElement('h2');h.textContent='Custom Themes';c.appendChild(h);\n"
+" let info=document.createElement('div');info.className='info';\n"
+" if(!t.themes||!t.themes.length){let e=document.createElement('div');e.className='kv';e.textContent='No custom themes yet';info.appendChild(e);}\n"
+" else{for(const nm of t.themes){let row=document.createElement('div');row.className='kv';let k=document.createElement('span');k.className='k';k.textContent=nm;row.appendChild(k);let v=document.createElement('span');v.appendChild(btn('Edit','',function(){openEdit(nm);}));v.appendChild(btn('Delete','danger',function(){delTheme(nm);}));row.appendChild(v);info.appendChild(row);}}\n"
+" c.appendChild(info);let r2=document.createElement('div');r2.className='row';r2.appendChild(btn('Create Theme','go',openCreate));c.appendChild(r2);host.appendChild(c);}\n"
+"function openCreate(){editFolder=null;curBg='';curMus='';document.getElementById('mtitle').textContent='Create Theme';let mn=document.getElementById('mname');mn.value='';mn.disabled=false;document.getElementById('mdim').value=40;document.getElementById('mdimv').textContent='40';document.getElementById('mbg').value='';document.getElementById('mmus').value='';for(const kc of CK)document.getElementById('c_'+kc[0]).value=CDEF[kc[0]];document.getElementById('mprog').textContent='';showModal(true);}\n"
+"async function openEdit(folder){editFolder=folder;document.getElementById('mtitle').textContent='Edit Theme';let mn=document.getElementById('mname');mn.value=folder;mn.disabled=true;document.getElementById('mbg').value='';document.getElementById('mmus').value='';document.getElementById('mprog').textContent='';\n"
+" let txt='';try{let r=await fetch('/api/theme/ini?folder='+encodeURIComponent(folder));txt=await r.text();}catch(e){}let kv=parseIni(txt);curBg=kv.background||'';curMus=kv.music||'';\n"
+" let dim=kv.bg_dim||'0';document.getElementById('mdim').value=dim;document.getElementById('mdimv').textContent=dim;for(const kc of CK)document.getElementById('c_'+kc[0]).value=normColor(kv[kc[0]]);showModal(true);}\n"
+"function resizeImage(file){return new Promise(function(resolve){let img=new Image();img.onload=function(){let w=img.width,h=img.height,MX=1280,MY=720;if(w<=MX&&h<=MY){resolve(file);return;}let s=Math.min(MX/w,MY/h);let nw=Math.round(w*s),nh=Math.round(h*s);let cv=document.createElement('canvas');cv.width=nw;cv.height=nh;cv.getContext('2d').drawImage(img,0,0,nw,nh);let type=(file.type&&file.type.indexOf('png')>=0)?'image/png':'image/jpeg';cv.toBlob(function(b){resolve(b||file);},type,0.9);};img.onerror=function(){resolve(file);};img.src=URL.createObjectURL(file);});}\n"
+"async function saveTheme(){let name=editFolder||document.getElementById('mname').value.trim().replace(/[^A-Za-z0-9 _-]/g,'');if(!name){alert('Name required');return;}\n"
+" let bgFile=document.getElementById('mbg').files[0];let musFile=document.getElementById('mmus').files[0];let prog=document.getElementById('mprog');\n"
+" let bgName=bgFile?('background'+extOf(bgFile.name)):curBg;let musName=musFile?('music'+extOf(musFile.name)):curMus;\n"
+" let ini='version = 1\\nname = '+name+'\\n';if(bgName)ini+='background = '+bgName+'\\n';ini+='bg_dim = '+document.getElementById('mdim').value+'\\n';if(musName)ini+='music = '+musName+'\\n';\n"
+" for(const kc of CK)ini+=kc[0]+' = '+document.getElementById('c_'+kc[0]).value+'\\n';\n"
+" prog.textContent='Saving theme...';try{\n"
+"  await fetch('/api/theme/ini?folder='+encodeURIComponent(name),{method:'POST',body:ini});\n"
+"  if(bgFile){prog.textContent='Uploading background...';let blob=await resizeImage(bgFile);await fetch('/api/theme/file?folder='+encodeURIComponent(name)+'&name='+encodeURIComponent(bgName),{method:'POST',body:blob});}\n"
+"  if(musFile){prog.textContent='Uploading music...';await fetch('/api/theme/file?folder='+encodeURIComponent(name)+'&name='+encodeURIComponent(musName),{method:'POST',body:musFile});}\n"
+"  prog.textContent='';showModal(false);msg('Theme saved');renderThemes();\n"
+" }catch(e){prog.textContent='Save failed';}}\n"
+"async function delTheme(folder){if(!confirm('Delete theme \"'+folder+'\" ?'))return;try{await fetch('/api/theme/del?folder='+encodeURIComponent(folder),{method:'POST'});}catch(e){}msg('Theme deleted');renderThemes();}\n"
 "loadSys();\n"
 "load();\n"
+"buildColorInputs();initModal();\n"
 "</script></body></html>\n";
 
 // ---- JSON: every bank ------------------------------------------------------
@@ -406,6 +469,107 @@ static int findCLen(void)   // scan headers for Content-Length, -1 if absent
     return -1;
 }
 
+// ---- custom-theme web helpers (Phase 4) -----------------------------------
+static int hx(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+// Extract the query value for 'key' into out (minimal %XX / '+' decode). The
+// key must sit at the query start or just after '?' or '&'. Returns length.
+static int qStr(const char* q, const char* key, char* out, int cap)
+{
+    int i = 0, kl = 0;
+    while (key[kl]) ++kl;
+    out[0] = 0;
+    while (q[i] && q[i] != ' ' && q[i] != '\r') {
+        if (i == 0 || q[i - 1] == '?' || q[i - 1] == '&') {
+            int j = 0;
+            while (j < kl && q[i + j] == key[j]) ++j;
+            if (j == kl && q[i + j] == '=') {
+                int k = i + kl + 1, p = 0;
+                while (q[k] && q[k] != '&' && q[k] != ' ' && q[k] != '\r' && p < cap - 1) {
+                    char c = q[k];
+                    if (c == '%' && q[k + 1] && q[k + 2]) { c = (char)((hx(q[k + 1]) << 4) | hx(q[k + 2])); k += 2; }
+                    else if (c == '+') c = ' ';
+                    out[p++] = c; ++k;
+                }
+                out[p] = 0;
+                return p;
+            }
+        }
+        ++i;
+    }
+    return 0;
+}
+
+// Validate one path component: non-empty, not hidden, no separators / traversal.
+static int safeName(const char* s)
+{
+    int i;
+    if (!s || !s[0] || s[0] == '.') return 0;
+    for (i = 0; s[i]; ++i) {
+        char c = s[i];
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<' || c == '>' || c == '|') return 0;
+        if ((unsigned char)c < 0x20) return 0;
+        if (i >= 63) return 0;
+    }
+    return 1;
+}
+
+// Build "E:\Eos\Themes\<folder>" (+ "\<leaf>" when leaf != 0).
+static void themePath(char* out, int cap, const char* folder, const char* leaf)
+{
+    const char* pre = "E:\\Eos\\Themes\\";
+    int p = 0, i = 0;
+    while (pre[i] && p < cap - 1) out[p++] = pre[i++];
+    for (i = 0; folder[i] && p < cap - 1; ++i) out[p++] = folder[i];
+    if (leaf) {
+        if (p < cap - 1) out[p++] = '\\';
+        for (i = 0; leaf[i] && p < cap - 1; ++i) out[p++] = leaf[i];
+    }
+    out[p] = 0;
+}
+
+// {"themes":["Name",...]} -- folders under E:\Eos\Themes with a theme.ini.
+static int buildThemesJson(char* o)
+{
+    static EosFileEntry ents[64];
+    char ini[256];
+    int  p = 0, n, i, first = 1;
+    n = File_ListDir("E:\\Eos\\Themes", ents, 64);
+    p += appS(o + p, "{\"themes\":[");
+    for (i = 0; i < n; ++i) {
+        if (!ents[i].is_dir) continue;
+        themePath(ini, sizeof(ini), ents[i].name, "theme.ini");
+        if (!File_Exists(ini)) continue;
+        if (!first) o[p++] = ',';
+        first = 0;
+        o[p++] = '"'; p += appJson(o + p, ents[i].name); o[p++] = '"';
+    }
+    p += appS(o + p, "]}");
+    return p;
+}
+
+// Delete every file in a theme folder (flat), then the folder. 1 on rmdir ok.
+static int deleteThemeFolder(const char* folder)
+{
+    static EosFileEntry ents[64];
+    char dir[256], fp[256];
+    int  n, i;
+    themePath(dir, sizeof(dir), folder, 0);
+    n = File_ListDir(dir, ents, 64);
+    for (i = 0; i < n; ++i) {
+        if (ents[i].is_dir) continue;
+        themePath(fp, sizeof(fp), folder, ents[i].name);
+        DeleteFileA(fp);
+    }
+    return RemoveDirectoryA(dir) ? 1 : 0;
+}
 static void parseReq(void)
 {
     int i = 0; const char* path;
@@ -425,10 +589,18 @@ static void parseReq(void)
     else if (strEqN(path, "/api/reset", 10))  s_route = R_RESET;
     else if (strEqN(path, "/api/sysinfo", 12)) s_route = R_SYSINFO;
     else if (strEqN(path, "/api/clrxbdiag", 14)) s_route = R_CLRXBDIAG;
+    else if (strEqN(path, "/api/themes", 11)) s_route = R_THEMES;
+    else if (strEqN(path, "/api/theme/ini", 14)) s_route = R_TINI;
+    else if (strEqN(path, "/api/theme/file", 15)) s_route = R_TFILE;
+    else if (strEqN(path, "/api/theme/del", 14)) s_route = R_TDEL;
     else if (strEqN(path, "/logo.bmp", 9)) s_route = R_LOGO;
     else if (path[0] == '/' && (path[1] == ' ' || path[1] == '?')) s_route = R_PAGE;
 
     s_bank = qBank(path);
+    if (s_route == R_THEMES || s_route == R_TINI || s_route == R_TFILE || s_route == R_TDEL) {
+        qStr(path, "folder", s_tFolder, sizeof(s_tFolder));
+        qStr(path, "name", s_tName, sizeof(s_tName));
+    }
     if (s_method == M_POST) s_clen = findCLen();
 }
 
@@ -466,6 +638,48 @@ static void process(void)
         respondText("200 OK", "XbDiag cleared"); return;
     }
     if (s_route == R_LOGO) { int len = buildLogoBmp(s_rx); respond("200 OK", "image/bmp", (const char*)s_rx, len); return; }
+
+    // ---- custom-theme web tools (Phase 4) ----
+    if (s_route == R_THEMES) { int len = buildThemesJson(s_json); respond("200 OK", "application/json", s_json, len); return; }
+    if (s_route == R_TINI) {
+        char fp[256];
+        if (!safeName(s_tFolder)) { respondText("400 Bad Request", "bad folder"); return; }
+        if (s_method == M_GET) {
+            int rd;
+            themePath(fp, sizeof(fp), s_tFolder, "theme.ini");
+            rd = File_ReadInto(fp, s_rx, HTTP_RX_MAX - 1);
+            if (rd < 0) { respondText("404 Not Found", "no theme.ini"); return; }
+            respond("200 OK", "text/plain", (const char*)s_rx, rd);
+            return;
+        }
+        {   // POST: write the body as theme.ini (folder auto-created)
+            char dir[256]; HANDLE h; DWORD wr;
+            themePath(dir, sizeof(dir), s_tFolder, 0);
+            CreateDirectoryA("E:\\Eos", NULL);
+            CreateDirectoryA("E:\\Eos\\Themes", NULL);
+            CreateDirectoryA(dir, NULL);
+            themePath(fp, sizeof(fp), s_tFolder, "theme.ini");
+            h = CreateFileA(fp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (h == INVALID_HANDLE_VALUE) { respondText("500 Error", "open failed"); return; }
+            WriteFile(h, s_rx, (DWORD)s_rxStore, &wr, NULL);
+            CloseHandle(h);
+            respondText("200 OK", "ini saved");
+            return;
+        }
+    }
+    if (s_route == R_TFILE) {
+        if (s_upFile != INVALID_HANDLE_VALUE) { CloseHandle(s_upFile); s_upFile = INVALID_HANDLE_VALUE; }
+        if (s_err) { respondText("500 Error", "upload failed"); return; }
+        respondText("200 OK", "file saved");
+        return;
+    }
+    if (s_route == R_TDEL) {
+        if (!safeName(s_tFolder)) { respondText("400 Bad Request", "bad folder"); return; }
+        deleteThemeFolder(s_tFolder);
+        respondText("200 OK", "theme deleted");
+        return;
+    }
+
 
     if (s_route == R_RENAME) {
         if (s_bank < 0 || s_bank >= n || Bank_IsBoot(s_bank)) { respondText("400 Bad Request", "bad bank"); return; }
@@ -612,6 +826,7 @@ static void process(void)
 // ---- connection lifecycle --------------------------------------------------
 static void closeConn(void)
 {
+    if (s_upFile != INVALID_HANDLE_VALUE) { CloseHandle(s_upFile); s_upFile = INVALID_HANDLE_VALUE; }
     if (s_conn != INVALID_SOCKET) { closesocket(s_conn); s_conn = INVALID_SOCKET; }
     s_state = ST_IDLE; s_launch = -1;
 }
@@ -631,6 +846,24 @@ static void beginBody(void)
     }
     else if (s_route == R_RENAME) {
         // cap to the name buffer; extra drained
+    }
+    else if (s_route == R_TINI) {
+        // POST theme.ini text -> buffer into s_rx (tiny)
+    }
+    else if (s_route == R_TFILE) {
+        // stream the upload straight to disk (mp3 far exceeds s_rx)
+        if (s_upFile != INVALID_HANDLE_VALUE) { CloseHandle(s_upFile); s_upFile = INVALID_HANDLE_VALUE; }
+        if (!safeName(s_tFolder) || !safeName(s_tName)) { s_err = 400; s_store = 0; }
+        else {
+            char dir[256], fp[256];
+            themePath(dir, sizeof(dir), s_tFolder, 0);
+            CreateDirectoryA("E:\\Eos", NULL);
+            CreateDirectoryA("E:\\Eos\\Themes", NULL);
+            CreateDirectoryA(dir, NULL);
+            themePath(fp, sizeof(fp), s_tFolder, s_tName);
+            s_upFile = CreateFileA(fp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (s_upFile == INVALID_HANDLE_VALUE) { s_err = 500; s_store = 0; }
+        }
     }
     else {
         s_store = 0;                                       // delete/launch: no body kept
@@ -653,6 +886,18 @@ static void stashBody(const char* src, int len)
         room = cap - s_rxStore; if (room > len) room = len;
         for (i = 0; i < room; ++i) s_name[s_rxStore + i] = src[i];
         s_rxStore += room;
+    }
+    else if (s_route == R_TINI) {
+        cap = HTTP_RX_MAX;
+        room = cap - s_rxStore; if (room > len) room = len;
+        for (i = 0; i < room; ++i) s_rx[s_rxStore + i] = (unsigned char)src[i];
+        s_rxStore += room;
+    }
+    else if (s_route == R_TFILE) {
+        if (s_upFile != INVALID_HANDLE_VALUE) {
+            DWORD wr; WriteFile(s_upFile, src, (DWORD)len, &wr, NULL);
+            s_rxStore += len;
+        }
     }
     s_rxRecv += len;
 }

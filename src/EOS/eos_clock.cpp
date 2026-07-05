@@ -9,6 +9,7 @@
 //
 // RXDK / MSVC2003 / C89: declarations before statements, no CRT.
 #include "eos_clock.h"
+#include "eos_rtc.h"    // X-RTC mirror (source of truth when present)
 
 extern "C" void __stdcall KeQuerySystemTime(LARGE_INTEGER* CurrentTime);
 extern "C" long __stdcall NtSetSystemTime(LARGE_INTEGER* SystemTime, LARGE_INTEGER* PreviousTime);
@@ -62,7 +63,11 @@ BOOL Clock_Set(const EosDateTime* dt)
 
     // System time to set so that the displayed LOCAL time equals what was entered.
     toSet.QuadPart = Clock_CivilToTicks(dt) - offset;
-    return NtSetSystemTime(&toSet, NULL) == 0;
+    {
+        BOOL ok = (NtSetSystemTime(&toSet, NULL) == 0);
+        if (ok && Rtc_Present()) Rtc_Write(dt);   // X-RTC is source of truth: mirror the set
+        return ok;
+    }
 }
 
 int Clock_IsLeap(int year)
@@ -102,4 +107,15 @@ const char* Clock_MonthName(int month)
                                  "Jul","Aug","Sep","Oct","Nov","Dec" };
     if (month < 1 || month > 12) return "---";
     return k[month - 1];
+}
+
+// Boot: an X-RTC, when present, is the source of truth. Probe it and seed the
+// system clock from it. No-op when absent (system time-only, as before). The
+// Clock_Set re-mirror is harmless (writes back what we read) and ensures the
+// oscillator is running (CH cleared).
+void Clock_InitFromRtc(void)
+{
+    EosDateTime dt;
+    Rtc_Probe();
+    if (Rtc_Present() && Rtc_Read(&dt)) Clock_Set(&dt);
 }

@@ -33,8 +33,11 @@ UI — all from the couch with a controller, or from a browser on your PC.
 - **Hard-drive setup** — stage a fresh drive with the standard Xbox partitions.
 - **Live telemetry HUD** — a top-right overlay shows **CPU / motherboard temperature** and
   **RAM** while you use the loader.
-- **Personalise it** — themes and background music, an on-screen keyboard, plus network,
-  clock, and NVRAM settings.
+- **Personalise it** — recolour the UI with built-in themes, or build your own **custom themes**
+  (a background image and a music track) right in the browser and pick them on the console. Plus
+  an on-screen keyboard and network / clock / NVRAM settings.
+- **Keep the time** — set the console clock by hand; with an optional **X-RTC** clock module
+  installed, the time is saved to the battery-backed chip and survives a full power-off.
 
 ---
 
@@ -77,6 +80,8 @@ Point a browser at the console's IP address for a control panel with:
 - **XbDiag** — when XbDiag Lite is installed, the panel shows it and can clear it from its bank.
 - **Reset Settings** — return the loader's own settings to defaults; your banks are left
   untouched.
+- **Theme editor** — create, edit, and delete **custom themes** (colours, a background image, and
+  a music track) from your browser. Saved themes appear on the console's theme picker straight away.
 
 ### FTP
 
@@ -120,13 +125,32 @@ accidental change.
 Resets the loader's config banks (bank table + settings) to factory. Bank names and saved
 settings are wiped; flashed BIOS images are not touched.
 
+### Themes
+
+The loader ships with several **built-in colour themes**. Open **Settings -> Themes** and scroll
+the theme list left/right to preview them live; keep scrolling **past the built-ins** and any
+**custom themes** on your drive appear in the same list.
+
+A **custom theme** is its own look: a full-screen **background image**, a **music track**, and a
+colour palette. Selecting one applies its colours and background and plays its music in place of
+the global background music; switching back to a built-in theme restores the normal look.
+
+The easy way to make one is the **web theme editor** (browser -> *Custom Themes* card -> *Create
+Theme*): pick your colours, upload a background (PNG or JPG) and an optional MP3, and save. It
+writes the theme to the drive under `E:\Eos\Themes\<name>\` and it shows up on the console's
+theme picker with no reflash. **Edit** and **Delete** live there too. Oversized background images
+are resized in the browser before upload, so uploads stay small.
+
 ### Settings
 
 - **Network** — IP / DHCP and the FTP credentials.
 - **Video / Audio / Region** — EEPROM-backed video standard, and game / DVD region editing.
-- **Clock / NVRAM** — console time and NVRAM values.
-- **Themes** — recolour the loader UI.
-- **Background music** — turn it on and pick a track to play in the loader.
+- **Clock / NVRAM** — console time and NVRAM values. With an optional **X-RTC** clock module
+  fitted, the Date & Time screen saves changes to it and restores the time from it on boot.
+- **Themes** — recolour the loader UI with a built-in palette, or select a **custom theme**
+  (its own background image and music). Scroll past the built-in themes to reach any on the drive.
+- **Background music** — turn it on and pick a track for the loader. (A custom theme with its own
+  music plays that instead while it's active.)
 - **About** — version and build info.
 
 ---
@@ -193,14 +217,16 @@ python3 eos_pack.py unpack eos.bin out.xbe                     # pull an XBE bac
 main.cpp                  entry point + frame loop + telemetry HUD overlay
 eos_menu / eos_ui         menu system + UI
 eos_gfx / eos_font        rendering + fonts (eos_font_data.h, eos_logo_data.h)
-eos_splash / eos_theme    splash + themeable styling
+eos_splash / eos_theme    splash + themeable styling (built-in palettes + custom-theme backdrop)
+eos_image                 image-file -> swizzled texture loader (custom-theme backgrounds; stb_image)
+eos_theme_custom          disk-loaded custom themes (theme.ini parser, folder scan, set.dat select)
 eos_audio                 background-music engine (minimp3 -> DirectSound)
 eos_osk                   on-screen keyboard
-eos_console               console read (revision, CPU MHz, temps, RAM) for the HUD
+eos_console               console read (revision, CPU MHz, temps, RAM) + SMBus access for other modules
 input                     controller input
 
 dd_ftp                    FTP server (2-session)
-eos_http                  HTTP server + OTA + web EEPROM backup/restore + sysinfo + reset
+eos_http                  HTTP server + OTA + web EEPROM backup/restore + sysinfo + reset + theme editor
 dd_net                    networking
 eos_firmware_io           firmware/loader image I/O + per-bank backup/restore
 
@@ -215,8 +241,9 @@ eos_eeprom_io             EEPROM transport
 eos_ee_crypto             EEPROM SHA-1 / HMAC / RC4 / CRC (ported crypto core)
 eos_ee_data               EEPROM raw-image decode/encode (video std, region, serial, MAC)
 
-eos_config / eos_settings config + settings hub (video/region, theme, background music)
+eos_config / eos_settings config + settings hub (video/region, theme + custom-theme picker, music)
 eos_clock / eos_nvram     clock + NVRAM
+eos_rtc                   optional X-RTC (DS1307-class SMBus clock): read/write + boot seed & mirror
 eos_ftoi                  float->int helper (MSVC2003 /GL: __ftol2_sse)
 
 minimp3.h                 bundled MP3 decoder (background music)
@@ -226,6 +253,9 @@ Media/                    runtime media assets (background-music tracks, etc.)
 ```
 
 > **minimp3.h and stb_image.h are bundled** — link `dsound.lib` for the audio engine.
+>
+> `eos_image.cpp`, `eos_theme_custom.cpp`, and `eos_rtc.cpp` are separate translation units —
+> make sure they're in the project's compile list.
 >
 > The EEPROM crypto lives in `eos_ee_crypto` + `eos_ee_data` (raw 256-byte image decode with
 > HMAC-validated security block). An older `eos_eeprom_crypto.cpp` remains on disk but is **not

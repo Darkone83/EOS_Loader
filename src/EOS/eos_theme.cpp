@@ -3,6 +3,8 @@
 // RXDK / MSVC2003 / C89: declarations before statements, no CRT.
 #include "eos_theme.h"
 #include "eos_config.h"
+#include "eos_image.h"    // Image_LoadTexture (backdrop)
+#include "eos_gfx.h"      // g_bbW/g_bbH (native backbuffer size)
 
 // Local ARGB helper (eos_gfx.h also defines EOS_ARGB; we keep this file free of
 // the graphics include so the palette table stays a pure data definition).
@@ -31,18 +33,45 @@ EosTheme g_theme = { "Eos Purple",
 
 static int s_idx = 0;
 
+// ---- Backdrop state. Separate from k_themes/g_theme (see eos_theme.h). -----
+// Decode ceiling. The real cap is the NATIVE backbuffer size (g_bbW/g_bbH) so
+// a 720p console gets a crisp 1280x720 background while a 480p console stays at
+// 640x480 (POT 1024x512, ~2MB). 720p -> POT 2048x1024 (~8MB). Ceiling clamps
+// 1080i down to a 1280x720 texture (scaled up at draw).
+#define THEME_BG_MAXW 1280
+#define THEME_BG_MAXH 720
+
+static IDirect3DTexture8* s_bgTex = 0;
+static int                s_bgDim = 0;
+static float              s_bgU1 = 1.0f;   // used-region UV extents in the POT tex
+static float              s_bgV1 = 1.0f;
+
+static void releaseBg(void)
+{
+    if (s_bgTex) { s_bgTex->Release(); s_bgTex = 0; }
+    s_bgDim = 0;
+    s_bgU1 = 1.0f;
+    s_bgV1 = 1.0f;
+}
+
 static void apply(int idx)
 {
     if (idx < 0) idx = 0;
     if (idx >= THEME_COUNT) idx = THEME_COUNT - 1;
     s_idx = idx;
     g_theme = k_themes[idx];
+    releaseBg();                   // built-in themes use the flat fill + orbs
 }
 
 void Theme_Init(void)
 {
     apply(Config_GetThemeIdx());   // config default is 0 if never saved
 }
+
+// Colors-only reset to the Eos default (index 0). Does NOT persist and does
+// NOT touch the backdrop -- used as the base for a custom theme so any color
+// key the theme.ini omits inherits the default purple.
+void Theme_ApplyDefaultPalette(void) { g_theme = k_themes[0]; }
 
 int Theme_Count(void) { return THEME_COUNT; }
 
@@ -69,3 +98,30 @@ void Theme_Commit(void)
 
 void Theme_Next(void) { Theme_Preview((s_idx + 1) % THEME_COUNT); }
 void Theme_Prev(void) { Theme_Preview((s_idx + THEME_COUNT - 1) % THEME_COUNT); }
+
+// ---- Backdrop API ---------------------------------------------------------
+int Theme_SetBgImage(const char* path, int dimPct)
+{
+    IDirect3DTexture8* tex = 0;
+    int   w = 0, h = 0;
+    float u1 = 1.0f, v1 = 1.0f;
+    int   capW = (g_bbW < THEME_BG_MAXW) ? g_bbW : THEME_BG_MAXW;
+    int   capH = (g_bbH < THEME_BG_MAXH) ? g_bbH : THEME_BG_MAXH;
+    if (!Image_LoadTexture(path, capW, capH, &tex, &w, &h, &u1, &v1))
+        return 0;                      // load failed -> leave current backdrop intact
+    releaseBg();                       // swap in only after a successful load
+    s_bgTex = tex;
+    s_bgU1 = u1;
+    s_bgV1 = v1;
+    if (dimPct < 0)   dimPct = 0;
+    if (dimPct > 100) dimPct = 100;
+    s_bgDim = dimPct;
+    return 1;
+}
+
+void Theme_ClearBg(void) { releaseBg(); }
+
+IDirect3DTexture8* Theme_BgTex(void) { return s_bgTex; }
+int                Theme_BgDim(void) { return s_bgDim; }
+float              Theme_BgU1(void) { return s_bgU1; }
+float              Theme_BgV1(void) { return s_bgV1; }

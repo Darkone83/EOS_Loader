@@ -20,6 +20,7 @@ typedef struct EosDateTime {
 LONGLONG    Clock_CivilToTicks(const EosDateTime* dt);  // ticks since 1601 (exposed for tests)
 void        Clock_Get(EosDateTime* dt);
 BOOL        Clock_Set(const EosDateTime* dt);
+void        Clock_InitFromRtc(void);                 // boot: seed system clock from X-RTC if present
 
 int         Clock_IsLeap(int year);
 int         Clock_DaysInMonth(int year, int month);  // leap-aware

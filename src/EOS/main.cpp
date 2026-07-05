@@ -6,6 +6,7 @@
 #include "eos_gfx.h"
 #include "eos_font.h"
 #include "eos_console.h"   // Console_ReadLive for the persistent HUD
+#include "eos_clock.h"     // Clock_InitFromRtc (X-RTC boot seed)
 #include "eos_splash.h"
 #include "eos_menu.h"
 #include "input.h"
@@ -22,6 +23,7 @@
 #include "eos_osk.h"
 #include "eos_settings.h"
 #include "eos_theme.h"
+#include "eos_theme_custom.h"  // disk-loaded custom themes + set.dat
 #include "eos_ui.h"
 #include "dd_net.h"
 #include "eos_http.h"
@@ -1514,11 +1516,18 @@ static void audioSync(void)
 {
     static int  s_aReady = 0;
     static char s_aPath[EOS_BGM_PATH_MAX] = { 0 };
-    int on = Config_GetBgmOn();
-    const char* path = Config_GetBgmPath();
+    int on;
+    const char* path;
     int i;
 
     if (!s_aReady) { if (!Audio_Init()) return; s_aReady = 1; }
+
+    // Audio source precedence: a custom theme's music takes center stage --
+    // the global BGM never plays alongside it. Otherwise fall back to the
+    // global BGM (persisted on/off + path in flash). A theme whose music
+    // file is missing resolves as 'no theme music', landing here on global.
+    if (ThemeCustom_HasMusic()) { on = 1; path = ThemeCustom_MusicPath(); }
+    else { on = Config_GetBgmOn(); path = Config_GetBgmPath(); }
 
     if (on && path[0]) {
         int changed = 0;
@@ -1547,7 +1556,16 @@ void __cdecl main() {
     Config_Load();       // pull persisted bank table from the Eos config bank
     Bank_XbDiagPresent(); // prime the XbDiag probe cache at boot: the one-time
     // flash read happens here, never in the web request path
-    Theme_Init();        // apply the saved theme (recolors the whole UI)
+    Theme_Init();        // built-in theme (fallback base)
+    ThemeCustom_EnsureDir();               // create E:\Eos\Themes if missing
+    {   // If a custom theme is selected (E:\Eos\set.dat), apply it over the
+        // built-in: colors + background + resolve its music. A stale/broken
+        // selection falls back to the built-in and clears set.dat.
+        char folder[EOS_FILE_NAME_MAX];
+        if (SetDat_Read(folder, sizeof(folder))) {
+            if (!ThemeCustom_Apply(folder)) SetDat_Clear();
+        }
+    }
     audioSync();         // start background music if enabled in settings
     // (exercises the real read path; graceful on fresh chip)
     Net_Start();         // bring the network up; DHCP resolves over the next frames
@@ -1564,6 +1582,7 @@ void __cdecl main() {
         Console_Read(&con);
         s_liveRev16 = (con.revStr && con.revStr[0] == '1' && con.revStr[2] == '6') ? 1 : 0;
     }
+    Clock_InitFromRtc();   // X-RTC (if present) is the source of truth for date/time
     Gfx_SetOverlay(hudDraw);
 
     GotoPhase(PH_SPLASH);

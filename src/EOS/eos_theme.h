@@ -34,3 +34,15 @@ void        Theme_Preview(int idx);    // apply only, no persist (live picker)
 void        Theme_Commit(void);        // persist whatever is currently applied
 void        Theme_Next(void);          // cycle forward (settings UI)
 void        Theme_Prev(void);          // cycle back
+void        Theme_ApplyDefaultPalette(void); // g_theme colors = Eos default (no persist/backdrop)
+
+// ---- Backdrop (custom-theme background image) -----------------------------
+// Kept OUT of EosTheme so `g_theme = k_themes[idx]` never clobbers it. A custom
+// theme sets an image backdrop; applying ANY built-in theme clears it, so the
+// UI falls back to the flat EOS_BG fill + orbs. Ui_Backdrop() queries these.
+int                Theme_SetBgImage(const char* path, int dimPct); // 1=loaded, 0=failed (backdrop unchanged on fail)
+void               Theme_ClearBg(void);                            // release image -> flat fill + orbs
+IDirect3DTexture8* Theme_BgTex(void);                              // 0 = no image (fill/orbs mode)
+int                Theme_BgDim(void);                              // 0..100 black scrim percent
+float              Theme_BgU1(void);                              // used-region UV extent (POT swizzle)
+float              Theme_BgV1(void);

@@ -19,6 +19,8 @@
 #include "eos_clock.h"
 #include "eos_theme.h"
 #include "eos_config.h"
+#include "eos_theme_custom.h"  // disk theme scan/apply/set.dat
+#include "eos_rtc.h"           // X-RTC presence for the Date & Time screen
 #include "dd_net.h"
 #include "input.h"
 
@@ -46,6 +48,8 @@ static int       s_row = 0;            // row cursor inside an editor
 static int       s_themePreview = 0;
 static int       s_bgmWork = 0;   // working bg-music on/off (persisted on exit)
 static int       s_returnTheme = 0;   // 1 = re-enter THEME after the song browser
+static char      s_ctList[32][EOS_FILE_NAME_MAX]; // scanned custom theme folders
+static int       s_ctCount = 0;                   // number of custom themes found
 static EosEeprom s_eep;
 static EosConsole s_con;
 static DWORD     s_vflags = 0;         // working video flags
@@ -64,7 +68,22 @@ static int       s_dtField = 0;        // 0..5 = Y M D h m s
 // ---- tiny helpers (no CRT) -------------------------------------------------
 
 static void networkEnter(void);   /* defined in the network section, used by the hub */
+static void themeEnter(void);     /* scans customs + sets the picker index */
 static bool Pressed(WORD now, WORD prev, WORD mask) { return (now & mask) && !(prev & mask); }
+
+// Case-insensitive folder-name compare (FATX is case-insensitive).
+static int folderEq(const char* a, const char* b)
+{
+    int i = 0;
+    for (;;) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+        if (ca != cb) return 0;
+        if (!ca) return 1;
+        ++i;
+    }
+}
 
 // unsigned int -> decimal string (into out), returns length
 static int uitoa(unsigned int v, char* out)
@@ -123,8 +142,7 @@ static int hubFrame(WORD b, WORD prev)
             s_vstdArm = 0; s_grArm = 0; s_regMsg = 0; break;
         case 4: s_sub = SUB_NETWORK; networkEnter(); break;
         case 5: s_sub = SUB_DATETIME; Clock_Get(&s_dt); s_dtField = 0; break;
-        case 6: s_sub = SUB_THEME; s_themePreview = Theme_Index();
-            s_bgmWork = Config_GetBgmOn(); s_row = 0; break;
+        case 6: s_sub = SUB_THEME; themeEnter(); break;
         }
     }
     titleBar("SETTINGS");
@@ -524,6 +542,9 @@ static int datetimeFrame(WORD b, WORD prev)
     }
     if (applied)
         Font_DrawCentered(0, g_scrW, LIST_Y0 + rows * LIST_DY + 6, applied, EOS_PURPLE);
+    if (Rtc_Present())
+        Font_DrawCentered(0, g_scrW, LIST_Y0 + rows * LIST_DY + 28,
+            "X-RTC detected -- date & time saved to the clock chip", EOS_DIM);
     footer("D-PAD  UP/DN FIELD   L/R ADJUST   A APPLY   B BACK");
     return 0;
 }
@@ -534,66 +555,125 @@ static int sAppendS(char* d, int p, const char* srcs)
     int i = 0; while (srcs[i]) { d[p++] = srcs[i]; ++i; } return p;
 }
 
-// THEME screen: theme select + background-music enable + single-track select.
-// Row 0 Theme (L/R cycles+preview), Row 1 Background Music (L/R toggles), Row 2
-// Track (A opens the song browser -> returns 2). B commits theme+bgm and backs out.
+// Enter the THEME picker: scan disk themes and point the picker at whatever is
+// currently active (a custom theme via set.dat, else the built-in index).
+static void themeEnter(void)
+{
+    char active[EOS_FILE_NAME_MAX];
+    int  nb = Theme_Count(), i;
+    s_ctCount = ThemeCustom_Scan(s_ctList, 32);
+    s_bgmWork = Config_GetBgmOn();
+    s_row = 0;
+    s_themePreview = Theme_Index();
+    if (s_ctCount > 0 && SetDat_Read(active, sizeof(active)))
+        for (i = 0; i < s_ctCount; ++i)
+            if (folderEq(s_ctList[i], active)) { s_themePreview = nb + i; break; }
+}
+
+// One continuous theme list: built-ins [0..nb-1] then custom disk themes
+// [nb..nb+ctCount-1]. Cycling applies the theme live (built-in palette, or a
+// custom theme's colors + background + music). Custom themes hide the palette
+// swatches and the BGM/Track rows -- their colors and music come from the theme.
 static int themeFrame(WORD b, WORD prev)
 {
-    int n = Theme_Count(), j, last;
-    char line[96]; int p; DWORD col;
-    const char* nm; const char* tk; const char* base;
+    int nb = Theme_Count();
+    int total = nb + s_ctCount;
+    int isCustom;
+    char line[96]; int p;
+    const char* nm;
 
-    if (Pressed(b, prev, BTN_DPAD_UP))   s_row = (s_row + 2) % 3;
-    if (Pressed(b, prev, BTN_DPAD_DOWN)) s_row = (s_row + 1) % 3;
+    if (total < 1) total = 1;
+    isCustom = (s_themePreview >= nb);
 
+    // Row navigation: custom = Theme row only; built-in = Theme/BGM/Track.
+    if (!isCustom) {
+        if (Pressed(b, prev, BTN_DPAD_UP))   s_row = (s_row + 2) % 3;
+        if (Pressed(b, prev, BTN_DPAD_DOWN)) s_row = (s_row + 1) % 3;
+    }
+    else {
+        s_row = 0;
+    }
+
+    // Row 0: cycle across built-ins then customs, applying live.
     if (s_row == 0) {
-        if (Pressed(b, prev, BTN_DPAD_LEFT)) { s_themePreview = (s_themePreview + n - 1) % n; Theme_Preview(s_themePreview); }
-        if (Pressed(b, prev, BTN_DPAD_RIGHT)) { s_themePreview = (s_themePreview + 1) % n;     Theme_Preview(s_themePreview); }
+        int dir = 0;
+        if (Pressed(b, prev, BTN_DPAD_LEFT))  dir = -1;
+        if (Pressed(b, prev, BTN_DPAD_RIGHT)) dir = +1;
+        if (dir) {
+            s_themePreview = (s_themePreview + dir + total) % total;
+            if (s_themePreview < nb) Theme_Preview(s_themePreview);
+            else ThemeCustom_Apply(s_ctList[s_themePreview - nb]);
+            isCustom = (s_themePreview >= nb);
+            if (isCustom) s_row = 0;
+        }
     }
     else if (s_row == 1) {
         if (Pressed(b, prev, BTN_DPAD_LEFT) || Pressed(b, prev, BTN_DPAD_RIGHT)) s_bgmWork ^= 1;
     }
 
-    if (s_row == 2 && Pressed(b, prev, BTN_A)) {
-        s_returnTheme = 1;          /* come back to THEME after the browse */
-        return 2;                   /* main.cpp opens the single-track browser */
+    // Track browser (built-in row 2 only).
+    if (!isCustom && s_row == 2 && Pressed(b, prev, BTN_A)) {
+        s_returnTheme = 1;
+        return 2;
     }
-    if (Pressed(b, prev, BTN_B) || (Pressed(b, prev, BTN_A) && s_row != 2)) {
-        Theme_Commit();
-        Config_SetBgmOn(s_bgmWork); /* persist bg-music enable */
+
+    // Commit + leave (B always; A unless on the built-in Track row).
+    if (Pressed(b, prev, BTN_B) || (Pressed(b, prev, BTN_A) && !(!isCustom && s_row == 2))) {
+        if (isCustom) {
+            SetDat_Write(s_ctList[s_themePreview - nb]);   // persist custom selection
+            // colors + background already applied; audio resyncs on Settings exit
+        }
+        else {
+            Theme_Commit();                 // persist built-in index
+            Config_SetBgmOn(s_bgmWork);
+            SetDat_Clear();                 // drop any custom selection
+            ThemeCustom_Clear();            // -> audio falls back to global BGM
+        }
         s_sub = SUB_HUB;
         return 0;
     }
 
+    // ---- draw ----
     titleBar("THEME");
-    nm = Theme_Name(s_themePreview);
-    tk = Config_GetBgmPath();
 
-    col = (s_row == 0) ? EOS_WHITE : EOS_DIM;
-    p = sAppendS(line, 0, "Theme:            "); p = sAppendS(line, p, nm ? nm : "?"); line[p] = 0;
-    Font_DrawCentered(0, g_scrW, 150, line, col);
-
-    col = (s_row == 1) ? EOS_WHITE : EOS_DIM;
-    p = sAppendS(line, 0, "Background Music:  "); p = sAppendS(line, p, s_bgmWork ? "On" : "Off"); line[p] = 0;
-    Font_DrawCentered(0, g_scrW, 185, line, col);
-
-    base = tk; last = -1;
-    for (j = 0; tk[j]; ++j) if (tk[j] == '\\' || tk[j] == '/') last = j;
-    if (last >= 0) base = tk + last + 1;
-    col = (s_row == 2) ? EOS_WHITE : EOS_DIM;
-    p = sAppendS(line, 0, "Track:            "); p = sAppendS(line, p, (base && base[0]) ? base : "(none)"); line[p] = 0;
-    Font_DrawCentered(0, g_scrW, 220, line, col);
-
+    nm = (s_themePreview < nb) ? Theme_Name(s_themePreview) : s_ctList[s_themePreview - nb];
     {
-        int sw = 80, x0 = (g_scrW - (sw * 4 + 30)) / 2, sy = 258;
-        Gfx_FillRounded(x0, sy, sw, 62, 12, EOS_PURPLE);
-        Gfx_FillRounded(x0 + (sw + 10), sy, sw, 62, 12, EOS_WHITE);
-        Gfx_FillRounded(x0 + (sw + 10) * 2, sy, sw, 62, 12, EOS_DIM);
-        Gfx_FillRounded(x0 + (sw + 10) * 3, sy, sw, 62, 12, EOS_PURPLE);
-        Font_DrawCentered(0, g_scrW, sy + 74, "Accent    Text    Dim    Accent", EOS_DIM);
+        DWORD col = (s_row == 0) ? EOS_WHITE : EOS_DIM;
+        p = sAppendS(line, 0, "Theme:            "); p = sAppendS(line, p, nm ? nm : "?"); line[p] = 0;
+        Font_DrawCentered(0, g_scrW, 150, line, col);
     }
 
-    footer("D-PAD  MOVE / CHANGE      A  SELECT      B  BACK");
+    if (!isCustom) {
+        const char* tk = Config_GetBgmPath();
+        const char* base; int j, last; DWORD col;
+
+        col = (s_row == 1) ? EOS_WHITE : EOS_DIM;
+        p = sAppendS(line, 0, "Background Music:  "); p = sAppendS(line, p, s_bgmWork ? "On" : "Off"); line[p] = 0;
+        Font_DrawCentered(0, g_scrW, 185, line, col);
+
+        base = tk; last = -1;
+        for (j = 0; tk[j]; ++j) if (tk[j] == '\\' || tk[j] == '/') last = j;
+        if (last >= 0) base = tk + last + 1;
+        col = (s_row == 2) ? EOS_WHITE : EOS_DIM;
+        p = sAppendS(line, 0, "Track:            "); p = sAppendS(line, p, (base && base[0]) ? base : "(none)"); line[p] = 0;
+        Font_DrawCentered(0, g_scrW, 220, line, col);
+
+        {
+            int sw = 80, x0 = (g_scrW - (sw * 4 + 30)) / 2, sy = 258;
+            Gfx_FillRounded(x0, sy, sw, 62, 12, EOS_PURPLE);
+            Gfx_FillRounded(x0 + (sw + 10), sy, sw, 62, 12, EOS_WHITE);
+            Gfx_FillRounded(x0 + (sw + 10) * 2, sy, sw, 62, 12, EOS_DIM);
+            Gfx_FillRounded(x0 + (sw + 10) * 3, sy, sw, 62, 12, EOS_PURPLE);
+            Font_DrawCentered(0, g_scrW, sy + 74, "Accent    Text    Dim    Accent", EOS_DIM);
+        }
+        footer("D-PAD  MOVE / CHANGE      A  SELECT      B  BACK");
+    }
+    else {
+        // Custom theme: palette + music come from the theme; controls hidden.
+        Font_DrawCentered(0, g_scrW, 192, "Custom theme", EOS_WHITE);
+        Font_DrawCentered(0, g_scrW, 224, "Background & music included", EOS_DIM);
+        footer("D-PAD  CHANGE      A  SELECT      B  BACK");
+    }
     return 0;
 }
 

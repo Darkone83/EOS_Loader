@@ -17,6 +17,8 @@ float       g_sx = 1.0f;
 float       g_sy = 1.0f;
 int         g_ox = 0;
 int         g_oy = 0;
+int         g_bbW = 640;   // native backbuffer size (mode-dependent):
+int         g_bbH = 480;   // 1280x720 @720p, 640x480 @480p/i, 640x576 @576i
 static IDirect3D8* s_d3d = 0;
 static IDirect3DTexture8* s_white = 0;   // 1x1 white, for solid fills
 static IDirect3DTexture8* s_glowTex = 0;   // 64x64 radial glow sprite
@@ -161,6 +163,7 @@ bool Gfx_Init()
         g_ox = (bbW - scaledW) / 2;               // integer math, no ftol
         g_oy = (bbH - scaledH) / 2;
     }
+    g_bbW = bbW; g_bbH = bbH;   // publish the final native backbuffer size
     s_baseFilter = (g_sx > 1.01f || g_sy > 1.01f) ? D3DTEXF_LINEAR : D3DTEXF_POINT;
 
     DWORD wpx = 0xFFFFFFFF;

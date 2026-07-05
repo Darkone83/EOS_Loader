@@ -69,6 +69,17 @@ static BOOL smbus_present(unsigned char addr)
     return smbus_read_byte(addr, 0x00, &v);
 }
 
+static BOOL smbus_write_byte(unsigned char addr, unsigned char reg, unsigned char val)
+{
+    return HalWriteSMBusValue(addr, reg, FALSE, (DWORD)val) == 0;
+}
+
+// Exposed SMBus for other modules (e.g. eos_rtc). Same kernel-HAL path as the
+// probes: Con_SmbReset() once per burst, then Con_SmbRead8/Write8 per byte.
+void Con_SmbReset(void) { SMBusControllerReset(); }
+BOOL Con_SmbRead8(unsigned char addr, unsigned char reg, unsigned char* val) { return smbus_read_byte(addr, reg, val); }
+BOOL Con_SmbWrite8(unsigned char addr, unsigned char reg, unsigned char val) { return smbus_write_byte(addr, reg, val); }
+
 // ---- PCI config read (kernel HAL, XbDiag method) ----------------------------
 static DWORD PciRead32(BYTE bus, BYTE dev, BYTE func, BYTE reg)
 {
