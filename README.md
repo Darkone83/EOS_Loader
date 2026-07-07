@@ -38,6 +38,9 @@ UI — all from the couch with a controller, or from a browser on your PC.
   an on-screen keyboard and network / clock / NVRAM settings.
 - **Keep the time** — set the console clock by hand; with an optional **X-RTC** clock module
   installed, the time is saved to the battery-backed chip and survives a full power-off.
+- **Status LCD** — drive an optional **character LCD** on the Xbox SMBus (US2066 OLED or an
+  HD44780 via a PCF8574 backpack) showing a live status screen: current screen, IP, temps,
+  and free RAM.
 
 ---
 
@@ -141,6 +144,22 @@ writes the theme to the drive under `E:\Eos\Themes\<name>\` and it shows up on t
 theme picker with no reflash. **Edit** and **Delete** live there too. Oversized background images
 are resized in the browser before upload, so uploads stay small.
 
+### Status LCD
+
+The loader can drive an optional **20x4 character LCD** wired to the Xbox **SMBus** (the same
+bus as the X-RTC and the temperature sensors). Two controller families are supported:
+
+- **US2066 / SSD1311** OLED modules (native I2C, addresses 0x3C / 0x3D) -- brightness
+  adjustable in software.
+- **HD44780** character LCDs on a **PCF8574 I2C backpack** (the common "I2C 1602/2004",
+  addresses 0x27 / 0x3F) -- brightness set by the pot on the module.
+
+It shows a fixed status screen -- current menu / selected item, IP address, CPU and
+motherboard temperatures, and free RAM -- and freezes on a "Booting <bank>" message when you
+launch. The screen only redraws the parts that change, so an idle loader barely touches the
+bus. Configure it under **Settings -> LCD** (below); with no panel connected the feature is
+simply inert.
+
 ### Settings
 
 - **Network** — IP / DHCP and the FTP credentials.
@@ -151,6 +170,8 @@ are resized in the browser before upload, so uploads stay small.
   (its own background image and music). Scroll past the built-in themes to reach any on the drive.
 - **Background music** — turn it on and pick a track for the loader. (A custom theme with its own
   music plays that instead while it's active.)
+- **LCD** — set the **Driver** (Disabled / HD44780 / US2066), the I2C **Address**, and
+  **Brightness** (US2066 only); a live **Detected** line confirms the panel is answering.
 - **About** — version and build info.
 
 ---
@@ -244,6 +265,7 @@ eos_ee_data               EEPROM raw-image decode/encode (video std, region, ser
 eos_config / eos_settings config + settings hub (video/region, theme + custom-theme picker, music)
 eos_clock / eos_nvram     clock + NVRAM
 eos_rtc                   optional X-RTC (DS1307-class SMBus clock): read/write + boot seed & mirror
+eos_lcd                   optional SMBus status LCD (US2066 + HD44780/PCF8574 drivers, lcd.dat)
 eos_ftoi                  float->int helper (MSVC2003 /GL: __ftol2_sse)
 
 minimp3.h                 bundled MP3 decoder (background music)
@@ -254,8 +276,8 @@ Media/                    runtime media assets (background-music tracks, etc.)
 
 > **minimp3.h and stb_image.h are bundled** — link `dsound.lib` for the audio engine.
 >
-> `eos_image.cpp`, `eos_theme_custom.cpp`, and `eos_rtc.cpp` are separate translation units —
-> make sure they're in the project's compile list.
+> `eos_image.cpp`, `eos_theme_custom.cpp`, `eos_rtc.cpp`, and `eos_lcd.cpp` are separate
+> translation units — make sure they're in the project's compile list.
 >
 > The EEPROM crypto lives in `eos_ee_crypto` + `eos_ee_data` (raw 256-byte image decode with
 > HMAC-validated security block). An older `eos_eeprom_crypto.cpp` remains on disk but is **not

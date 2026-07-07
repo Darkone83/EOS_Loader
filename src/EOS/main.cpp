@@ -7,6 +7,7 @@
 #include "eos_font.h"
 #include "eos_console.h"   // Console_ReadLive for the persistent HUD
 #include "eos_clock.h"     // Clock_InitFromRtc (X-RTC boot seed)
+#include "eos_lcd.h"       // optional SMBus character-LCD status display
 #include "eos_splash.h"
 #include "eos_menu.h"
 #include "input.h"
@@ -218,11 +219,40 @@ static bool Pressed(WORD now, WORD prev, WORD mask)
     return ((now & mask) && !(prev & mask));
 }
 
+static const char* PhaseName(AppPhase p)
+{
+    switch (p) {
+    case PH_MENU:        return "Main Menu";
+    case PH_BANKSEL:     return "Launch Bank";
+    case PH_BANKMGMT:    return "Bank Manager";
+    case PH_BROWSE:      return "Browse";
+    case PH_RENAME:      return "Rename";
+    case PH_TOOLS:       return "Tools";
+    case PH_EE_TOOLS:
+    case PH_EE_RESTORE:
+    case PH_EE_CONFIRM:  return "EEPROM";
+    case PH_FW_TOOLS:
+    case PH_FW_BACKUP:
+    case PH_FW_RPICK:
+    case PH_FW_RTARGET:
+    case PH_FW_RCONFIRM: return "Firmware";
+    case PH_HDD_TOOLS:
+    case PH_HDD_INFO:    return "HDD Tools";
+    case PH_FORMAT:
+    case PH_FORMAT_CONFIRM: return "Format";
+    case PH_CLEARCFG:    return "Reset Settings";
+    case PH_SETTINGS:    return "Settings";
+    case PH_ABOUT:       return "About";
+    default:             return "Eos Loader";
+    }
+}
+
 static void GotoPhase(AppPhase p)
 {
     s_phase = p;
     s_phaseT0 = GetTickCount();
     if (p == PH_MENU)     Menu_Init();
+    Lcd_SetContext(PhaseName(p), 0);   // LCD row-0 context follows the screen
     if (p == PH_BANKSEL) { s_bankSel = 0; s_layoutOk = Desc_Load(&s_layout); reconcileDescriptor(); }
     if (p == PH_BANKMGMT) { s_mgmtSel = 0; s_layoutOk = Desc_Load(&s_layout); reconcileDescriptor(); }
     if (p == PH_SETTINGS) Settings_Enter();
@@ -321,14 +351,19 @@ static void BankSel_Frame(WORD b)
         // TSOP releases D0 -> onboard flash; XbDiag pages itself into SDRAM (sync)
         // then boots; a real bank keeps D0 asserted and warm-resets so the FPGA
         // serves it. None return on HW.
-        if (s_bankSel == tsopIdx)
+        if (s_bankSel == tsopIdx) {
+            Lcd_HandOff("TSOP");   // freeze the LCD on the hand-off screen
             Eos_TsopBoot();
-        else if (hasDiag && s_bankSel == diagIdx)
+        }
+        else if (hasDiag && s_bankSel == diagIdx) {
+            Lcd_HandOff("XbDiag");
             Eos_LaunchXbDiag();
+        }
         else {
             // Every bank launches NORMALLY. If the descriptor marks this bank as
             // an oversized anchor, the FPGA redirects its serve to the ext-region
             // SDRAM copy -- no special launch EF needed here.
+            Lcd_HandOff(Bank_Name(Bank_LaunchIndex(s_bankSel)));
             Bank_Launch(Bank_LaunchIndex(s_bankSel));
         }
         return;
@@ -1583,6 +1618,7 @@ void __cdecl main() {
         s_liveRev16 = (con.revStr && con.revStr[0] == '1' && con.revStr[2] == '6') ? 1 : 0;
     }
     Clock_InitFromRtc();   // X-RTC (if present) is the source of truth for date/time
+    Lcd_Init();            // optional SMBus status LCD (no-op if none present)
     Gfx_SetOverlay(hudDraw);
 
     GotoPhase(PH_SPLASH);
@@ -1600,6 +1636,7 @@ void __cdecl main() {
         Http_Poll();
         Ftp_Tick();   // FTP service (start/stop tracks the link internally)
         Audio_Update();   // service the DirectSound mixer (required every frame)
+        Lcd_Tick(&s_live);   // optional status LCD (throttled + shadow-diffed; no-op if none)
 
         if (s_phase == PH_SPLASH)   Splash_Frame(b);
         else if (s_phase == PH_BANKSEL)  BankSel_Frame(b);

@@ -36,6 +36,7 @@
     <ClCompile Include="eos_hdd.cpp" />
     <ClCompile Include="eos_http.cpp" />
     <ClCompile Include="eos_image.cpp" />
+    <ClCompile Include="eos_lcd.cpp" />
     <ClCompile Include="eos_menu.cpp" />
     <ClCompile Include="eos_nvram.cpp" />
     <ClCompile Include="eos_osk.cpp" />
@@ -75,6 +76,7 @@
     <ClInclude Include="eos_hdd.h" />
     <ClInclude Include="eos_http.h" />
     <ClInclude Include="eos_image.h" />
+    <ClInclude Include="eos_lcd.h" />
     <ClInclude Include="eos_logo_data.h" />
     <ClInclude Include="eos_menu.h" />
     <ClInclude Include="eos_nvram.h" />

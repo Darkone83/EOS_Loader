@@ -21,6 +21,7 @@
 #include "eos_config.h"
 #include "eos_theme_custom.h"  // disk theme scan/apply/set.dat
 #include "eos_rtc.h"           // X-RTC presence for the Date & Time screen
+#include "eos_lcd.h"           // LCD settings screen
 #include "dd_net.h"
 #include "input.h"
 
@@ -37,9 +38,9 @@
 #define INFO_LX   70
 #define INFO_VX   300
 
-enum Sub { SUB_HUB = 0, SUB_SYSINFO, SUB_VIDEO, SUB_AUDIO, SUB_REGION, SUB_NETWORK, SUB_DATETIME, SUB_THEME };
+enum Sub { SUB_HUB = 0, SUB_SYSINFO, SUB_VIDEO, SUB_AUDIO, SUB_REGION, SUB_NETWORK, SUB_DATETIME, SUB_THEME, SUB_LCD };
 
-static const char* k_hub[] = { "System Info", "Video", "Audio", "Region", "Network", "Date & Time", "Theme" };
+static const char* k_hub[] = { "System Info", "Video", "Audio", "Region", "Network", "Date & Time", "Theme", "LCD" };
 #define HUB_COUNT ((int)(sizeof(k_hub) / sizeof(k_hub[0])))
 
 static int       s_sub = SUB_HUB;
@@ -143,6 +144,7 @@ static int hubFrame(WORD b, WORD prev)
         case 4: s_sub = SUB_NETWORK; networkEnter(); break;
         case 5: s_sub = SUB_DATETIME; Clock_Get(&s_dt); s_dtField = 0; break;
         case 6: s_sub = SUB_THEME; themeEnter(); break;
+        case 7: s_sub = SUB_LCD; s_row = 0; break;
         }
     }
     titleBar("SETTINGS");
@@ -695,6 +697,92 @@ void Settings_Enter(void)
     Eeprom_Read(&s_eep);
 }
 
+/* Full common LCD address range: PCF8574 backpacks cluster at 0x20-0x27,
+   native OLED/US2066 at 0x3C-0x3F. Any address is selectable regardless of
+   driver -- pick whatever answers; the Detected line confirms live. */
+static const unsigned char k_lcdAddr[] = {
+    0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x27, 0x3C,0x3D,0x3E,0x3F
+};
+#define LCD_ADDR_N ((int)(sizeof(k_lcdAddr)/sizeof(k_lcdAddr[0])))
+
+static int lcdAddrIndex(void)
+{
+    int i; unsigned char a = Lcd_Address();
+    for (i = 0; i < LCD_ADDR_N; ++i) if (k_lcdAddr[i] == a) return i;
+    return 8;   /* 0x3C */
+}
+
+static void hexByte(char* o, unsigned v)
+{
+    const char* H = "0123456789ABCDEF";
+    o[0] = '0'; o[1] = 'x'; o[2] = H[(v >> 4) & 0xF]; o[3] = H[v & 0xF]; o[4] = 0;
+}
+
+// Settings -> LCD: Driver / Address / Brightness (US2066 only) / Detected.
+// Changes apply live via the Lcd_Set* setters (which persist lcd.dat or hold
+// in RAM on a write failure). Driver = Disabled/HD44780/US2066 is the enable.
+static int lcdFrame(WORD b, WORD prev)
+{
+    int drv = Lcd_Driver();
+    int hasB = (drv == LCD_DRV_US2066);
+    int nRows = (drv == LCD_DRV_NONE) ? 1 : (hasB ? 3 : 2);
+    char line[64], hb[8], bv[12];
+    int p, dir;
+
+    if (s_row >= nRows) s_row = 0;
+    if (Pressed(b, prev, BTN_DPAD_UP))   s_row = (s_row + nRows - 1) % nRows;
+    if (Pressed(b, prev, BTN_DPAD_DOWN)) s_row = (s_row + 1) % nRows;
+
+    dir = 0;
+    if (Pressed(b, prev, BTN_DPAD_LEFT))  dir = -1;
+    if (Pressed(b, prev, BTN_DPAD_RIGHT)) dir = +1;
+    if (dir) {
+        if (s_row == 0) {                       /* Driver (0=Disabled,1=HD,2=US) */
+            int nd = drv + dir; if (nd < 0) nd = 2; if (nd > 2) nd = 0;
+            Lcd_SetDriver(nd);
+        }
+        else if (s_row == 1) {                /* Address (full range) */
+            int i = (lcdAddrIndex() + dir + LCD_ADDR_N) % LCD_ADDR_N;
+            Lcd_SetAddress(k_lcdAddr[i]);
+        }
+        else if (s_row == 2 && hasB) {        /* Brightness (US2066) */
+            int v = Lcd_Brightness() + dir * 16;
+            if (v < 0) v = 0; if (v > 255) v = 255;
+            Lcd_SetBrightness(v);
+        }
+    }
+
+    if (Pressed(b, prev, BTN_B) || Pressed(b, prev, BTN_A)) { s_sub = SUB_HUB; return 0; }
+
+    /* re-read after any change so the draw + row model reflect it this frame */
+    drv = Lcd_Driver();
+    hasB = (drv == LCD_DRV_US2066);
+
+    titleBar("LCD");
+    {
+        const char* dn = (drv == LCD_DRV_US2066) ? "US2066 (SMBUS)" :
+            (drv == LCD_DRV_HD44780) ? "HD44780 (SMBUS)" : "Disabled";
+        p = sAppendS(line, 0, "Driver:      "); p = sAppendS(line, p, dn); line[p] = 0;
+        Font_DrawCentered(0, g_scrW, 150, line, (s_row == 0) ? EOS_WHITE : EOS_DIM);
+    }
+    if (drv != LCD_DRV_NONE) {
+        hexByte(hb, Lcd_Address());
+        p = sAppendS(line, 0, "Address:     "); p = sAppendS(line, p, hb); line[p] = 0;
+        Font_DrawCentered(0, g_scrW, 185, line, (s_row == 1) ? EOS_WHITE : EOS_DIM);
+    }
+    if (hasB) {
+        uitoa((unsigned)Lcd_Brightness(), bv);
+        p = sAppendS(line, 0, "Brightness:  "); p = sAppendS(line, p, bv); line[p] = 0;
+        Font_DrawCentered(0, g_scrW, 220, line, (s_row == 2) ? EOS_WHITE : EOS_DIM);
+    }
+    {
+        p = sAppendS(line, 0, "Detected:    ");
+        p = sAppendS(line, p, Lcd_Detected() ? "Detected" : "Not detected"); line[p] = 0;
+        Font_DrawCentered(0, g_scrW, 262, line, EOS_DIM);
+    }
+    footer("D-PAD  MOVE / CHANGE      B  BACK");
+    return 0;
+}
 int Settings_Frame(WORD b, WORD prevBtn)
 {
     switch (s_sub) {
@@ -705,6 +793,7 @@ int Settings_Frame(WORD b, WORD prevBtn)
     case SUB_NETWORK:  return networkFrame(b, prevBtn);
     case SUB_DATETIME: return datetimeFrame(b, prevBtn);
     case SUB_THEME:    return themeFrame(b, prevBtn);
+    case SUB_LCD:      return lcdFrame(b, prevBtn);
     }
     return hubFrame(b, prevBtn);
 }
