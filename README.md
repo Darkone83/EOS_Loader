@@ -209,7 +209,7 @@ folder** — it is a required, separate tool, not part of this loader source. Bu
 loader produces `default.xbe`; `eos_pack.py` is what turns that into a flashable image.
 
 The Eos board boots a **2 MB Xenium-style BIOS image** with the loader XBE embedded
-(LZ4-compressed) in the XeniumOS bank, and a borrowed Cerbios kernel + bank geometry kept
+(LZ4-compressed) in the XeniumOS bank, + bank geometry kept
 byte-for-byte. `eos_pack.py` swaps **only** the embedded XBE into a known-good template, so
 the kernel's XBE-location expectations stay satisfied.
 
@@ -220,7 +220,7 @@ python3 eos_pack.py unpack eos.bin out.xbe                     # pull an XBE bac
 ```
 
 - `<template.bin>` must be the **2 MB Xenium image** (e.g. `Xenium_Prometheos_V1_5_0.bin`) —
-  not the 256 K Cerbios `.bin` or the 1 MB RP2040 image.
+  not the 256 K BIOS `.bin` or the 1 MB RP2040 image.
 - The XBE is placed at the XeniumOS bank (`0x100000`); descriptor is `u32 decompressed_size,
   u32 compressed_size` then the raw LZ4 block. Kernel sits at `0x180000`.
 - Budget: descriptor + compressed XBE must fit **0x80000 (512 KB)** — `pack` errors on
