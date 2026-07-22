@@ -209,7 +209,7 @@ folder** — it is a required, separate tool, not part of this loader source. Bu
 loader produces `default.xbe`; `eos_pack.py` is what turns that into a flashable image.
 
 The Eos board boots a **2 MB Xenium-style BIOS image** with the loader XBE embedded
-(LZ4-compressed) in the XeniumOS bank, + bank geometry kept
+(LZ4-compressed) in the XeniumOS bank, bank geometry kept
 byte-for-byte. `eos_pack.py` swaps **only** the embedded XBE into a known-good template, so
 the kernel's XBE-location expectations stay satisfied.
 
