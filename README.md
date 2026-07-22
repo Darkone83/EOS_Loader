@@ -11,8 +11,6 @@ loader: pick which BIOS runs, flash new BIOS images over the network, back up an
 EEPROM, run firmware and hard-drive tools, watch live console telemetry, and personalise the
 UI — all from the couch with a controller, or from a browser on your PC.
 
-> Team Resurgent · Darkone83 · **Private — do not distribute**
-
 ---
 
 ## What you can do
