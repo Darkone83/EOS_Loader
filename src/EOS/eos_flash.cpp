@@ -17,6 +17,10 @@
 #define IDX_LASTSTAT     0x07
 #define IDX_DESCRELOAD   0x0D
 #define IDX_ERASEBLK     0x0E
+#define IDX_LEDMODE      0x0F   // LED show: 0=off 1=solid 2=pulse white 3=pulse purple 4=pulse magenta
+#define IDX_LEDR         0x10
+#define IDX_LEDG         0x11
+#define IDX_LEDB         0x12
 
 // --- ops --------------------------------------------------------------------
 #define OP_ERASE         0
@@ -305,5 +309,20 @@ void Flash_ReloadDescriptor(void)
     for (t = 0; t < POLL_LIMIT; ++t) {
         st = io_in8(EOS_PORT_DATA);
         if (!(st & ST_BUSY)) break;                // engine idle -> reload done
+    }
+}
+
+// ---- bank LED show ---------------------------------------------------------
+// Drive the external bank LED live. mode: 0=off, 1=solid(rgb), 2=pulse white
+// (loader/recovery), 3=pulse purple (XbDiag), 4=pulse magenta (SD Card). For
+// solid, rgb is 0x00RRGGBB.
+// Cheap (4 port writes); safe to call on every menu-highlight change.
+void Led_Show(int mode, unsigned int rgb)
+{
+    regw(IDX_LEDMODE, (unsigned char)(mode & 0x07));
+    if ((mode & 0x07) == 1) {
+        regw(IDX_LEDR, (unsigned char)((rgb >> 16) & 0xFF));
+        regw(IDX_LEDG, (unsigned char)((rgb >> 8) & 0xFF));
+        regw(IDX_LEDB, (unsigned char)(rgb & 0xFF));
     }
 }

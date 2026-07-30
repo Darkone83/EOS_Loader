@@ -23,7 +23,7 @@ enum { ST_IDLE = 0, ST_HDR, ST_BODY, ST_SEND };
 enum { M_GET = 0, M_POST };
 enum {
     R_NONE = 0, R_PAGE, R_LOGO, R_BANKS, R_RENAME, R_DELETE, R_FLASH, R_LAUNCH, R_EEPROM, R_RESET, R_SYSINFO, R_CLRXBDIAG,
-    R_THEMES, R_TINI, R_TFILE, R_TDEL
+    R_THEMES, R_TINI, R_TFILE, R_TDEL, R_SETCOLOR
 };   // custom-theme web tools (Phase 4)
 
 static SOCKET s_listen = INVALID_SOCKET;
@@ -51,6 +51,7 @@ static char   s_json[HTTP_JSON_MAX];
 static char   s_resp[HTTP_RESP_MAX];
 static char   s_name[80];
 static char   s_tFolder[64], s_tName[64];       // theme route query params
+static char   s_colorStr[10];                   // /api/setcolor ?c=RRGGBB
 static HANDLE s_upFile = INVALID_HANDLE_VALUE;  // streaming theme-file upload
 
 // send segments: headers then body
@@ -115,6 +116,16 @@ static const char* k_page =
 "button:hover{border-color:var(--p);}\n"
 "button.danger:hover{border-color:#e05050;color:#e05050;}\n"
 "button.go:hover{border-color:#39d98a;color:#39d98a;}\n"
+"#cmodal{position:fixed;inset:0;background:rgba(0,0,0,.66);display:none;align-items:center;justify-content:center;z-index:50;}\n"
+"#cmodal.show{display:flex;}\n"
+"#cbox{background:var(--card);border:1px solid #2c2c38;border-radius:12px;padding:20px;max-width:520px;width:90%;}\n"
+"#cbox h3{margin:0 0 4px;color:var(--p);font-size:16px;letter-spacing:2px;}\n"
+"#cbox .csub{color:var(--dim);font-size:12px;margin-bottom:14px;}\n"
+"#cgrid{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;}\n"
+"#cgrid .sw{border-radius:8px;padding:12px 4px;text-align:center;font-size:11px;cursor:pointer;color:#1a1a1a;border:2px solid transparent;user-select:none;}\n"
+"#cgrid .sw:hover{border-color:var(--p);}\n"
+"#cgrid .sw.off{background:#3a3a3a;color:#c8c8c8;}\n"
+"#cbox .crow{display:flex;justify-content:flex-end;margin-top:14px;}\n"
 ".info{margin:10px 0 4px;}\n"
 ".kv{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid #1e1e28;font-size:13px;}\n"
 ".kv:last-child{border-bottom:none;}\n"
@@ -141,6 +152,12 @@ static const char* k_page =
 "<div id=budget style='max-width:1100px;margin:0 auto;padding:8px 20px 0;color:#9a9aa8;font-size:13px;'></div>\n"
 "<div class=grid id=grid></div>\n"
 "<div class=grid id=sys></div><div id=msg></div>\n"
+"<div id=cmodal><div id=cbox>\n"
+" <h3 id=ctitle>LED Color</h3>\n"
+" <div class=csub>Pick a color for this bank's status LED. Off = LED dark.</div>\n"
+" <div id=cgrid></div>\n"
+" <div class=crow><button onclick='closeColor()'>Close</button></div>\n"
+"</div></div>\n"
 "<div id=modal class=modal><div class=modalcard>\n"
 " <h2 id=mtitle>Create Theme</h2>\n"
 " <label>Name<input id=mname></label>\n"
@@ -171,6 +188,7 @@ static const char* k_page =
 " if(!b.boot){\n"
 "  row.appendChild(btn('Flash','',function(){pick(b.i);}));\n"
 "  row.appendChild(btn('Rename','',function(){ren(b.i,b.name);}));\n"
+"  if(b.ef>=3&&b.ef<=6)row.appendChild(btn('LED Color','',function(){pickColor(b.i,b.name);}));\n"
 "  if(b.occ){row.appendChild(btn('Delete','danger',function(){del(b.i);}));\n"
 "            row.appendChild(btn('Launch','go',function(){go(b.i);}));}\n"
 " }\n"
@@ -196,6 +214,24 @@ static const char* k_page =
 "async function ren(i,cur){let n=prompt('Bank name:',cur);if(n==null)return;await fetch('/api/rename?b='+i,{method:'POST',body:n});msg('Renamed');load();}\n"
 "async function del(i){if(!confirm('Delete this bank?'))return;await fetch('/api/delete?b='+i,{method:'POST'});msg('Deleted');load();}\n"
 "async function go(i){if(!confirm('Launch this bank? The console will reboot.'))return;fetch('/api/launch?b='+i,{method:'POST'});msg('Launching...');}\n"
+"const PAL=[['Off','ffffff'],['Red','ff0000'],['Orange','ff6000'],['Amber','ffd000'],['Green','30ff00'],['Teal','00ffc0'],['Cyan','00c0ff'],['Blue','0040ff'],['Purple','a855f7'],['Magenta','ff00e0'],['Pink','ff3080'],['White','fefefe']];\n"
+"function pickColor(i,name){\n"
+" let m=document.getElementById('cmodal');\n"
+" document.getElementById('ctitle').textContent='LED Color \u2014 '+name;\n"
+" let g=document.getElementById('cgrid');g.innerHTML='';\n"
+" for(const p of PAL){\n"
+"  let s=document.createElement('div');s.className='sw'+(p[1]=='ffffff'?' off':'');\n"
+"  if(p[1]!='ffffff')s.style.background='#'+p[1];\n"
+"  s.textContent=p[0];\n"
+"  s.addEventListener('click',(function(hex){return async function(){\n"
+"    await fetch('/api/setcolor?b='+i+'&c='+hex,{method:'POST'});\n"
+"    m.classList.remove('show');msg('Color set');\n"
+"  };})(p[1]));\n"
+"  g.appendChild(s);\n"
+" }\n"
+" m.classList.add('show');\n"
+"}\n"
+"function closeColor(){document.getElementById('cmodal').classList.remove('show');}\n"
 "async function eeBackup(){\n"
 " let r=await fetch('/api/eeprom');\n"
 " if(!r.ok){msg('EEPROM read failed');return;}\n"
@@ -593,6 +629,7 @@ static void parseReq(void)
     else if (strEqN(path, "/api/theme/ini", 14)) s_route = R_TINI;
     else if (strEqN(path, "/api/theme/file", 15)) s_route = R_TFILE;
     else if (strEqN(path, "/api/theme/del", 14)) s_route = R_TDEL;
+    else if (strEqN(path, "/api/setcolor", 13)) s_route = R_SETCOLOR;
     else if (strEqN(path, "/logo.bmp", 9)) s_route = R_LOGO;
     else if (path[0] == '/' && (path[1] == ' ' || path[1] == '?')) s_route = R_PAGE;
 
@@ -600,6 +637,9 @@ static void parseReq(void)
     if (s_route == R_THEMES || s_route == R_TINI || s_route == R_TFILE || s_route == R_TDEL) {
         qStr(path, "folder", s_tFolder, sizeof(s_tFolder));
         qStr(path, "name", s_tName, sizeof(s_tName));
+    }
+    if (s_route == R_SETCOLOR) {
+        qStr(path, "c", s_colorStr, sizeof(s_colorStr));   // hex RRGGBB (no '#')
     }
     if (s_method == M_POST) s_clen = findCLen();
 }
@@ -685,6 +725,24 @@ static void process(void)
         if (s_bank < 0 || s_bank >= n || Bank_IsBoot(s_bank)) { respondText("400 Bad Request", "bad bank"); return; }
         s_name[s_rxStore] = 0;
         if (s_name[0]) { Bank_SetName(s_bank, s_name); Config_Save(); }
+        respondText("200 OK", "ok"); return;
+    }
+    if (s_route == R_SETCOLOR) {
+        // /api/setcolor?b=N&c=RRGGBB  -> set the user bank's LED color.
+        unsigned int rgb; int i; char ch;
+        // validate it's a user bank; Desc_SetColor takes a BANK INDEX and does the
+        // slot conversion internally, so pass s_bank (not a pre-converted slot).
+        if (s_bank < 0 || s_bank >= n || httpDescSlot(s_bank) < 0) { respondText("400 Bad Request", "bad bank"); return; }
+        // parse 6 hex digits (RRGGBB) -> 0x00RRGGBB
+        rgb = 0;
+        for (i = 0; i < 6; ++i) {
+            ch = s_colorStr[i];
+            if (ch >= '0' && ch <= '9')      rgb = (rgb << 4) | (unsigned)(ch - '0');
+            else if (ch >= 'a' && ch <= 'f') rgb = (rgb << 4) | (unsigned)(ch - 'a' + 10);
+            else if (ch >= 'A' && ch <= 'F') rgb = (rgb << 4) | (unsigned)(ch - 'A' + 10);
+            else { respondText("400 Bad Request", "bad color"); return; }
+        }
+        Desc_SetColor(s_bank, rgb & 0xFFFFFFu);  // bank index; slot mapping is internal
         respondText("200 OK", "ok"); return;
     }
     if (s_route == R_DELETE) {

@@ -21,7 +21,7 @@
 
 #define OSK_MAX_LEN 32
 
-enum { OSK_TEXT = 0, OSK_NUMERIC = 1 };
+enum { OSK_TEXT = 0, OSK_NUMERIC = 1, OSK_HEX = 2 };
 
 void Osk_Open(int mode, const char* initial, int maxLen);
 void Osk_Close(void);

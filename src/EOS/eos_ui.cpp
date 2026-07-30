@@ -190,6 +190,7 @@ static DWORD perspLerp(DWORD a, DWORD b, int num, int den)
 #define M3_AMAX   1.20f     // past this angle (~69 deg) an item has rotated away
 #define M3_SWAY   0.05f     // idle sway amplitude (rad) -- keeps it alive
 #define M3_EASE   10.0f     // selection-snap speed (higher = snappier)
+#define M3_SEL_GLOW 120      // selected-pill halo intensity 0..255 (visible bloom)
 
 // Animation state. selAnim is the fractional, eased selection the wheel rotates
 // to; the integer sel is the target. Reset when the list (count) changes.
@@ -232,6 +233,14 @@ static void wheelItem(const char* label, int i, int sel, float aSway)
         txt = (perspLerp(EOS_DIM, EOS_BG, 100 - ia, 100) & 0x00FFFFFF)
             | ((DWORD)(0x40 + ia * 0xBF / 100) << 24);  // label fades with depth too
     }
+
+    // Selected row: a soft, static accent halo UNDER the pill. Sized a touch
+    // larger than the pill so it reads as a gentle bloom around it, never a
+    // hard edge. Additive + radial-falloff (Gfx_GlowX3D) keeps it subtle: it
+    // only adds light and fades to nothing, so it pops without overpowering.
+    if (i == sel)
+        Gfx_GlowX3D(0.0f, yc, zc, ca, sa, hw + M3_HH * 2.0f, M3_HH * 3.4f,
+            EOS_GLOW, M3_SEL_GLOW);
 
     Gfx_PillX3D(0.0f, yc, zc, ca, sa, hw, M3_HH, pill);
     Font_Draw3D(0.0f, yc, zc, ca, sa, M3_K, label, txt);

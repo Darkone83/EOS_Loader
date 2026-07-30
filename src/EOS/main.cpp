@@ -13,6 +13,7 @@
 #include "input.h"
 #include "eos_bank.h"
 #include "eos_descriptor.h"
+#include "eos_led.h"
 #include "eos_config.h"
 #include "eos_audio.h"
 #include "eos_eeprom_io.h"
@@ -21,10 +22,13 @@
 #include "eos_format.h"
 #include "eos_flash.h"
 #include "eos_file.h"
+#include "eos_sdcard.h"    // onboard SD card: FAT32 browse + BIOS precache/launch
+#include "ff.h"            // FatFs types used directly in the SD browse UI
 #include "eos_osk.h"
 #include "eos_settings.h"
 #include "eos_theme.h"
 #include "eos_theme_custom.h"  // disk-loaded custom themes + set.dat
+#include "eos_cerbios.h"        // Cerbios .ini editor + overclock calculator
 #include "eos_ui.h"
 #include "dd_net.h"
 #include "eos_http.h"
@@ -37,11 +41,14 @@
 // ---------------------------------------------------------------------------
 enum AppPhase {
     PH_SPLASH = 0, PH_MENU, PH_BANKSEL, PH_BANKMGMT, PH_CONFIRM, PH_BROWSE, PH_RENAME, PH_TOOLS, PH_EE_TOOLS, PH_FW_TOOLS, PH_FW_BACKUP, PH_FW_RPICK,
-    PH_FW_RTARGET, PH_FW_RCONFIRM, PH_HDD_TOOLS, PH_HDD_INFO, PH_EE_RESTORE, PH_EE_CONFIRM, PH_FORMAT, PH_FORMAT_CONFIRM, PH_SETTINGS, PH_ABOUT, PH_CLEARCFG
+    PH_FW_RTARGET, PH_FW_RCONFIRM, PH_HDD_TOOLS, PH_HDD_INFO, PH_EE_RESTORE, PH_EE_CONFIRM, PH_FORMAT, PH_FORMAT_CONFIRM, PH_SETTINGS, PH_ABOUT, PH_CLEARCFG,
+    PH_CERB_MENU, PH_CERB_EDIT, PH_CERB_SAVED, PH_CERB_OC, PH_CERB_COMBO,
+    PH_LEDCOLOR, PH_SDBROWSE
 };
 
 static AppPhase s_phase = PH_SPLASH;
 static DWORD    s_phaseT0 = 0;
+static int      s_menuIntro = 0;   // 1 = play the splash->menu settle ONCE
 static WORD     s_prevBtn = 0;
 static int      s_bankSel = 0;   // highlighted bank in PH_BANKSEL
 static int      s_mgmtSel = 0;   // highlighted bank in PH_BANKMGMT
@@ -102,13 +109,25 @@ static int           s_browseSel = 0;
 static int           s_browseScroll = 0;
 static int           s_flashTarget = -1;          // bank idx being flashed
 static int           s_browseSong = 0;           // 1 = browsing to pick a bg-music track
+static int           s_browseCerb = 0;           // 1 = browsing to pick a Cerbios path field
+static int           s_browseCerbField = -1;     // which Cerbios field the pick fills
 static char          s_flashPath[EOS_FILE_PATH_MAX] = { 0 };
 static int           s_renameTarget = -1;         // bank idx being renamed
 static AppPhase      s_renameReturn = PH_BANKMGMT; // phase to return to after rename
 
+// SD card browser (PH_SDBROWSE) state -- separate from the HDD browser above:
+// sourced from our own FAT32 driver (FatFs) over the SD_BR_* LPC registers,
+// not File_ListDir/XTL. Root is "" (no drive prefix -- FF_VOLUMES=1).
+static char          s_sdPath[EOS_FILE_PATH_MAX] = { 0 };
+static EosFileEntry  s_sdEntries[EOS_FILE_MAX_ENTRIES];
+static int           s_sdEntCount = 0;
+static int           s_sdSel = 0;
+static int           s_sdScroll = 0;
+
 // forward decls (browser block is defined below, before main)
 static void DoFlash(int idx, const char* path);
 static void browseRefresh(void);
+static void EnterSdBrowse(void);
 
 // transient status line after a stub selection
 static char  s_status[64] = { 0 };
@@ -225,7 +244,9 @@ static const char* PhaseName(AppPhase p)
     case PH_MENU:        return "Main Menu";
     case PH_BANKSEL:     return "Launch Bank";
     case PH_BANKMGMT:    return "Bank Manager";
+    case PH_LEDCOLOR:    return "LED Color";
     case PH_BROWSE:      return "Browse";
+    case PH_SDBROWSE:    return "SD Card";
     case PH_RENAME:      return "Rename";
     case PH_TOOLS:       return "Tools";
     case PH_EE_TOOLS:
@@ -241,6 +262,11 @@ static const char* PhaseName(AppPhase p)
     case PH_FORMAT:
     case PH_FORMAT_CONFIRM: return "Format";
     case PH_CLEARCFG:    return "Reset Settings";
+    case PH_CERB_MENU:   return "Cerbios Config";
+    case PH_CERB_EDIT:
+    case PH_CERB_SAVED:  return "Cerbios Editor";
+    case PH_CERB_OC:     return "Overclock Calc";
+    case PH_CERB_COMBO:  return "Cerbios Editor";
     case PH_SETTINGS:    return "Settings";
     case PH_ABOUT:       return "About";
     default:             return "Eos Loader";
@@ -251,8 +277,13 @@ static void GotoPhase(AppPhase p)
 {
     s_phase = p;
     s_phaseT0 = GetTickCount();
+    s_menuIntro = 0;              // any phase change clears a pending settle;
+    // the splash handoff re-arms it after this call
     if (p == PH_MENU)     Menu_Init();
     Lcd_SetContext(PhaseName(p), 0);   // LCD row-0 context follows the screen
+    // Bank LED is OFF while in the loader (the onboard LED covers loader status).
+    // Only the bank-select screen drives it (XbDiag purple / bank color).
+    Led_Show(EOS_LED_OFF, 0);
     if (p == PH_BANKSEL) { s_bankSel = 0; s_layoutOk = Desc_Load(&s_layout); reconcileDescriptor(); }
     if (p == PH_BANKMGMT) { s_mgmtSel = 0; s_layoutOk = Desc_Load(&s_layout); reconcileDescriptor(); }
     if (p == PH_SETTINGS) Settings_Enter();
@@ -261,12 +292,18 @@ static void GotoPhase(AppPhase p)
 // ---------------------------------------------------------------------------
 // SPLASH: fade the logo in over ~0.6s, hold, advance on A/START or ~2s timeout.
 // ---------------------------------------------------------------------------
+// Splash accent-bloom peak intensity (0..255). Kept low: a lit glow, not a flare.
+#define EOS_SPLASH_GLOW 90
+// Duration of the splash -> menu settle (ms). Short enough to feel snappy.
+#define EOS_MENU_INTRO_MS 260
+
 static void Splash_Frame(WORD b)
 {
     DWORD dt = GetTickCount() - s_phaseT0;
 
     if (Pressed(b, s_prevBtn, BTN_A) || Pressed(b, s_prevBtn, BTN_START) || dt > 2000) {
         GotoPhase(PH_MENU);
+        s_menuIntro = 1;          // arm the settle AFTER GotoPhase (only path that sets it)
         return;
     }
 
@@ -274,6 +311,15 @@ static void Splash_Frame(WORD b)
     DWORD mod = EOS_ARGB(a, 255, 255, 255);
 
     Gfx_Begin(EOS_BG); Ui_Backdrop();
+
+    // Soft accent bloom behind the logo, rising with the fade alpha so the mark
+    // reads as lit. Additive + low peak -> a glow, not a flare.
+    {
+        int gcx = g_scrW / 2, gcy = g_scrH / 2 - 20;
+        int gpk = (int)(a * EOS_SPLASH_GLOW / 255);
+        Gfx_GlowSoft(gcx, gcy, 340, 340, EOS_GLOW, gpk);
+    }
+
     Splash_Draw(g_scrW / 2, g_scrH / 2 - 20, 256, mod);
     Font_DrawCentered(0, g_scrW, g_scrH / 2 + 130, "EOS  LOADER",
         EOS_ARGB(a, 168, 85, 247));
@@ -297,11 +343,30 @@ static void HandleChoice(int id)
 
 static void Menu_Frame(WORD b)
 {
-    int chosen = Menu_Step(b, s_prevBtn);   // edge-detected nav + select
-    if (chosen >= 0) HandleChoice(chosen);
+    // While the splash->menu settle plays, swallow menu input so an early press
+    // can't act on a menu that's still sliding in (and can't leave the intro
+    // armed for a later re-entry). The settle is brief, so this costs nothing.
+    int introActive = (s_menuIntro &&
+        (GetTickCount() - s_phaseT0) < EOS_MENU_INTRO_MS);
+
+    if (!introActive) {
+        int chosen = Menu_Step(b, s_prevBtn);   // edge-detected nav + select
+        if (chosen >= 0) HandleChoice(chosen);
+    }
 
     Gfx_Begin(EOS_BG); Ui_Backdrop();
-    Menu_Draw();
+
+    // Settle: for the first EOS_MENU_INTRO_MS after the SPLASH only, the logo
+    // eases from the splash placement into the header slot and the list arrives
+    // just behind it. Every other way into the menu skips straight to settled.
+    if (introActive) {
+        DWORD idt = GetTickCount() - s_phaseT0;
+        Menu_DrawIntro((int)(idt * 255 / EOS_MENU_INTRO_MS));
+    }
+    else {
+        s_menuIntro = 0;
+        Menu_Draw();
+    }
     if (s_status[0] && GetTickCount() < s_statusUntil)
         Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
 
@@ -332,8 +397,9 @@ static void BankSel_Frame(WORD b)
     int cap = (n < EOS_BANK_MAX) ? n : EOS_BANK_MAX;
     int hasDiag = Bank_XbDiagPresent();           // XbDiag entry only when installed
     int diagIdx = hasDiag ? cap : -1;             // XbDiag slot (after the real banks)
-    int tsopIdx = cap + (hasDiag ? 1 : 0);        // TSOP is always the last item
-    int total = tsopIdx + 1;
+    int tsopIdx = cap + (hasDiag ? 1 : 0);        // TSOP is always the last hard-flash item
+    int sdIdx = tsopIdx + 1;                      // SD Card is always last of all
+    int total = sdIdx + 1;
     int i;
 
     if (s_bankSel >= total) s_bankSel = total - 1;
@@ -350,21 +416,33 @@ static void BankSel_Frame(WORD b)
     if (Pressed(b, s_prevBtn, BTN_A)) {
         // TSOP releases D0 -> onboard flash; XbDiag pages itself into SDRAM (sync)
         // then boots; a real bank keeps D0 asserted and warm-resets so the FPGA
-        // serves it. None return on HW.
-        if (s_bankSel == tsopIdx) {
+        // serves it; SD Card opens the FAT32 browser (see EnterSdBrowse). None of
+        // the first three return on HW.
+        if (s_bankSel == sdIdx) {
+            EnterSdBrowse();
+        }
+        else if (s_bankSel == tsopIdx) {
             Lcd_HandOff("TSOP");   // freeze the LCD on the hand-off screen
             Eos_TsopBoot();
         }
         else if (hasDiag && s_bankSel == diagIdx) {
+            Led_Show(EOS_LED_PURPLE, 0);   // XbDiag -> breathing purple
             Lcd_HandOff("XbDiag");
             Eos_LaunchXbDiag();
         }
         else {
             // Every bank launches NORMALLY. If the descriptor marks this bank as
             // an oversized anchor, the FPGA redirects its serve to the ext-region
-            // SDRAM copy -- no special launch EF needed here.
-            Lcd_HandOff(Bank_Name(Bank_LaunchIndex(s_bankSel)));
-            Bank_Launch(Bank_LaunchIndex(s_bankSel));
+            // SDRAM copy -- no special launch EF needed here. Set the bank LED
+            // (persists across the warm reset into the launched bank): Recovery
+            // (EF 0xA) breathes white; a user bank shows its stored color.
+            int _li = Bank_LaunchIndex(s_bankSel);
+            if (Bank_Ef(_li) == 0x0A)
+                Led_Show(EOS_LED_WHITE, 0);
+            else
+                Led_Show(EOS_LED_SOLID, Desc_GetColor(_li));
+            Lcd_HandOff(Bank_Name(_li));
+            Bank_Launch(_li);
         }
         return;
     }
@@ -373,10 +451,11 @@ static void BankSel_Frame(WORD b)
     Ui_TitleBar("SELECT BANK");
 
     {
-        const char* names[EOS_BANK_MAX + 2];      // real banks + XbDiag + TSOP
+        const char* names[EOS_BANK_MAX + 3];      // real banks + XbDiag + TSOP + SD Card
         for (i = 0; i < cap; ++i) names[i] = Bank_Name(Bank_LaunchIndex(i));
         if (hasDiag) names[diagIdx] = "XbDiag Lite";
         names[tsopIdx] = "TSOP  (onboard flash)";
+        names[sdIdx] = "SD Card";
         Ui_Menu3D(names, total, s_bankSel);
     }
 
@@ -639,19 +718,600 @@ static void DoBackupEeprom(void)
     }
 }
 
+// Pill row geometry -- same values eos_settings.cpp uses, redefined here since
+// those #defines are local to that translation unit and not visible in main.cpp.
+#ifndef PILL_W
+#define PILL_W    400
+#define PILL_H    38
+#define PILL_X    ((g_scrW - PILL_W) / 2)
+#define PILL_R    19
+#endif
+
+// local: int -> decimal into buf (>=12). Returns buf for inline use.
+static const char* iToB(int v, char* buf)
+{
+    char t[12]; int n = 0, i = 0;
+    if (v < 0) { buf[i++] = '-'; v = -v; }
+    if (v == 0) t[n++] = '0';
+    while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n) buf[i++] = t[--n];
+    buf[i] = 0;
+    return buf;
+}
+
+// bounded string copy (local; the module's cstrCopy is static to eos_cerbios.cpp)
+static void cstrCopy(char* dst, int cap, const char* src)
+{
+    int i = 0;
+    if (cap <= 0) return;
+    while (src && src[i] && i < cap - 1) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
+
+// Width in px of the substring val[a..b) (b exclusive), measured with the real
+// (non-monospace) font metric.
+static int subWidth(const char* val, int a, int b)
+{
+    char tmp[80]; int p = 0, i;
+    for (i = a; i < b && val[i] && p < 79; i++) tmp[p++] = val[i];
+    tmp[p] = 0;
+    return Font_TextWidth(tmp);
+}
+
+// Fit a value string into maxPx for a pill's right side.
+//  - selected + overflow  -> MARQUEE: the visible window slides across the
+//    string (pauses at the ends) so the whole value is readable
+//  - unselected + overflow -> leading "..." + the tail that fits (keeps a path's
+//    filename, the useful part, visible)
+//  - fits                  -> unchanged
+// Writes into out (outCap >= 64). tick advances the marquee (a frame counter).
+static const char* fitValue(const char* val, int maxPx, int selected,
+    DWORD tick, char* out, int outCap)
+{
+    int len = 0; while (val[len]) len++;
+    if (Font_TextWidth(val) <= maxPx) { cstrCopy(out, outCap, val); return out; }
+
+    if (selected) {
+        // Character-window marquee. True pixel-smooth scrolling would spill the
+        // pill (no scissor available), so we step by whole characters -- but
+        // slowly, with clear pauses at both ends, so it reads as a steady crawl
+        // rather than a jitter. Find how many characters overflow, then walk a
+        // window across them: [pause at head][crawl to tail][pause at tail][wrap].
+        int over = 0, i, j, p = 0;
+        // count characters we must scroll past so the tail becomes visible
+        for (i = 0; val[i]; i++) {
+            if (subWidth(val, i, len) <= maxPx) break;   // from i, the tail fits
+        }
+        over = i;                        // i = first start offset where tail fits
+        {
+            int hold = 14;               // frames per step -- slow = smooth-reading
+            int pause = 10;              // steps held at each end
+            int cycle = over + pause * 2;
+            int step, start;
+            if (cycle < 1) cycle = 1;
+            step = (int)((tick / hold) % (unsigned)cycle);
+            start = step - pause;        // negative -> still paused at the head
+            if (start < 0) start = 0;
+            if (start > over) start = over;
+            // fill the window from `start` up to what fits in maxPx
+            for (j = start; val[j]; j++) {
+                if (subWidth(val, start, j + 1) > maxPx) break;
+            }
+            while (val[start + p] && p < outCap - 1 && (start + p) < j) {
+                out[p] = val[start + p]; p++;
+            }
+            out[p] = 0;
+        }
+        return out;
+    }
+
+    {   // leading "..." then as much of the tail as fits
+        int ellW = Font_TextWidth("...");
+        int i = len, p = 0;
+        while (i > 0 && ellW + subWidth(val, i - 1, len) <= maxPx) i--;
+        out[p++] = '.'; out[p++] = '.'; out[p++] = '.';
+        while (val[i] && p < outCap - 1) out[p++] = val[i++];
+        out[p] = 0;
+        return out;
+    }
+}
+
+// ===========================================================================
+// Cerbios Config Editor -- Tools sub-feature.
+//   PH_CERB_MENU : pick 3.x.x / Legacy / Overclock Calc
+//   PH_CERB_EDIT : scrolling field editor (load-or-create + Save)
+//   PH_CERB_SAVED: brief save-result screen
+//   PH_CERB_OC   : overclock calculator (enter targets -> show -> confirm write)
+// The heavy lifting (parse, round-trip save, calc) lives in eos_cerbios.*.
+// ===========================================================================
+static CerbConfig s_cerb;               // active config being edited
+static int  s_cerbTarget = CERB_NEW;    // which target the editor is on
+static int  s_cerbSel = 0;           // selected field row
+static int  s_cerbScroll = 0;           // first visible row
+static int  s_cerbSaveOk = 0;           // last save result
+static int  s_cerbOsk = 0;           // 1 = hex OSK overlay open for a field
+static int  s_cerbOskLen = 6;           // expected hex length for the open field
+static DWORD s_cerbTick = 0;          // frame counter, drives the value marquee
+static int   s_comboSlot = 0;          // selected slot in the combo editor
+static int   s_comboIsLed = 0;          // 1 = editing an LED field, 0 = IGR
+static char  s_comboBuf[16] = "";       // working copy of the combo value (bounded)
+#define CERB_ROWS_VISIBLE 6             // field rows per screen (fits above footer)
+
+// A "Save" pseudo-row sits at the end of the field list.
+#define CERB_SAVE_ROW (s_cerb.fieldCount)
+
+static void CerbEdit_Enter(int target)
+{
+    s_cerbTarget = target;
+    File_MountDrives();        // ensure C:/E: symlinks are live before we read
+    Cerb_Load(&s_cerb, target);
+    s_cerbSel = 0; s_cerbScroll = 0;
+    GotoPhase(PH_CERB_EDIT);
+}
+
+// --- branch picker ---------------------------------------------------------
+static int s_cerbMenuSel = 0;
+static void CerbMenu_Frame(WORD b)
+{
+    static const char* items[3] = { "Cerbios 3.x.x", "Legacy (2.4.2)", "Overclock Calc" };
+    if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_TOOLS); return; }
+    s_cerbMenuSel = navSel(b, s_cerbMenuSel, 3);
+    if (Pressed(b, s_prevBtn, BTN_A)) {
+        if (s_cerbMenuSel == 0)      CerbEdit_Enter(CERB_NEW);
+        else if (s_cerbMenuSel == 1) CerbEdit_Enter(CERB_LEGACY);
+        else                         GotoPhase(PH_CERB_OC);
+    }
+    listScreen("Cerbios Config Editor", items, 3, s_cerbMenuSel);
+}
+
+// --- field editor ----------------------------------------------------------
+static void CerbEdit_Frame(WORD b)
+{
+    int total = s_cerb.fieldCount + 1;   // +1 for the Save row
+    int i, y;
+
+    // Hex OSK overlay is modal: while open, it owns input + the screen.
+    if (s_cerbOsk) {
+        WORD edges = (WORD)(b & ~s_prevBtn);
+        int r = Osk_Update(edges);
+        if (r == 1) {
+            char tmp[OSK_MAX_LEN + 1];
+            Osk_GetText(tmp, sizeof(tmp));
+            // normalise to "0x" + uppercase hex of the expected width.
+            {
+                char norm[16]; int ni = 0, j = 0;
+                // skip a leading 0x/0X in the typed text if present
+                if (tmp[0] == '0' && (tmp[1] == 'x' || tmp[1] == 'X')) j = 2;
+                norm[ni++] = '0'; norm[ni++] = 'x';
+                for (; tmp[j] && ni < 14; j++) {
+                    char c = tmp[j];
+                    if (c >= 'a' && c <= 'f') c = (char)(c - 32);
+                    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))
+                        norm[ni++] = c;
+                }
+                norm[ni] = 0;
+                // only store if we captured at least one hex digit
+                if (ni > 2) Cerb_Set(&s_cerb, s_cerbSel, norm);
+            }
+            s_cerbOsk = 0;
+        }
+        else if (r == -1) {
+            s_cerbOsk = 0;   // cancelled -- leave the field unchanged
+        }
+        Gfx_Begin(EOS_BG); Ui_Backdrop();
+        Osk_Draw();
+        Gfx_End();
+        s_prevBtn = b;   // OSK consumed this frame's input
+        return;
+    }
+
+    if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_CERB_MENU); return; }
+
+    // navigation
+    if (Pressed(b, s_prevBtn, BTN_DPAD_UP))   s_cerbSel = (s_cerbSel + total - 1) % total;
+    if (Pressed(b, s_prevBtn, BTN_DPAD_DOWN)) s_cerbSel = (s_cerbSel + 1) % total;
+
+    // keep the selection inside the visible window
+    if (s_cerbSel < s_cerbScroll) s_cerbScroll = s_cerbSel;
+    if (s_cerbSel >= s_cerbScroll + CERB_ROWS_VISIBLE)
+        s_cerbScroll = s_cerbSel - CERB_ROWS_VISIBLE + 1;
+
+    // value editing on a field row
+    if (s_cerbSel < s_cerb.fieldCount) {
+        int k = s_cerb.fields[s_cerbSel].kind;
+        if (k == CF_BOOL) {
+            if (Pressed(b, s_prevBtn, BTN_A) ||
+                Pressed(b, s_prevBtn, BTN_DPAD_LEFT) ||
+                Pressed(b, s_prevBtn, BTN_DPAD_RIGHT))
+                Cerb_Cycle(&s_cerb, s_cerbSel, +1);
+        }
+        else if (k == CF_ENUM) {
+            if (Pressed(b, s_prevBtn, BTN_DPAD_RIGHT) || Pressed(b, s_prevBtn, BTN_A))
+                Cerb_Cycle(&s_cerb, s_cerbSel, +1);
+            if (Pressed(b, s_prevBtn, BTN_DPAD_LEFT))
+                Cerb_Cycle(&s_cerb, s_cerbSel, -1);
+        }
+        else if (k == CF_IGR || k == CF_LED) {
+            // A -> open the slot combo editor (buttons for IGR, colors for LED).
+            if (Pressed(b, s_prevBtn, BTN_A)) {
+                {   // bounded copy: combos are <=4 chars; cap defensively
+                    const char* src = Cerb_Get(&s_cerb, s_cerbSel);
+                    int ci = 0;
+                    while (src[ci] && ci < (int)sizeof(s_comboBuf) - 1) {
+                        s_comboBuf[ci] = src[ci]; ci++;
+                    }
+                    s_comboBuf[ci] = 0;
+                    // LED always has 4 segments -- pad short/empty values with 'G'
+                    if (k == CF_LED) {
+                        while (ci < 4) s_comboBuf[ci++] = 'G';
+                        s_comboBuf[ci] = 0;
+                    }
+                }
+                s_comboIsLed = (k == CF_LED);
+                s_comboSlot = 0;
+                GotoPhase(PH_CERB_COMBO);
+                s_prevBtn = b;
+                return;
+            }
+        }
+        else if (k == CF_HEX6) {
+            // A -> open the hex OSK seeded with the current value.
+            if (Pressed(b, s_prevBtn, BTN_A)) {
+                // seed with the bare hex digits (strip any 0x); user types 0-F.
+                const char* cur = Cerb_Get(&s_cerb, s_cerbSel);
+                if (cur[0] == '0' && (cur[1] == 'x' || cur[1] == 'X')) cur += 2;
+                s_cerbOskLen = 6;   // up to 6 hex digits (coeffs); LCD addr uses 2
+                Osk_Open(OSK_HEX, cur, s_cerbOskLen);
+                s_cerbOsk = 1;
+                s_prevBtn = b;
+                return;
+            }
+        }
+        else {
+            // CF_TEXT: FanSpeed cycles; every other CF_TEXT is a file PATH, so A
+            // opens the file browser to pick one (Dash/BootAnim/CD paths).
+            const char* key = s_cerb.fields[s_cerbSel].iniKey;
+            if (!strcmp(key, "FanSpeed")) {
+                if (Pressed(b, s_prevBtn, BTN_DPAD_RIGHT)) Cerb_Cycle(&s_cerb, s_cerbSel, +1);
+                if (Pressed(b, s_prevBtn, BTN_DPAD_LEFT))  Cerb_Cycle(&s_cerb, s_cerbSel, -1);
+            }
+            else if (Pressed(b, s_prevBtn, BTN_A)) {
+                // browse for a path -> fills this field on select
+                File_MountDrives();
+                s_browseCerb = 1;
+                s_browseCerbField = s_cerbSel;
+                s_browsePath[0] = 0;       // start at the drive list
+                browseRefresh();
+                GotoPhase(PH_BROWSE);
+                s_prevBtn = b;
+                return;
+            }
+        }
+    }
+    else {
+        // Save row
+        if (Pressed(b, s_prevBtn, BTN_A)) {
+            s_cerbSaveOk = Cerb_Save(&s_cerb);
+            GotoPhase(PH_CERB_SAVED);
+            return;
+        }
+    }
+
+    // --- render ---
+    s_cerbTick++;                         // advance the marquee on the selected row
+    Gfx_Begin(EOS_BG); Ui_Backdrop();
+    Gfx_SetFilter(FALSE);
+    Ui_TitleBar(s_cerbTarget == CERB_LEGACY ? "Cerbios 2.4.2  (C:)" : "Cerbios 3.x.x  (E:)");
+
+    // "new file" hint when we built from defaults
+    if (!s_cerb.hadFile)
+        Font_DrawCentered(0, g_scrW, 74, "(no file found -- new one will be created on Save)", EOS_DIM);
+
+    y = 96;
+    for (i = s_cerbScroll; i < s_cerbScroll + CERB_ROWS_VISIBLE && i < total; i++) {
+        int selected = (i == s_cerbSel);
+        if (i < s_cerb.fieldCount) {
+            const char* lbl = s_cerb.fields[i].label;
+            const char* rawv = Cerb_Display(&s_cerb, i);
+            char fitted[80];
+            // value gets the pill width minus the label column (~170px) and margins
+            int valMax = PILL_W - 170 - 40;
+            const char* val = fitValue(rawv, valMax, selected, s_cerbTick, fitted, sizeof(fitted));
+            int dim = (s_cerb.fields[i].kind == CF_HEX6 ||
+                s_cerb.fields[i].kind == CF_LED ||
+                s_cerb.fields[i].kind == CF_IGR);   // display-only rows
+            Ui_PillRow(PILL_X, y, PILL_W, PILL_H, PILL_R, selected, dim, lbl, val);
+        }
+        else {
+            // the Save row -- centered accent pill
+            Ui_PillCentered(PILL_X, y, PILL_W, PILL_H, PILL_R, selected, "Save");
+        }
+        y += 48;
+    }
+
+    Ui_Footer("D-PAD MOVE   L/R or A CHANGE   B BACK");
+    Gfx_End();
+}
+
+// --- IGR / LED slot combo editor -------------------------------------------
+// Shows the combo's slots as a horizontal row of pills. DPAD L/R moves between
+// slots, DPAD U/D (or A) cycles the selected slot. B/Start commits back to the
+// field; the field keeps whatever the slots show.
+static void CerbCombo_Frame(WORD b)
+{
+    int slots, i, x, y;
+    int pw = 130, gap = 12, ph = 46;
+
+    slots = s_comboIsLed ? 4 : Cerb_ComboLen(s_comboBuf);
+    if (slots < 1) slots = 1;
+
+    // commit + leave
+    if (Pressed(b, s_prevBtn, BTN_B) || Pressed(b, s_prevBtn, BTN_START)) {
+        Cerb_Set(&s_cerb, s_cerbSel, s_comboBuf);
+        GotoPhase(PH_CERB_EDIT);
+        return;
+    }
+
+    // move between slots
+    if (Pressed(b, s_prevBtn, BTN_DPAD_LEFT))  s_comboSlot = (s_comboSlot + slots - 1) % slots;
+    if (Pressed(b, s_prevBtn, BTN_DPAD_RIGHT)) s_comboSlot = (s_comboSlot + 1) % slots;
+
+    // cycle the selected slot's value
+    if (Pressed(b, s_prevBtn, BTN_DPAD_UP) || Pressed(b, s_prevBtn, BTN_A)) {
+        if (s_comboIsLed) Cerb_LedCycle(s_comboBuf, s_comboSlot, +1);
+        else              Cerb_IgrCycle(s_comboBuf, s_comboSlot, +1);
+    }
+    if (Pressed(b, s_prevBtn, BTN_DPAD_DOWN)) {
+        if (s_comboIsLed) Cerb_LedCycle(s_comboBuf, s_comboSlot, -1);
+        else              Cerb_IgrCycle(s_comboBuf, s_comboSlot, -1);
+    }
+
+    // --- render ---
+    Gfx_Begin(EOS_BG); Ui_Backdrop();
+    Gfx_SetFilter(FALSE);
+    Ui_TitleBar(s_cerb.fields[s_cerbSel].label);
+
+    Font_DrawCentered(0, g_scrW, 120,
+        s_comboIsLed ? "Set the LED ring colour for each of the 4 segments"
+        : "Set the button for each slot in the combo",
+        EOS_DIM);
+
+    // center the row of slot pills
+    x = (g_scrW - (slots * pw + (slots - 1) * gap)) / 2;
+    y = 180;
+    for (i = 0; i < slots; i++) {
+        int sel = (i == s_comboSlot);
+        const char* nm = s_comboIsLed ? Cerb_LedSlotName(s_comboBuf, i)
+            : Cerb_IgrSlotName(s_comboBuf, i);
+        Ui_PillCentered(x, y, pw, ph, ph / 2, sel, nm);
+        x += pw + gap;
+    }
+
+    Font_DrawCentered(0, g_scrW, 260, "L/R  slot     UP/DOWN or A  change", EOS_DIM);
+    Ui_Footer("B / START  SAVE + BACK");
+    Gfx_End();
+}
+
+// --- save-result screen ----------------------------------------------------
+static void CerbSaved_Frame(WORD b)
+{
+    if (Pressed(b, s_prevBtn, BTN_A) || Pressed(b, s_prevBtn, BTN_B)) {
+        GotoPhase(PH_CERB_EDIT); return;
+    }
+    Gfx_Begin(EOS_BG); Ui_Backdrop();
+    Ui_TitleBar("Cerbios Editor");
+    if (s_cerbSaveOk) {
+        Font_DrawCentered(0, g_scrW, 150, "Saved successfully.", EOS_WHITE);
+        Font_DrawCentered(0, g_scrW, 178, s_cerb.path, EOS_PURPLE);
+        Font_DrawCentered(0, g_scrW, 220, "Restart to apply changes.", EOS_DIM);
+    }
+    else {
+        Font_DrawCentered(0, g_scrW, 150, "SAVE FAILED -- file not written.", EOS_PURPLE);
+        Font_DrawCentered(0, g_scrW, 178, s_cerb.path, EOS_DIM);
+        Font_DrawCentered(0, g_scrW, 220, "Check the drive is present + writable.", EOS_DIM);
+    }
+    Font_DrawCentered(0, g_scrW, 300, "A / B = BACK", EOS_WHITE);
+    Gfx_End();
+}
+
+// --- overclock calculator --------------------------------------------------
+// Simple, new-user-friendly: pick a CPU target and a multiplier, and a GPU
+// target; the calc shows the achieved clocks + coeffs; A writes both coeffs
+// into the 3.x.x ini (leaving the Overclocking toggle to the user).
+static int  s_ocRow = 0;             // 0 CPU MHz, 1 mult, 2 GPU MHz, 3 Compute, 4 Write
+static int  s_ocCpu = 733;           // target CPU MHz
+static int  s_ocMultX10 = 55;            // multiplier * 10 (5.5x stock)
+static int  s_ocGpu = 233;           // target GPU MHz
+static int  s_ocDone = 0;             // 1 once computed
+static int  s_ocAchCpu = 0, s_ocAchRam = 0, s_ocAchFsb = 0, s_ocAchGpu = 0;
+static char s_ocCpuHex[16] = "";
+static char s_ocGpuHex[16] = "";
+static int  s_ocWriteOk = -1;           // -1 none, 0 fail, 1 ok
+// held-direction acceleration for value adjust: track which dir is held and how
+// many frames. Taps step by 1; holding ramps the step up over time.
+static int  s_ocHeldDir = 0;           // -1 left, +1 right, 0 none
+static int  s_ocHeldFrames = 0;         // frames the current dir has been held
+
+static void ocClamp(void)
+{
+    if (s_ocCpu < 500)  s_ocCpu = 500;   if (s_ocCpu > 1400) s_ocCpu = 1400;
+    if (s_ocGpu < 155)  s_ocGpu = 155;   if (s_ocGpu > 400)  s_ocGpu = 400;
+    if (s_ocMultX10 < 40) s_ocMultX10 = 40; if (s_ocMultX10 > 130) s_ocMultX10 = 130;
+}
+
+static void ocCompute(void)
+{
+    Cerb_CalcCpu(s_ocCpu, s_ocMultX10, s_ocCpuHex, &s_ocAchCpu, &s_ocAchRam, &s_ocAchFsb);
+    Cerb_CalcGpu(s_ocGpu, s_ocGpuHex, &s_ocAchGpu);
+    s_ocDone = 1;
+}
+
+// write only CPUMPLLCoeff + NVPLLCoeff into E:\Cerbios\cerbios.ini (round-trip)
+static void ocWrite(void)
+{
+    CerbConfig c;
+    int fi;
+    File_MountDrives();        // ensure E: is live before the round-trip read+write
+    Cerb_Load(&c, CERB_NEW);
+    for (fi = 0; fi < c.fieldCount; fi++) {
+        if (!strcmp(c.fields[fi].iniKey, "CPUMPLLCoeff")) Cerb_Set(&c, fi, s_ocCpuHex);
+        if (!strcmp(c.fields[fi].iniKey, "NVPLLCoeff"))   Cerb_Set(&c, fi, s_ocGpuHex);
+    }
+    s_ocWriteOk = Cerb_Save(&c);
+}
+
+static void ocIntRow(int y, int selected, const char* label, int value, const char* suffix)
+{
+    char v[20], nb[12]; int p = 0;
+    p = appendStr(v, p, iToB(value, nb));
+    if (suffix) p = appendStr(v, p, suffix);
+    v[p] = 0;
+    Ui_PillRow(PILL_X, y, PILL_W, PILL_H, PILL_R, selected, 0, label, v);
+}
+
+// Held-direction acceleration. Call once per frame with the raw button state.
+// Returns the signed increment to apply this frame (0 = none). First press
+// steps by 1 immediately; then a short delay; then repeats, and the repeat
+// STEP grows the longer the button is held so large jumps don't take forever.
+//   ~0.0s : single step of 1 (the initial press)
+//   ~0.3s+: repeat at 1/frame-group, step 1
+//   ~1.0s+: step 2
+//   ~2.0s+: step 5
+//   ~3.0s+: step 10
+static int ocAccelStep(WORD b)
+{
+    int dir = 0;
+    if (b & BTN_DPAD_RIGHT) dir = +1;
+    else if (b & BTN_DPAD_LEFT) dir = -1;
+
+    if (dir == 0) { s_ocHeldDir = 0; s_ocHeldFrames = 0; return 0; }
+
+    // direction just pressed (or changed) -> immediate single step, reset timer
+    if (dir != s_ocHeldDir) {
+        s_ocHeldDir = dir;
+        s_ocHeldFrames = 0;
+        return dir;                       // one crisp step on the initial press
+    }
+
+    // same direction held: advance the hold timer
+    s_ocHeldFrames++;
+
+    // ~60fps assumed. Initial hold delay before auto-repeat kicks in.
+    if (s_ocHeldFrames < 20) return 0;    // ~0.33s dead time after first step
+
+    {
+        int held = s_ocHeldFrames - 20;   // frames since repeat began
+        int stepMag, cadence;
+        // grow the per-repeat step magnitude with total hold time
+        if (s_ocHeldFrames > 180) stepMag = 10;   // >3s
+        else if (s_ocHeldFrames > 120) stepMag = 5;    // >2s
+        else if (s_ocHeldFrames > 60)  stepMag = 2;    // >1s
+        else                           stepMag = 1;
+        cadence = 4;                      // apply a repeat every 4 frames (~15/s)
+        if (held % cadence != 0) return 0;
+        return dir * stepMag;
+    }
+}
+
+static void CerbOc_Frame(WORD b)
+{
+    int y;
+    if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_CERB_MENU); return; }
+
+    // Row navigation only steals UP/DOWN; LEFT/RIGHT drive value adjust below.
+    if (Pressed(b, s_prevBtn, BTN_DPAD_UP)) { s_ocRow = (s_ocRow + 5 - 1) % 5; s_ocHeldDir = 0; s_ocHeldFrames = 0; }
+    if (Pressed(b, s_prevBtn, BTN_DPAD_DOWN)) { s_ocRow = (s_ocRow + 1) % 5; s_ocHeldDir = 0; s_ocHeldFrames = 0; }
+
+    // Accelerated value adjust: 1-unit taps, ramping to bigger steps on hold.
+    // Only the three value rows (0 CPU, 1 mult, 2 GPU) respond to L/R.
+    {
+        int step = (s_ocRow <= 2) ? ocAccelStep(b) : 0;
+        if (step != 0) {
+            if (s_ocRow == 0)      s_ocCpu += step;   // 1 MHz per unit
+            else if (s_ocRow == 1) s_ocMultX10 += step;   // 0.1x per unit
+            else if (s_ocRow == 2) s_ocGpu += step;   // 1 MHz per unit
+            s_ocDone = 0;
+        }
+    }
+    ocClamp();
+
+    if (Pressed(b, s_prevBtn, BTN_A)) {
+        if (s_ocRow == 3) ocCompute();
+        else if (s_ocRow == 4) {
+            if (s_ocDone) { ocWrite(); }   // only write after a compute
+        }
+    }
+
+    // --- render ---
+    Gfx_Begin(EOS_BG); Ui_Backdrop();
+    Gfx_SetFilter(FALSE);
+    Ui_TitleBar("Overclock Calculator");
+
+    y = 80;
+    ocIntRow(y, s_ocRow == 0, "CPU Target", s_ocCpu, " MHz");      y += 46;
+    // multiplier shown as e.g. "5.5x"
+    {
+        // multiplier shown as "N.Mx" (e.g. 55 -> "5.5x")
+        char mv[12], nb[12]; int p = 0;
+        p = appendStr(mv, p, iToB(s_ocMultX10 / 10, nb));
+        mv[p++] = '.';
+        mv[p++] = (char)('0' + (s_ocMultX10 % 10));
+        mv[p++] = 'x'; mv[p] = 0;
+        Ui_PillRow(PILL_X, y, PILL_W, PILL_H, PILL_R, s_ocRow == 1, 0, "Multiplier", mv);
+    }
+    y += 46;
+    ocIntRow(y, s_ocRow == 2, "GPU Target", s_ocGpu, " MHz");      y += 46;
+
+    Ui_PillCentered(PILL_X, y, PILL_W, PILL_H, PILL_R, s_ocRow == 3, "Compute"); y += 46;
+    {
+        int canWrite = s_ocDone;
+        Ui_PillCentered(PILL_X, y, PILL_W, PILL_H, PILL_R, s_ocRow == 4,
+            canWrite ? "Write to E:\\Cerbios\\cerbios.ini" : "Write (compute first)");
+    }
+    y += 50;
+
+    // results
+    if (s_ocDone) {
+        char line[62], nb[12]; int p;
+        // "CPU 733  RAM 200   0x230801"
+        p = 0;
+        p = appendStr(line, p, "CPU ");  p = appendStr(line, p, iToB(s_ocAchCpu, nb));
+        p = appendStr(line, p, "  RAM "); p = appendStr(line, p, iToB(s_ocAchRam, nb));
+        p = appendStr(line, p, "  ");     p = appendStr(line, p, s_ocCpuHex);
+        line[p] = 0;
+        Font_DrawCentered(0, g_scrW, y, line, EOS_WHITE); y += 20;
+        // "GPU 233   0x011C01"
+        p = 0;
+        p = appendStr(line, p, "GPU ");  p = appendStr(line, p, iToB(s_ocAchGpu, nb));
+        p = appendStr(line, p, "   ");   p = appendStr(line, p, s_ocGpuHex);
+        line[p] = 0;
+        Font_DrawCentered(0, g_scrW, y, line, EOS_WHITE); y += 24;
+    }
+
+    if (s_ocWriteOk == 1)
+        Font_DrawCentered(0, g_scrW, y, "Coeffs written. Enable Overclocking in the editor.", EOS_PURPLE);
+    else if (s_ocWriteOk == 0)
+        Font_DrawCentered(0, g_scrW, y, "WRITE FAILED -- check E: is present.", EOS_PURPLE);
+
+    Ui_Footer("UP/DN MOVE   L/R ADJUST (hold=faster)   A SELECT   B BACK");
+    Gfx_End();
+}
+
+
 static void Tools_Frame(WORD b)             // top level: tool categories
 {
-    static const char* cats[5] = { "EEPROM", "Firmware", "HDD", "Format", "Clear Settings" };
+    static const char* cats[6] = { "EEPROM", "Firmware", "HDD", "Cerbios Config Editor", "Format", "Clear Settings" };
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_MENU); return; }
-    s_toolSel = navSel(b, s_toolSel, 5);
+    s_toolSel = navSel(b, s_toolSel, 6);
     if (Pressed(b, s_prevBtn, BTN_A)) {
         if (s_toolSel == 0) { s_eeToolSel = 0; GotoPhase(PH_EE_TOOLS); }
         else if (s_toolSel == 1) { s_fwToolSel = 0; GotoPhase(PH_FW_TOOLS); }
         else if (s_toolSel == 2) { HddTools_Enter(); }
-        else if (s_toolSel == 3) { Format_Enter(); }
+        else if (s_toolSel == 3) { s_cerbMenuSel = 0; GotoPhase(PH_CERB_MENU); }
+        else if (s_toolSel == 4) { Format_Enter(); }
         else { GotoPhase(PH_CLEARCFG); }
     }
-    listScreen("Tools", cats, 5, s_toolSel);
+    listScreen("Tools", cats, 6, s_toolSel);
 }
 
 // Clear the two config banks (bank table 0xB + settings 0xC) back to factory.
@@ -1213,6 +1873,27 @@ static void BankMgmt_Frame(WORD b)
         }
     }
 
+    // Black -> set this bank's LED color. Excluded: locked banks and shadowed
+    // slots (a slot swallowed by a large bank's shadow has no independent LED
+    // color -- the color lives on the anchor).
+    if (Pressed(b, s_prevBtn, BTN_BLACK)) {
+        int cslot = descSlotForBank(s_mgmtSel);
+        if (Bank_IsLocked(s_mgmtSel)) {
+            SetStatus("Cannot set color on locked bank");
+        }
+        else if (cslot < 0) {
+            SetStatus("Not a user bank");
+        }
+        else if (s_layout.slot[cslot].state == EOS_SLOT_SHADOW) {
+            SetStatus("Slot is part of a large bank");
+        }
+        else {
+            LedPick_Open(s_mgmtSel, PH_BANKMGMT);
+            GotoPhase(PH_LEDCOLOR);
+            return;
+        }
+    }
+
     Gfx_Begin(EOS_BG); Ui_Backdrop();
     Ui_TitleBar("BANK MANAGEMENT");
 
@@ -1236,7 +1917,7 @@ static void BankMgmt_Frame(WORD b)
     }
 
     Font_DrawCentered(0, g_scrW, g_scrH - 66,
-        "A = FLASH   X = DELETE   Y = RENAME   B = BACK", EOS_DIM);
+        "A = FLASH   X = DELETE   Y = RENAME   Blk = LED COLOR", EOS_DIM);
     if (s_status[0] && GetTickCount() < s_statusUntil)
         Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
     Gfx_End();
@@ -1360,6 +2041,12 @@ static void DoFlash(int idx, const char* path)
         }
         Config_Save();
         SetStatus("Flashed OK");
+        // Option B: flash is fully committed. Offer the LED color picker as an
+        // optional trailing step (B backs out without affecting the flash).
+        if (s_flashTarget >= 0) {
+            LedPick_Open(s_flashTarget, PH_BANKMGMT);
+            GotoPhase(PH_LEDCOLOR);
+        }
         return;
     }
 
@@ -1439,6 +2126,16 @@ static void DoFlash(int idx, const char* path)
         Config_Save();
         SetStatus(s_extReady ? "Flashed OK (large) - ext RESIDENT"
             : "Flashed (large) - ext NOT resident!");
+        // Option B: flash committed -> optional LED color picker (B = no change).
+        // A large BIOS auto-places into an anchor slot that may differ from the
+        // originally-selected bank, so color the ACTUAL anchor, not s_flashTarget.
+        {
+            int anchorTbl = Bank_IndexForEf((unsigned char)(0x3 + slot));
+            if (anchorTbl >= 0) {
+                LedPick_Open(anchorTbl, PH_BANKMGMT);
+                GotoPhase(PH_LEDCOLOR);
+            }
+        }
         return;
     }
 }
@@ -1457,6 +2154,7 @@ static void Browse_Frame(WORD b)
     }
     if (Pressed(b, s_prevBtn, BTN_B)) {
         if (s_browsePath[0] == 0) {
+            if (s_browseCerb) { s_browseCerb = 0; GotoPhase(PH_CERB_EDIT); return; }
             if (s_browseSong) { s_browseSong = 0; GotoPhase(PH_SETTINGS); return; }
             GotoPhase(PH_BANKMGMT); return;                             // drive list -> back
         }
@@ -1468,6 +2166,24 @@ static void Browse_Frame(WORD b)
             browseInto(e->name);
         }
         else {
+            if (s_browseCerb) {
+                // Cerbios paths use the "HDD0-" device prefix (e.g.
+                // HDD0-E:\\Dashboard\\default.xbe). The browser gives a plain
+                // "E:\\..." path, so prepend "HDD0-" before storing it.
+                char cerbPath[EOS_FILE_PATH_MAX + 8];
+                int cp = 0;
+                buildFullPath(s_flashPath, e->name);   // plain "X:\\dir\\file"
+                cp = appendStr(cerbPath, 0, "HDD0-");
+                {
+                    int j = 0; while (s_flashPath[j] && cp < (int)sizeof(cerbPath) - 1)
+                        cerbPath[cp++] = s_flashPath[j++]; cerbPath[cp] = 0;
+                }
+                if (s_browseCerbField >= 0)
+                    Cerb_Set(&s_cerb, s_browseCerbField, cerbPath);
+                s_browseCerb = 0;
+                GotoPhase(PH_CERB_EDIT);
+                return;
+            }
             if (s_browseSong) {
                 buildFullPath(s_flashPath, e->name);   // reuse as path scratch
                 Config_SetBgmPath(s_flashPath);        // persist the selected track
@@ -1494,7 +2210,7 @@ static void Browse_Frame(WORD b)
     if (s_browseSel >= s_browseScroll + vis) s_browseScroll = s_browseSel - vis + 1;
 
     Gfx_Begin(EOS_BG); Ui_Backdrop();
-    Ui_TitleBar("SELECT BIOS IMAGE");
+    Ui_TitleBar(s_browseCerb ? "SELECT FILE" : (s_browseSong ? "SELECT MUSIC" : "SELECT BIOS IMAGE"));
     Font_DrawCentered(0, g_scrW, 76, (s_browsePath[0] ? s_browsePath : "(drives)"), EOS_DIM);
 
     top = 104;
@@ -1513,6 +2229,200 @@ static void Browse_Frame(WORD b)
             p = appendStr(row, p, s_entries[ei].name);
             if (s_entries[ei].is_dir) appendStr(row, p, "/");
             Ui_PillLeft(x, y, w, 26, 13, ei == s_browseSel, row);
+        }
+    }
+
+    Ui_Footer("A = OPEN/SELECT    B = UP/BACK");
+    Gfx_End();
+}
+
+// ---------------------------------------------------------------------------
+// SD CARD BROWSER: FAT32, read-only, our own driver (eos_sdcard.cpp / FatFs)
+// over the SD_BR_* LPC registers -- NOT File_ListDir/XTL (that's the HDD path
+// above). Selecting a file resolves it to a raw contiguous LBA run, precaches
+// it into NRGN_SD in hardware, and launches bank 0x0. Never writes to the SD
+// card and never touches on-board flash.
+// ---------------------------------------------------------------------------
+static void sdSortEntries(void)
+{
+    int i, j;
+    for (i = 0; i < s_sdEntCount - 1; ++i) {
+        for (j = 0; j < s_sdEntCount - 1 - i; ++j) {
+            EosFileEntry* a = &s_sdEntries[j];
+            EosFileEntry* c = &s_sdEntries[j + 1];
+            int swap;
+            if (a->is_dir != c->is_dir) {
+                swap = c->is_dir && !a->is_dir;
+            }
+            else {
+                int k = 0;
+                while (a->name[k] && c->name[k]) {
+                    char ca = a->name[k], cb = c->name[k];
+                    if (ca >= 'a' && ca <= 'z') ca = (char)(ca - 32);
+                    if (cb >= 'a' && cb <= 'z') cb = (char)(cb - 32);
+                    if (ca != cb) break;
+                    ++k;
+                }
+                swap = (unsigned char)a->name[k] > (unsigned char)c->name[k];
+            }
+            if (swap) { EosFileEntry t = *a; *a = *c; *c = t; }
+        }
+    }
+}
+
+static void sdBrowseRefresh(void)
+{
+    DIR    dir;
+    FILINFO fno;
+    FRESULT fr;
+    int    n = 0;
+
+    fr = f_opendir(&dir, (s_sdPath[0] == 0) ? "/" : s_sdPath);
+    if (fr == FR_OK) {
+        for (;;) {
+            fr = f_readdir(&dir, &fno);
+            if (fr != FR_OK || fno.fname[0] == 0) break;
+            if (fno.fname[0] == '.') continue;       // skip dotfiles / "." / ".."
+            if (n >= EOS_FILE_MAX_ENTRIES) break;
+            {
+                int k = 0;
+                while (fno.fname[k] && k < EOS_FILE_NAME_MAX - 1) {
+                    s_sdEntries[n].name[k] = fno.fname[k]; ++k;
+                }
+                s_sdEntries[n].name[k] = 0;
+            }
+            s_sdEntries[n].is_dir = (fno.fattrib & AM_DIR) ? 1 : 0;
+            ++n;
+        }
+        f_closedir(&dir);
+    }
+    s_sdEntCount = n;
+    s_sdSel = 0;
+    s_sdScroll = 0;
+    sdSortEntries();
+}
+
+static void sdBrowseUp(void)
+{
+    int n = mLen(s_sdPath), i;
+    if (n == 0) return;                        // already at root
+    i = n - 1;
+    while (i > 0 && s_sdPath[i] != '/') --i;
+    s_sdPath[i] = 0;
+    sdBrowseRefresh();
+}
+
+static void sdBrowseInto(const char* name)
+{
+    int n = mLen(s_sdPath), i;
+    if (n > 0 && s_sdPath[n - 1] != '/' && n < EOS_FILE_PATH_MAX - 1) s_sdPath[n++] = '/';
+    for (i = 0; name[i] && n < EOS_FILE_PATH_MAX - 1; ++i) s_sdPath[n++] = name[i];
+    s_sdPath[n] = 0;
+    sdBrowseRefresh();
+}
+
+static void sdBuildFullPath(char* out, const char* name)
+{
+    int p = 0, i = 0;
+    while (s_sdPath[p] && p < EOS_FILE_PATH_MAX - 1) { out[p] = s_sdPath[p]; ++p; }
+    if (p > 0 && out[p - 1] != '/' && p < EOS_FILE_PATH_MAX - 1) out[p++] = '/';
+    while (name[i] && p < EOS_FILE_PATH_MAX - 1) out[p++] = name[i++];
+    out[p] = 0;
+}
+
+// Called from BankSel_Frame when "SD Card" is chosen. Mounts the volume (cheap,
+// idempotent-ish -- f_mount just (re)binds the FATFS object) and lists the
+// root; only switches to PH_SDBROWSE on success, so a missing/bad card just
+// shows a status line and leaves the user on the bank-select screen.
+static void EnterSdBrowse(void)
+{
+    int rc = Sd_Mount();
+    if (rc != EOS_SD_OK) {
+        SetStatus(Sd_CardReady() ? "SD card: not a valid FAT32 volume" : "No SD card detected");
+        return;
+    }
+    s_sdPath[0] = 0;
+    sdBrowseRefresh();
+    GotoPhase(PH_SDBROWSE);
+}
+
+static void SdBrowse_Frame(WORD b)
+{
+    int vis = 10, i, top;
+
+    if (s_sdSel >= s_sdEntCount) s_sdSel = (s_sdEntCount > 0) ? s_sdEntCount - 1 : 0;
+
+    if (s_sdEntCount > 0) {
+        if (Pressed(b, s_prevBtn, BTN_DPAD_UP))
+            s_sdSel = (s_sdSel + s_sdEntCount - 1) % s_sdEntCount;
+        if (Pressed(b, s_prevBtn, BTN_DPAD_DOWN))
+            s_sdSel = (s_sdSel + 1) % s_sdEntCount;
+    }
+    if (Pressed(b, s_prevBtn, BTN_B)) {
+        if (s_sdPath[0] == 0) { GotoPhase(PH_BANKSEL); return; }
+        sdBrowseUp();
+    }
+    if (s_sdEntCount > 0 && Pressed(b, s_prevBtn, BTN_A)) {
+        EosFileEntry* e = &s_sdEntries[s_sdSel];
+        if (e->is_dir) {
+            sdBrowseInto(e->name);
+        }
+        else {
+            char    path[EOS_FILE_PATH_MAX];
+            FIL     fp;
+            FRESULT fr;
+            sdBuildFullPath(path, e->name);
+            fr = f_open(&fp, path, FA_READ);
+            if (fr != FR_OK) {
+                SetStatus("Could not open file");
+            }
+            else {
+                unsigned long lba; unsigned int sectors; int szc;
+                int rc = Sd_ResolveFile(&fp, &lba, &sectors, &szc);
+                f_close(&fp);
+                if (rc == EOS_SD_FRAGMENTED)
+                    SetStatus("File is fragmented -- copy it fresh to the card");
+                else if (rc == EOS_SD_TOOBIG)
+                    SetStatus("Not a 256K/512K/1MB BIOS image");
+                else if (rc == EOS_SD_OK) {
+                    // Staging feedback: SD Card gets its own distinct color
+                    // (magenta/neon pink) -- not a reuse of XbDiag's purple,
+                    // even though both are "paging into SDRAM before boot".
+                    Led_Show(EOS_LED_MAGENTA, 0);
+                    Lcd_HandOff(e->name);
+                    Sd_PrecacheAndLaunch(lba, sectors, szc);   // no return on success
+                    SetStatus("SD card error during staging");  // only reached on failure
+                }
+            }
+        }
+    }
+
+    if (s_sdSel < s_sdScroll) s_sdScroll = s_sdSel;
+    if (s_sdSel >= s_sdScroll + vis) s_sdScroll = s_sdSel - vis + 1;
+
+    Gfx_Begin(EOS_BG); Ui_Backdrop();
+    Ui_TitleBar("SELECT BIOS (SD CARD)");
+    Font_DrawCentered(0, g_scrW, 76, (s_sdPath[0] ? s_sdPath : "(root)"), EOS_DIM);
+
+    top = 104;
+    if (s_sdEntCount == 0)
+        Font_DrawCentered(0, g_scrW, 200, "(empty)", EOS_DIM);
+
+    {
+        int w = 500, x = (g_scrW - w) / 2;
+        for (i = 0; i < vis; ++i) {
+            int  ei = s_sdScroll + i;
+            int  y = top + i * 30;
+            char row[EOS_FILE_NAME_MAX + 4];
+            int  p = 0;
+            if (ei >= s_sdEntCount) break;
+            {
+                int k = 0;
+                while (s_sdEntries[ei].name[k] && p < (int)sizeof(row) - 2) { row[p++] = s_sdEntries[ei].name[k]; ++k; }
+            }
+            if (s_sdEntries[ei].is_dir) row[p++] = '/';
+            row[p] = 0;
+            Ui_PillLeft(x, y, w, 26, 13, ei == s_sdSel, row);
         }
     }
 
@@ -1641,8 +2551,13 @@ void __cdecl main() {
         if (s_phase == PH_SPLASH)   Splash_Frame(b);
         else if (s_phase == PH_BANKSEL)  BankSel_Frame(b);
         else if (s_phase == PH_BANKMGMT) BankMgmt_Frame(b);
+        else if (s_phase == PH_LEDCOLOR) {
+            int nx = LedPick_Frame(b, s_prevBtn);
+            if (nx >= 0) GotoPhase((AppPhase)nx);
+        }
         else if (s_phase == PH_CONFIRM)  Confirm_Frame(b);
         else if (s_phase == PH_BROWSE)   Browse_Frame(b);
+        else if (s_phase == PH_SDBROWSE) SdBrowse_Frame(b);
         else if (s_phase == PH_RENAME)   Rename_Frame(b);
         else if (s_phase == PH_TOOLS)    Tools_Frame(b);
         else if (s_phase == PH_EE_TOOLS) EeTools_Frame(b);
@@ -1656,6 +2571,11 @@ void __cdecl main() {
         else if (s_phase == PH_FORMAT)         Format_Frame(b);
         else if (s_phase == PH_FORMAT_CONFIRM) FormatConfirm_Frame(b);
         else if (s_phase == PH_CLEARCFG)       ClearCfg_Frame(b);
+        else if (s_phase == PH_CERB_MENU)  CerbMenu_Frame(b);
+        else if (s_phase == PH_CERB_EDIT)  CerbEdit_Frame(b);
+        else if (s_phase == PH_CERB_SAVED) CerbSaved_Frame(b);
+        else if (s_phase == PH_CERB_OC)    CerbOc_Frame(b);
+        else if (s_phase == PH_CERB_COMBO) CerbCombo_Frame(b);
         else if (s_phase == PH_EE_RESTORE) EeRestore_Frame(b);
         else if (s_phase == PH_EE_CONFIRM) EeConfirm_Frame(b);
         else if (s_phase == PH_ABOUT)    About_Frame(b);

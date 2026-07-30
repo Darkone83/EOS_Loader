@@ -255,6 +255,14 @@ void Bank_Launch(int idx)
     ensureInit();
     ef = Bank_Ef(idx);
 
+    // 0) Recovery (EF 0xA) serves from SDRAM 0x1C0000, which is ABOVE the boot
+    //    preload region (0..0x1BFFFF). Unlike user banks, it is not populated at
+    //    cold boot, so it must be paged in from flash before serving -- exactly
+    //    like Eos_LaunchXbDiag does for 0xD. Without this, a freshly-flashed
+    //    recovery image is in NOR flash but the served SDRAM copy is empty on the
+    //    next cold boot. Sync it here so recovery always launches what was flashed.
+    if (ef == 0x0A) Flash_Sync(0x0A);
+
     // 1) select the bank in the FPGA (persists across the warm reset)
     io_out8(0x00EF, ef);
 

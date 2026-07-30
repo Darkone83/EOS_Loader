@@ -11,14 +11,16 @@ loader: pick which BIOS runs, flash new BIOS images over the network, back up an
 EEPROM, run firmware and hard-drive tools, watch live console telemetry, and personalise the
 UI — all from the couch with a controller, or from a browser on your PC.
 
-> Team Resurgent · Darkone83 · **Private — do not distribute**
+> Team Resurgent · Darkone83
 
 ---
 
 ## What you can do
 
 - **Choose your BIOS** — switch between BIOS banks on the Eos board, boot the console's
-  original **TSOP** BIOS, or launch **XbDiag Lite** when it's installed.
+  original **TSOP** BIOS, launch **XbDiag Lite** when it's installed, or boot a BIOS image
+  straight off an **SD card** (FAT32, read-only — nothing is written to the card or to the
+  board's flash).
 - **Flash BIOS images** — push a new BIOS to a bank over FTP or the web control panel, then
   commit it. Supports **256K, 512K, and 1MB** images; oversized banks are auto-placed into
   the dynamic new-region layout.
@@ -31,6 +33,8 @@ UI — all from the couch with a controller, or from a browser on your PC.
 - **HDD tools** — drive info, plus **ATA security lock / unlock** (bind a drive to this
   console or remove security).
 - **Hard-drive setup** — stage a fresh drive with the standard Xbox partitions.
+- **Cerbios tools** *(planned)* — a Cerbios config editor and CPU/GPU overclock calculator,
+  on-console and in the web panel.
 - **Live telemetry HUD** — a top-right overlay shows **CPU / motherboard temperature** and
   **RAM** while you use the loader.
 - **Personalise it** — recolour the UI with built-in themes, or build your own **custom themes**
@@ -70,6 +74,11 @@ dynamic new-region layout and the bank management screen shows the free-slot bud
 To **boot the stock BIOS**: choose the **TSOP** entry in the bank list. Eos steps aside and
 the Xbox boots its original onboard BIOS; a normal power cycle returns you to Eos.
 
+To **boot from an SD card**: choose the **SD Card** entry in the bank list, browse the card's
+FAT32 filesystem, and pick a BIOS image (**256K, 512K, or 1MB**). It's staged into SDRAM and
+booted directly — the loader never writes to the card and never touches the Eos flash. Write
+BIOS images to the card from a PC; the loader only reads it.
+
 ### Web control panel
 
 Point a browser at the console's IP address for a control panel with:
@@ -94,8 +103,8 @@ port **21** (all changeable in Settings). Up to two sessions at once; a third ge
 
 ### Tools
 
-**Tools** groups the maintenance functions: **EEPROM**, **Firmware**, **HDD**, **Format**, and
-**Clear Settings**.
+**Tools** groups the maintenance functions: **EEPROM**, **Firmware**, **HDD**, **Cerbios**,
+**Format**, and **Clear Settings**.
 
 ### EEPROM tools
 
@@ -108,6 +117,13 @@ the console booting, and the backup is how you recover.
 
 **Backup** dumps a chosen bank's flash to a file on the drive, and **Restore** writes a saved
 firmware image back to a size-matched bank (erased, programmed, and verified page-by-page).
+
+### Cerbios tools
+
+A **Cerbios config editor** — for reading and writing a bank's Cerbios configuration block
+without a PC — and a **CPU/GPU overclock calculator**, on-console and mirrored in the web
+control panel. Not yet in the loader; reserving this section so the shape stays consistent
+with the rest of Tools once it lands.
 
 ### HDD tools
 
@@ -211,7 +227,7 @@ folder** — it is a required, separate tool, not part of this loader source. Bu
 loader produces `default.xbe`; `eos_pack.py` is what turns that into a flashable image.
 
 The Eos board boots a **2 MB Xenium-style BIOS image** with the loader XBE embedded
-(LZ4-compressed) in the XeniumOS bank, and a borrowed Cerbios kernel + bank geometry kept
+(LZ4-compressed) in the XeniumOS bank, and bank geometry kept
 byte-for-byte. `eos_pack.py` swaps **only** the embedded XBE into a known-good template, so
 the kernel's XBE-location expectations stay satisfied.
 
@@ -222,7 +238,7 @@ python3 eos_pack.py unpack eos.bin out.xbe                     # pull an XBE bac
 ```
 
 - `<template.bin>` must be the **2 MB Xenium image** (e.g. `Xenium_Prometheos_V1_5_0.bin`) —
-  not the 256 K Cerbios `.bin` or the 1 MB RP2040 image.
+  not the 256 K variant or the 1 MB RP2040 image.
 - The XBE is placed at the XeniumOS bank (`0x100000`); descriptor is `u32 decompressed_size,
   u32 compressed_size` then the raw LZ4 block. Kernel sits at `0x180000`.
 - Budget: descriptor + compressed XBE must fit **0x80000 (512 KB)** — `pack` errors on
@@ -252,6 +268,9 @@ dd_net                    networking
 eos_firmware_io           firmware/loader image I/O + per-bank backup/restore
 
 eos_bank                  bank register control + locked-bank flag + TSOP boot + XbDiag detect
+eos_sdcard                SD card driver: register I/O, FatFs file -> raw LBA resolve, precache + launch
+eos_sddiskio              FatFs disk I/O glue (single-sector reads over the onboard SD slot)
+ff / ffunicode / diskio   vendored FatFs (read-only, LFN, fast-seek) -- see bundled-library note below
 eos_descriptor            dynamic bank geometry descriptor (256K/512K/1MB slot layout)
 eos_flash                 flash engine bridge
 eos_hdd / eos_format      drive info + ATA security + HDD staging/format
@@ -275,6 +294,13 @@ Media/                    runtime media assets (background-music tracks, etc.)
 ```
 
 > **minimp3.h and stb_image.h are bundled** — link `dsound.lib` for the audio engine.
+>
+> **FatFs (`ff.c`/`ff.h`/`ffconf.h`/`ffunicode.c`/`diskio.h`) is vendored** — R0.16 with the
+> 2026 CVE patch set applied, configured read-only (LFN on, fast-seek on, fixed 512B sectors).
+> `eos_sddiskio.cpp` is the disk I/O glue over the onboard SD slot. A handful of local, clearly
+> commented deltas in `ff.h`/`ffconf.h` handle porting quirks specific to this toolchain (Xbox/
+> RXDK integer types, an alignment-attribute syntax MSVC doesn't understand) — see the comments
+> in those files; nothing else in the vendored FatFs source is modified from upstream.
 >
 > `eos_image.cpp`, `eos_theme_custom.cpp`, `eos_rtc.cpp`, and `eos_lcd.cpp` are separate
 > translation units — make sure they're in the project's compile list.

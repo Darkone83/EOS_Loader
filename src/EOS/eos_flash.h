@@ -57,3 +57,12 @@ unsigned char Flash_LastFlashSR(void);  // flash status register from the last p
 // Tell the FPGA to re-read the bank-layout descriptor (bank 0xF) after writing
 // it, so dynamic bank geometry updates live (no reboot needed).
 void Flash_ReloadDescriptor(void);
+
+// Drive the external bank status LED. mode: 0=off, 1=solid(rgb 0x00RRGGBB),
+// 2=pulse white (loader/recovery), 3=pulse purple (XbDiag).
+#define EOS_LED_OFF     0
+#define EOS_LED_SOLID   1
+#define EOS_LED_WHITE   2   // pulse white  (loader/recovery)
+#define EOS_LED_PURPLE  3   // pulse purple (XbDiag)
+#define EOS_LED_MAGENTA 4   // pulse magenta/neon pink (SD Card staging)
+void Led_Show(int mode, unsigned int rgb);

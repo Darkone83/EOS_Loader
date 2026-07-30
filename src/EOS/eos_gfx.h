@@ -81,6 +81,13 @@ void Gfx_Quad3DAdd(float cx, float cy, float cz, float hw, float hh, DWORD c,
     IDirect3DTexture8* tex);
 void Gfx_Orb3D(float cx, float cy, float cz, float size, DWORD color, int peak);
 
+// Additive soft glow sprite at a rotated 3D position (same transform basis as
+// Gfx_PillX3D). Uses the 64x64 radial glow texture, blended additive so it only
+// ever ADDS light -- it cannot darken the pill or the background. peak = 0..255
+// overall intensity. Draw it BEFORE the pill so the pill sits on top of the glow.
+void Gfx_GlowX3D(float cx, float cy, float cz, float ca, float sa,
+    float hw, float hh, DWORD color, int peak);
+
 // CRT-free sine/cosine (range-reduced; ~0.1% error). For wheel rotation.
 void Gfx_SinCos(float a, float* s, float* c);
 

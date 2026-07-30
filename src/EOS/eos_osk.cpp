@@ -53,6 +53,15 @@ static const Key k_n4[MAX_KEYS_PER_ROW] = { {{SK_DONE,SK_DONE,SK_DONE},2},{{SK_C
 static const Key* const k_num[5] = { k_n0, k_n1, k_n2, k_n3, k_n4 };
 static const int        k_numCount[5] = { 3, 3, 3, 3, 2 };
 
+// ---- hex layout: 0-F in a 4x4-ish grid + edit keys ------------------------
+static const Key k_h0[MAX_KEYS_PER_ROW] = { {{'0','0','0'},1},{{'1','1','1'},1},{{'2','2','2'},1},{{'3','3','3'},1},{{0,0,0},0} };
+static const Key k_h1[MAX_KEYS_PER_ROW] = { {{'4','4','4'},1},{{'5','5','5'},1},{{'6','6','6'},1},{{'7','7','7'},1},{{0,0,0},0} };
+static const Key k_h2[MAX_KEYS_PER_ROW] = { {{'8','8','8'},1},{{'9','9','9'},1},{{'A','A','A'},1},{{'B','B','B'},1},{{0,0,0},0} };
+static const Key k_h3[MAX_KEYS_PER_ROW] = { {{'C','C','C'},1},{{'D','D','D'},1},{{'E','E','E'},1},{{'F','F','F'},1},{{0,0,0},0} };
+static const Key k_h4[MAX_KEYS_PER_ROW] = { {{SK_BKSP,SK_BKSP,SK_BKSP},1},{{SK_DONE,SK_DONE,SK_DONE},2},{{SK_CANCEL,SK_CANCEL,SK_CANCEL},1},{{0,0,0},0} };
+static const Key* const k_hex[5] = { k_h0, k_h1, k_h2, k_h3, k_h4 };
+static const int        k_hexCount[5] = { 4, 4, 4, 4, 3 };
+
 // ---- layout geometry (integer pixels; centered on g_scrW) ------------------
 // Kept in int so no float->int conversion is emitted (avoids __ftol2_sse).
 // Gfx_Fill takes floats, but int->float casts are free.
@@ -91,8 +100,8 @@ static void kCopy(char* d, int cap, const char* s)
     d[i] = 0;
 }
 
-static const Key* const* Rows(void) { return (s_mode == OSK_NUMERIC) ? k_num : k_text; }
-static const int* Counts(void) { return (s_mode == OSK_NUMERIC) ? k_numCount : k_textCount; }
+static const Key* const* Rows(void) { return (s_mode == OSK_HEX) ? k_hex : (s_mode == OSK_NUMERIC) ? k_num : k_text; }
+static const int* Counts(void) { return (s_mode == OSK_HEX) ? k_hexCount : (s_mode == OSK_NUMERIC) ? k_numCount : k_textCount; }
 static int               RowCount(int r) { return Counts()[r]; }
 
 static void ClampCol(void)
@@ -104,7 +113,11 @@ static void ClampCol(void)
 
 static void LayoutForMode(void)
 {
-    if (s_mode == OSK_NUMERIC) {
+    if (s_mode == OSK_HEX) {
+        s_panelW = 300;
+        s_panelX = (g_scrW - 300) / 2;
+    }
+    else if (s_mode == OSK_NUMERIC) {
         s_panelW = 240;
         s_panelX = (g_scrW - 240) / 2;
     }
@@ -279,7 +292,7 @@ void Osk_Draw(void)
     }
 
     Font_DrawCentered(0, g_scrW, KB_PANEL_Y + ROWS * (KB_KEY_H + KB_ROW_GAP) + 8,
-        (s_mode == OSK_NUMERIC)
+        (s_mode == OSK_NUMERIC || s_mode == OSK_HEX)
         ? "A Type   B Del   Start OK   Back Cancel"
         : "A Type  B Del  X Case  L3 Caps  Y Space  Start OK  Back Cancel",
         dim);

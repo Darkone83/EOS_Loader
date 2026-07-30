@@ -535,6 +535,23 @@ void Gfx_Orb3D(float cx, float cy, float cz, float size, DWORD color, int peak)
     Gfx_SetFilter(FALSE);
 }
 
+void Gfx_GlowX3D(float cx, float cy, float cz, float ca, float sa,
+    float hw, float hh, DWORD color, int peak)
+{
+    // Soft additive halo behind a rotated 3D pill. Same rotated-quad basis as
+    // Gfx_PillX3D so it tracks the pill exactly (including the idle sway); the
+    // radial glow texture + additive blend means it only adds light and fades to
+    // nothing at its edges, so it can never draw a hard box or dim anything.
+    DWORD c = (color & 0x00FFFFFF) | ((DWORD)(peak & 0xFF) << 24);
+    if (!s_glowTex) return;
+    g_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);   // additive
+    Gfx_SetFilter(TRUE);                                    // smooth the sprite
+    Gfx_Quad3DP(cx, cy, cz, ca, sa, 0.0f, 0.0f, hw, hh, c,
+        s_glowTex, 0.0f, 0.0f, 1.0f, 1.0f);
+    Gfx_SetFilter(FALSE);
+    g_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+}
+
 // Tilted quad. A local-space rect (centered at lcx,lcy within the item's face)
 // rotated about the world X axis by (ca=cos,sa=sin), then placed at the item
 // center (cx,cy,cz). X is unaffected by the rotation; local Y maps into world
