@@ -33,7 +33,7 @@ UI — all from the couch with a controller, or from a browser on your PC.
 - **HDD tools** — drive info, plus **ATA security lock / unlock** (bind a drive to this
   console or remove security).
 - **Hard-drive setup** — stage a fresh drive with the standard Xbox partitions.
-- **Cerbios tools** *(planned)* — a Cerbios config editor and CPU/GPU overclock calculator,
+- **Cerbios tools** — a Cerbios config editor and CPU/GPU overclock calculator,
   on-console and in the web panel.
 - **Live telemetry HUD** — a top-right overlay shows **CPU / motherboard temperature** and
   **RAM** while you use the loader.
