@@ -141,6 +141,12 @@
     <ClCompile Include="ffunicode.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="eos_model.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="eos_plasma.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Text Include="Media\Copy Assets Here.txt">
@@ -278,6 +284,18 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ffconf.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="eos_model.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="eos_model_tex.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="eos_model_data.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="eos_plasma.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

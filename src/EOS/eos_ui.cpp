@@ -4,6 +4,8 @@
 #include "eos_ui.h"
 #include "eos_gfx.h"
 #include "eos_font.h"
+#include "eos_model.h"   // Darkone 83 theme: 3D character backdrop
+#include "eos_plasma.h"  // Darkone 83 theme: soft plasma backdrop filler
 
 
 // ---- 3D parallax orb field --------------------------------------------
@@ -104,12 +106,23 @@ void Ui_Backdrop(void)
         return;                // image mode: no orbs
     }
 
-    // Default: flat fill + animated orbs.
+    // Default: flat fill, then the 3D parallax field behind everything.
+    // The Darkone 83 theme swaps the orb field for the character mesh; if the
+    // model can't be built (VB/IB/texture), Model_Init() returns 0 and we fall
+    // straight back to the orbs -- the backdrop never fails to draw.
     Gfx_Fill(0, 0, (float)g_scrW, (float)g_scrH, EOS_BG);
-    orbsStep();
-    Gfx_Begin3D();
-    orbsDraw();
-    Gfx_End3D();
+    if (Theme_BgIsModel() && Model_Init()) {
+        Plasma_Draw((float)GetTickCount() * 0.001f);   // soft plasma behind the figure
+        Gfx_Begin3D();
+        Model_Draw((float)GetTickCount() * 0.001f);
+        Gfx_End3D();
+    }
+    else {
+        orbsStep();
+        Gfx_Begin3D();
+        orbsDraw();
+        Gfx_End3D();
+    }
 }
 
 // Soft accent halo behind a selected pill.

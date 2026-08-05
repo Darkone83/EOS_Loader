@@ -18,7 +18,7 @@
 
 // Loader version string, shared by the on-screen UI and the web UI.
 #ifndef EOS_LOADER_VERSION
-#define EOS_LOADER_VERSION "1.0"
+#define EOS_LOADER_VERSION "1.0.3"
 #endif
 
 void Http_Start(void);   // bind + listen on :80 (call once the net is up)

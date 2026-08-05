@@ -40,8 +40,10 @@
     <ClCompile Include="eos_lcd.cpp" />
     <ClCompile Include="eos_led.cpp" />
     <ClCompile Include="eos_menu.cpp" />
+    <ClCompile Include="eos_model.cpp" />
     <ClCompile Include="eos_nvram.cpp" />
     <ClCompile Include="eos_osk.cpp" />
+    <ClCompile Include="eos_plasma.cpp" />
     <ClCompile Include="eos_rtc.cpp" />
     <ClCompile Include="eos_sdcard.cpp" />
     <ClCompile Include="eos_sddiskio.cpp" />
@@ -88,8 +90,12 @@
     <ClInclude Include="eos_led.h" />
     <ClInclude Include="eos_logo_data.h" />
     <ClInclude Include="eos_menu.h" />
+    <ClInclude Include="eos_model.h" />
+    <ClInclude Include="eos_model_data.h" />
+    <ClInclude Include="eos_model_tex.h" />
     <ClInclude Include="eos_nvram.h" />
     <ClInclude Include="eos_osk.h" />
+    <ClInclude Include="eos_plasma.h" />
     <ClInclude Include="eos_rtc.h" />
     <ClInclude Include="eos_sdcard.h" />
     <ClInclude Include="eos_settings.h" />

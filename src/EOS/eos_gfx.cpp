@@ -122,7 +122,8 @@ bool Gfx_Init()
     pp.BackBufferFormat = D3DFMT_A8R8G8B8;
     pp.BackBufferCount = 1;
     pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    pp.EnableAutoDepthStencil = FALSE;
+    pp.EnableAutoDepthStencil = TRUE;              // Darkone83 model needs a depth buffer
+    pp.AutoDepthStencilFormat = D3DFMT_D24S8;
     pp.Flags = ppFlags;
     pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_ONE;
 
@@ -246,7 +247,7 @@ void Gfx_Shutdown()
 
 void Gfx_Begin(DWORD clear_argb)
 {
-    g_dev->Clear(0, NULL, D3DCLEAR_TARGET, clear_argb, 1.0f, 0);
+    g_dev->Clear(0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, clear_argb, 1.0f, 0);
     g_dev->BeginScene();
     SetState2D();
 }
