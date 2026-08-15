@@ -108,9 +108,17 @@ static void us_init(unsigned char a)
     Con_SmbWrite8(a, 0x80, CMD_FUNC);   Sleep(5);
     Con_SmbWrite8(a, 0x80, CMD_FUNC);   Sleep(1);
     Con_SmbWrite8(a, 0x80, CMD_FUNC);
+
+    /* Flip display 180 degrees:
+   RE=1, then BDC=0 / BDS=0 = reverse COM + SEG */
+    Con_SmbWrite8(a, 0x80, 0x3A);       /* Function Set, RE=1 */
+    Con_SmbWrite8(a, 0x80, 0x06);       /* BDC=0, BDS=0: reverse both */
+    Con_SmbWrite8(a, 0x80, 0x38);       /* Function Set, RE=0 */
+
     Con_SmbWrite8(a, 0x80, CMD_DISPON);
     Con_SmbWrite8(a, 0x80, CMD_CLEAR);  Sleep(2);
     Con_SmbWrite8(a, 0x80, CMD_ENTRY);
+
     us_contrast(a, (BYTE)s_bright);
 }
 

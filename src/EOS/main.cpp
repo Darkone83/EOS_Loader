@@ -43,7 +43,7 @@ enum AppPhase {
     PH_SPLASH = 0, PH_MENU, PH_BANKSEL, PH_BANKMGMT, PH_CONFIRM, PH_BROWSE, PH_RENAME, PH_TOOLS, PH_EE_TOOLS, PH_FW_TOOLS, PH_FW_BACKUP, PH_FW_RPICK,
     PH_FW_RTARGET, PH_FW_RCONFIRM, PH_HDD_TOOLS, PH_HDD_INFO, PH_EE_RESTORE, PH_EE_CONFIRM, PH_FORMAT, PH_FORMAT_CONFIRM, PH_SETTINGS, PH_ABOUT, PH_CLEARCFG,
     PH_CERB_MENU, PH_CERB_EDIT, PH_CERB_SAVED, PH_CERB_OC, PH_CERB_COMBO,
-    PH_LEDCOLOR, PH_SDBROWSE
+    PH_LEDCOLOR, PH_SDBROWSE, PH_EOS_SCRIPTS
 };
 
 static AppPhase s_phase = PH_SPLASH;
@@ -111,6 +111,7 @@ static int           s_flashTarget = -1;          // bank idx being flashed
 static int           s_browseSong = 0;           // 1 = browsing to pick a bg-music track
 static int           s_browseCerb = 0;           // 1 = browsing to pick a Cerbios path field
 static int           s_browseCerbField = -1;     // which Cerbios field the pick fills
+static int           s_browseScript = 0;         // 1 = browsing to pick an EOS .eos script to stage
 static char          s_flashPath[EOS_FILE_PATH_MAX] = { 0 };
 static int           s_renameTarget = -1;         // bank idx being renamed
 static AppPhase      s_renameReturn = PH_BANKMGMT; // phase to return to after rename
@@ -249,6 +250,7 @@ static const char* PhaseName(AppPhase p)
     case PH_SDBROWSE:    return "SD Card";
     case PH_RENAME:      return "Rename";
     case PH_TOOLS:       return "Tools";
+    case PH_EOS_SCRIPTS: return "EOS Scripts";
     case PH_EE_TOOLS:
     case PH_EE_RESTORE:
     case PH_EE_CONFIRM:  return "EEPROM";
@@ -699,6 +701,107 @@ static void FwBackup_Enter(void);
 static void FwRestore_Enter(void);
 static void HddTools_Enter(void);
 static void Format_Enter(void);
+
+static void EnterEosScripts(void);
+static void EosScripts_Frame(WORD b);
+
+// ---- EOS script: persistent flash region (bank 0x09, phys 0x800000, 128K) ----
+// The loader is upload-only (§6): read the .eos text, wrap it in the §4.4 validity
+// frame, and commit to the script bank with MAGIC programmed LAST (power-loss
+// safe). The gateware pages this region into the EXP scratch window at boot and
+// runs it. "Present" = a committed MAGIC 'EOSX' in the frame.
+#define EOS_SCRIPT_BANK   0x09
+#define EOS_SCRIPT_FRAME  16                 // FRAME_SIZE: frame 0x00-0x0F, text @ 0x10
+#define EOS_SCRIPT_MAXTXT 0x1FFF0            // MAX_TEXT_LEN = region 0x20000 - frame 0x10
+
+static int s_scriptPresent = 0;             // cached MAGIC-valid flag (menu grey-out)
+
+// CRC-32 (IEEE, poly 0xEDB88320) over the text body -- matches eos_crc32.v.
+static unsigned int Script_Crc32(const unsigned char* p, int n)
+{
+    unsigned int c = 0xFFFFFFFFu; int i, k;
+    for (i = 0; i < n; ++i) {
+        c ^= (unsigned int)p[i];
+        for (k = 0; k < 8; ++k)
+            c = (c >> 1) ^ (0xEDB88320u & (unsigned int)(0 - (int)(c & 1u)));
+    }
+    return c ^ 0xFFFFFFFFu;
+}
+
+// Re-read the committed frame's MAGIC and cache presence for the menu grey-out.
+static int Script_RefreshPresent(void)
+{
+    unsigned char pg[256];
+    if (Flash_ReadPage(EOS_SCRIPT_BANK, 0, pg) != EOS_FLASH_OK) { s_scriptPresent = 0; return 0; }
+    s_scriptPresent = (pg[0] == 'E' && pg[1] == 'O' && pg[2] == 'S' && pg[3] == 'X') ? 1 : 0;
+    return s_scriptPresent;
+}
+static int Script_Present(void) { return s_scriptPresent; }
+
+// Erase the region -> blank -> engine idle (§5.5), then resync the scratch view
+// (Flash_Sync of bank 0x09 -> reload_base 0x800000 -> scratch; engine revalidates).
+static void Script_Clear(void)
+{
+    Flash_EraseBank(EOS_SCRIPT_BANK);
+    Flash_Sync(EOS_SCRIPT_BANK);
+    Script_RefreshPresent();
+}
+
+// Read a .eos text file, wrap it in the §4.4 frame, and commit with MAGIC last.
+// Returns 1 on success (region now holds a valid, committed script).
+static int Script_FlashFrom(const char* src)
+{
+    int textLen, i, total; unsigned int crc; unsigned char tgt;
+    unsigned char magicPage[256];
+
+    // text body lands at frame offset 16; leave 16 bytes for the frame header
+    textLen = File_ReadInto(src, s_imgBuf + EOS_SCRIPT_FRAME, EOS_IMG_BUF_MAX - EOS_SCRIPT_FRAME);
+    if (textLen <= 0 || textLen > EOS_SCRIPT_MAXTXT) return 0;
+
+    // TARGET must equal the text's TARGET directive (§4.4/§5.5). Default NOHD(0);
+    // HD(1) if a "TARGET HD" directive appears in the body.
+    tgt = 0;
+    for (i = EOS_SCRIPT_FRAME; i + 9 <= EOS_SCRIPT_FRAME + textLen; ++i) {
+        if (s_imgBuf[i] == 'T' && s_imgBuf[i + 1] == 'A' && s_imgBuf[i + 2] == 'R' &&
+            s_imgBuf[i + 3] == 'G' && s_imgBuf[i + 4] == 'E' && s_imgBuf[i + 5] == 'T' &&
+            s_imgBuf[i + 6] == ' ') {
+            int j = i + 7;
+            while (j < EOS_SCRIPT_FRAME + textLen && s_imgBuf[j] == ' ') ++j;
+            if (j + 1 < EOS_SCRIPT_FRAME + textLen && s_imgBuf[j] == 'H' && s_imgBuf[j + 1] == 'D')
+                tgt = 1;
+            break;
+        }
+    }
+
+    crc = Script_Crc32(s_imgBuf + EOS_SCRIPT_FRAME, textLen);
+
+    // frame header -- MAGIC left 0xFF so it is programmed LAST (validity commit)
+    s_imgBuf[0] = 0xFF; s_imgBuf[1] = 0xFF; s_imgBuf[2] = 0xFF; s_imgBuf[3] = 0xFF;
+    s_imgBuf[4] = 0x01;                          // FMT_VER
+    s_imgBuf[5] = tgt;                           // TARGET (0 NOHD / 1 HD)
+    s_imgBuf[6] = 0x00;                          // FLAGS
+    s_imgBuf[7] = 0x00;                          // RESERVED
+    s_imgBuf[8] = (unsigned char)(textLen);      s_imgBuf[9] = (unsigned char)(textLen >> 8);
+    s_imgBuf[10] = (unsigned char)(textLen >> 16); s_imgBuf[11] = (unsigned char)(textLen >> 24);
+    s_imgBuf[12] = (unsigned char)(crc);          s_imgBuf[13] = (unsigned char)(crc >> 8);
+    s_imgBuf[14] = (unsigned char)(crc >> 16);    s_imgBuf[15] = (unsigned char)(crc >> 24);
+
+    total = EOS_SCRIPT_FRAME + textLen;
+
+    // §4.4 commit order: erase -> write frame(minus MAGIC) + text -> MAGIC last -> sync
+    if (Flash_EraseBank(EOS_SCRIPT_BANK) != EOS_FLASH_OK) return 0;
+    if (Flash_WriteImageAtNoSync(EOS_SCRIPT_BANK, 0, s_imgBuf, total) != EOS_FLASH_OK) return 0;
+
+    // Program page 0 again with just the MAGIC: 0xFF elsewhere clears no bits, so
+    // the already-written frame fields + first text bytes stay intact.
+    magicPage[0] = 'E'; magicPage[1] = 'O'; magicPage[2] = 'S'; magicPage[3] = 'X';
+    for (i = 4; i < 256; ++i) magicPage[i] = 0xFF;
+    if (Flash_ProgramPage(EOS_SCRIPT_BANK, 0, magicPage) != EOS_FLASH_OK) return 0;
+
+    Flash_Sync(EOS_SCRIPT_BANK);                  // reload_base 0x800000 -> scratch; engine runs it
+    Script_RefreshPresent();
+    return s_scriptPresent;
+}
 
 static int s_toolSel = 0;   // top category
 static int s_eeToolSel = 0;   // EEPROM sub-menu
@@ -1300,18 +1403,19 @@ static void CerbOc_Frame(WORD b)
 
 static void Tools_Frame(WORD b)             // top level: tool categories
 {
-    static const char* cats[6] = { "EEPROM", "Firmware", "HDD", "Cerbios Config Editor", "Format", "Clear Settings" };
+    static const char* cats[7] = { "EEPROM", "Firmware", "HDD", "Cerbios Config Editor", "EOS Scripts", "Format", "Clear Settings" };
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_MENU); return; }
-    s_toolSel = navSel(b, s_toolSel, 6);
+    s_toolSel = navSel(b, s_toolSel, 7);
     if (Pressed(b, s_prevBtn, BTN_A)) {
         if (s_toolSel == 0) { s_eeToolSel = 0; GotoPhase(PH_EE_TOOLS); }
         else if (s_toolSel == 1) { s_fwToolSel = 0; GotoPhase(PH_FW_TOOLS); }
         else if (s_toolSel == 2) { HddTools_Enter(); }
         else if (s_toolSel == 3) { s_cerbMenuSel = 0; GotoPhase(PH_CERB_MENU); }
-        else if (s_toolSel == 4) { Format_Enter(); }
+        else if (s_toolSel == 4) { EnterEosScripts(); }
+        else if (s_toolSel == 5) { Format_Enter(); }
         else { GotoPhase(PH_CLEARCFG); }
     }
-    listScreen("Tools", cats, 6, s_toolSel);
+    listScreen("Tools", cats, 7, s_toolSel);
 }
 
 // Clear the two config banks (bank table 0xB + settings 0xC) back to factory.
@@ -1978,6 +2082,53 @@ static void buildFullPath(char* out, const char* name)
     out[p] = 0;
 }
 
+static int s_scriptSel = 0;   // EOS Scripts menu selection
+
+static void EnterEosScripts(void)
+{
+    Script_RefreshPresent();                  // read the committed frame's MAGIC
+    s_scriptSel = Script_Present() ? 1 : 0;   // park on the enabled row
+    GotoPhase(PH_EOS_SCRIPTS);
+}
+
+// EOS Scripts: two mutually-exclusive actions. Flash stages a picked .eos into
+// the slot (enabled only when empty); Clear removes it (enabled only when one is
+// present). The disabled row is drawn dimmed and A is gated, so exactly one
+// action is ever live.
+static void EosScripts_Frame(WORD b)
+{
+    int present = Script_Present();
+    int y = 180;
+
+    if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_TOOLS); return; }
+    s_scriptSel = navSel(b, s_scriptSel, 2);
+
+    if (Pressed(b, s_prevBtn, BTN_A)) {
+        if (s_scriptSel == 0 && !present) {          // Flash Script -> pick a .eos
+            s_browseScript = 1;
+            s_browsePath[0] = 0;                     // start at the drive list
+            browseRefresh();
+            GotoPhase(PH_BROWSE);
+            return;
+        }
+        else if (s_scriptSel == 1 && present) {      // Clear Script
+            Script_Clear();
+            SetStatus(Script_Present() ? "Clear FAILED" : "Script cleared");
+        }
+    }
+
+    Gfx_Begin(EOS_BG); Ui_Backdrop();
+    Ui_TitleBar("EOS Scripts");
+    Ui_PillRow(PILL_X, y, PILL_W, PILL_H, PILL_R, s_scriptSel == 0, present ? 1 : 0,
+        "Flash Script", present ? "" : "Select .eos");
+    Ui_PillRow(PILL_X, y + 48, PILL_W, PILL_H, PILL_R, s_scriptSel == 1, present ? 0 : 1,
+        "Clear Script", present ? "Staged" : "");
+    if (s_status[0] && GetTickCount() < s_statusUntil)
+        Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
+    Ui_Footer("D-PAD  MOVE      A  SELECT      B  BACK");
+    Gfx_End();
+}
+
 static void fileToBankName(char* out, int cap, const char* fname)
 {
     int i, dot = -1, p;
@@ -2156,6 +2307,7 @@ static void Browse_Frame(WORD b)
         if (s_browsePath[0] == 0) {
             if (s_browseCerb) { s_browseCerb = 0; GotoPhase(PH_CERB_EDIT); return; }
             if (s_browseSong) { s_browseSong = 0; GotoPhase(PH_SETTINGS); return; }
+            if (s_browseScript) { s_browseScript = 0; GotoPhase(PH_EOS_SCRIPTS); return; }
             GotoPhase(PH_BANKMGMT); return;                             // drive list -> back
         }
         browseUp();
@@ -2191,6 +2343,15 @@ static void Browse_Frame(WORD b)
                 GotoPhase(PH_SETTINGS);                // re-lands on THEME (s_returnTheme)
                 return;
             }
+            if (s_browseScript) {
+                int ok;
+                buildFullPath(s_flashPath, e->name);   // plain "X:\\dir\\file"
+                ok = Script_FlashFrom(s_flashPath);    // §4.4 commit to the flash script region
+                SetStatus(ok ? "Script flashed" : "Flash FAILED -- bad/oversized .eos");
+                s_browseScript = 0;
+                GotoPhase(PH_EOS_SCRIPTS);
+                return;
+            }
             // file selected -> confirm flashing it into the target bank
             int p;
             buildFullPath(s_flashPath, e->name);
@@ -2210,7 +2371,7 @@ static void Browse_Frame(WORD b)
     if (s_browseSel >= s_browseScroll + vis) s_browseScroll = s_browseSel - vis + 1;
 
     Gfx_Begin(EOS_BG); Ui_Backdrop();
-    Ui_TitleBar(s_browseCerb ? "SELECT FILE" : (s_browseSong ? "SELECT MUSIC" : "SELECT BIOS IMAGE"));
+    Ui_TitleBar(s_browseCerb ? "SELECT FILE" : (s_browseSong ? "SELECT MUSIC" : (s_browseScript ? "SELECT SCRIPT" : "SELECT BIOS IMAGE")));
     Font_DrawCentered(0, g_scrW, 76, (s_browsePath[0] ? s_browsePath : "(drives)"), EOS_DIM);
 
     top = 104;
@@ -2560,6 +2721,7 @@ void __cdecl main() {
         else if (s_phase == PH_SDBROWSE) SdBrowse_Frame(b);
         else if (s_phase == PH_RENAME)   Rename_Frame(b);
         else if (s_phase == PH_TOOLS)    Tools_Frame(b);
+        else if (s_phase == PH_EOS_SCRIPTS) EosScripts_Frame(b);
         else if (s_phase == PH_EE_TOOLS) EeTools_Frame(b);
         else if (s_phase == PH_FW_TOOLS) FwTools_Frame(b);
         else if (s_phase == PH_FW_BACKUP)   FwBackup_Frame(b);

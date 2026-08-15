@@ -40,7 +40,7 @@
 
 enum Sub { SUB_HUB = 0, SUB_SYSINFO, SUB_VIDEO, SUB_AUDIO, SUB_REGION, SUB_NETWORK, SUB_DATETIME, SUB_THEME, SUB_LCD };
 
-static const char* k_hub[] = { "System Info", "Video", "Audio", "Region", "Network", "Date & Time", "Theme", "LCD" };
+static const char* k_hub[] = { "Audio", "Date & Time", "LCD", "Network", "Region", "System Info", "Theme", "Video" };
 #define HUB_COUNT ((int)(sizeof(k_hub) / sizeof(k_hub[0])))
 
 static int       s_sub = SUB_HUB;
@@ -127,10 +127,11 @@ static int hubFrame(WORD b, WORD prev)
     if (Pressed(b, prev, BTN_A)) {
         s_row = 0;
         switch (s_sel) {
-        case 0: s_sub = SUB_SYSINFO; Eeprom_Read(&s_eep); Console_Read(&s_con); break;
-        case 1: s_sub = SUB_VIDEO;  s_vflags = Nvram_GetVideoFlags(); break;
-        case 2: s_sub = SUB_AUDIO;  s_aflags = Nvram_GetAudioFlags(); break;
-        case 3: s_sub = SUB_REGION; Eeprom_Read(&s_eep);
+        case 0: s_sub = SUB_AUDIO;  s_aflags = Nvram_GetAudioFlags(); break;
+        case 1: s_sub = SUB_DATETIME; Clock_Get(&s_dt); s_dtField = 0; break;
+        case 2: s_sub = SUB_LCD; s_row = 0; break;
+        case 3: s_sub = SUB_NETWORK; networkEnter(); break;
+        case 4: s_sub = SUB_REGION; Eeprom_Read(&s_eep);
             s_dvd = Nvram_GetDvdRegion(); s_lang = Nvram_GetLanguage();
             s_vstdSel = (s_eep.avRegion == EE_VS_NTSC_J) ? 1
                 : (s_eep.avRegion == EE_VS_PAL_I) ? 2
@@ -141,10 +142,9 @@ static int hubFrame(WORD b, WORD prev)
                 s_grSel = (gr == EE_REGION_JAPAN) ? 1 : (gr == EE_REGION_EURO) ? 2 : 0;
             }
             s_vstdArm = 0; s_grArm = 0; s_regMsg = 0; break;
-        case 4: s_sub = SUB_NETWORK; networkEnter(); break;
-        case 5: s_sub = SUB_DATETIME; Clock_Get(&s_dt); s_dtField = 0; break;
+        case 5: s_sub = SUB_SYSINFO; Eeprom_Read(&s_eep); Console_Read(&s_con); break;
         case 6: s_sub = SUB_THEME; themeEnter(); break;
-        case 7: s_sub = SUB_LCD; s_row = 0; break;
+        case 7: s_sub = SUB_VIDEO;  s_vflags = Nvram_GetVideoFlags(); break;
         }
     }
     titleBar("SETTINGS");

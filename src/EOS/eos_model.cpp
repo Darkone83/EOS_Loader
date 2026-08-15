@@ -35,6 +35,20 @@
 #define MDL_Z        6.90f    // behind the menu, inside the fog band
 #define MDL_SPINRATE 0.22f    // radians/sec idle turntable
 #define MDL_YAW0     0.35f    // base yaw so she faces slightly toward center
+// --- idle "alive" motion (all subtle; set an amp to 0 to disable that axis) ---
+#define MDL_BOB_HZ   0.90f    // vertical bob speed
+#define MDL_BOB_AMP  0.055f   // bob height (world units; figure ~5.2 tall)
+#define MDL_BRTH_HZ  1.50f    // breathing speed
+#define MDL_BRTH_AMP 0.012f   // breathing depth (fractional Y scale, ~1.2%)
+#define MDL_SWAY_HZ  0.33f    // gentle yaw sway layered on the turntable
+#define MDL_SWAY_AMP 0.07f    // sway amount (radians). Set MDL_SPINRATE 0 for sway-only.
+// --- procedural secondary motion (vertex sway; no rig, no baked data) ---
+#define MDL_SWAY1_HZ 0.55f    // primary sway speed (X)
+#define MDL_SWAY2_HZ 0.42f    // primary sway speed (Z) -- differs so the drift circles
+#define MDL_SWAY_X   0.022f   // primary sway amount (model units; x MDL_HEIGHT in world)
+#define MDL_SWAY_Z   0.017f
+#define MDL_FLUT_HZ  1.30f    // hair-tip flutter speed
+#define MDL_FLUT_A   0.010f   // flutter amount (applied to the very tips)
 
 #define MDL_FVF (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1)
 
@@ -43,6 +57,8 @@ static IDirect3DIndexBuffer8* s_ib = 0;
 static IDirect3DTexture8* s_tex = 0;
 static int                     s_ready = 0;
 static int                     s_tried = 0;   // one-shot: don't retry a failure every frame
+static EosModelVtx             s_base[EOS_MODEL_VERTS];   // rest pose (RAM ~238KB BSS; no pack cost)
+static float                   s_swayW[EOS_MODEL_VERTS];  // per-vertex sway weight (height-based)
 
 // ---- helpers --------------------------------------------------------------
 static void colF(DWORD argb, float* r, float* g, float* b)
@@ -84,7 +100,6 @@ int Model_Init(void)
     void* dst;
     unsigned vbBytes, ibBytes;
     int vi;
-    EosModelVtx* vw;
 
     if (s_ready) return 1;
     if (s_tried) return 0;      // already failed once -- stay on the orb fallback
@@ -98,24 +113,28 @@ int Model_Init(void)
         D3DPOOL_MANAGED, &s_vb)) || !s_vb) {
         Model_Free(); return 0;
     }
-    dst = 0;
-    if (FAILED(s_vb->Lock(0, 0, (BYTE**)&dst, 0)) || !dst) { Model_Free(); return 0; }
-    // Expand packed (int16 pos / int8 normal / int16 uv) into the float VB.
-    // int->float only (no __ftol2_sse). Quality is identical to the float mesh.
-    vw = (EosModelVtx*)dst;
+    // Expand packed data into the RAM rest pose (s_base) and derive each vertex's
+    // sway weight from its height (0 at the feet, 1 at the hair). int->float only.
     for (vi = 0; vi < EOS_MODEL_VERTS; ++vi) {
         const unsigned short* p = &kEosModelPos[vi * 3];
         const signed char* n = &kEosModelNrm[vi * 3];
         const unsigned short* t = &kEosModelUV[vi * 2];
-        vw[vi].x = kEosModelPosBias[0] + (float)p[0] * kEosModelPosScale[0];
-        vw[vi].y = kEosModelPosBias[1] + (float)p[1] * kEosModelPosScale[1];
-        vw[vi].z = kEosModelPosBias[2] + (float)p[2] * kEosModelPosScale[2];
-        vw[vi].nx = (float)n[0] * (1.0f / 127.0f);
-        vw[vi].ny = (float)n[1] * (1.0f / 127.0f);
-        vw[vi].nz = (float)n[2] * (1.0f / 127.0f);
-        vw[vi].u = (float)t[0] * (1.0f / 65535.0f);
-        vw[vi].v = (float)t[1] * (1.0f / 65535.0f);
+        float yy;
+        s_base[vi].x = kEosModelPosBias[0] + (float)p[0] * kEosModelPosScale[0];
+        s_base[vi].y = kEosModelPosBias[1] + (float)p[1] * kEosModelPosScale[1];
+        s_base[vi].z = kEosModelPosBias[2] + (float)p[2] * kEosModelPosScale[2];
+        s_base[vi].nx = (float)n[0] * (1.0f / 127.0f);
+        s_base[vi].ny = (float)n[1] * (1.0f / 127.0f);
+        s_base[vi].nz = (float)n[2] * (1.0f / 127.0f);
+        s_base[vi].u = (float)t[0] * (1.0f / 65535.0f);
+        s_base[vi].v = (float)t[1] * (1.0f / 65535.0f);
+        yy = s_base[vi].y;                 /* normalized 0..1 (feet..top) */
+        if (yy < 0.0f) yy = 0.0f; else if (yy > 1.0f) yy = 1.0f;
+        s_swayW[vi] = yy;
     }
+    dst = 0;
+    if (FAILED(s_vb->Lock(0, 0, (BYTE**)&dst, 0)) || !dst) { Model_Free(); return 0; }
+    memcpy(dst, s_base, vbBytes);          /* seed VB with the rest pose */
     s_vb->Unlock();
 
     if (FAILED(g_dev->CreateIndexBuffer(ibBytes, 0, D3DFMT_INDEX16,
@@ -145,6 +164,33 @@ void Model_Free(void)
     // NOTE: leave s_tried set; a mid-run failure shouldn't thrash retries.
 }
 
+// Rewrite the VB each frame: rest pose + height-weighted sway. No baked data --
+// the displacement is derived from vertex height every frame, so hair and skirt
+// drift while the feet stay planted. Cost: four global sines + one multiply-add
+// per vertex. The sway is in model space, so it rotates with the turntable.
+static void Model_UpdateVB(float tsec)
+{
+    void* dst; EosModelVtx* vw; int i;
+    float sX, sZ, fX, fZ;
+    if (!s_vb) return;
+    Gfx_SinCos(tsec * MDL_SWAY1_HZ, &sX, 0);
+    Gfx_SinCos(tsec * MDL_SWAY2_HZ, &sZ, 0);
+    Gfx_SinCos(tsec * MDL_FLUT_HZ, &fX, 0);
+    Gfx_SinCos(tsec * MDL_FLUT_HZ * 1.27f, &fZ, 0);
+    sX *= MDL_SWAY_X; sZ *= MDL_SWAY_Z; fX *= MDL_FLUT_A; fZ *= MDL_FLUT_A;
+    if (FAILED(s_vb->Lock(0, 0, (BYTE**)&dst, 0)) || !dst) return;
+    vw = (EosModelVtx*)dst;
+    for (i = 0; i < EOS_MODEL_VERTS; ++i) {
+        float w = s_swayW[i];
+        float wp = w * w;          /* primary: quadratic -> lower body barely moves */
+        float wf = wp * w;         /* flutter: cubic -> hair tips only */
+        vw[i] = s_base[i];
+        vw[i].x += wp * sX + wf * fX;
+        vw[i].z += wp * sZ + wf * fZ;
+    }
+    s_vb->Unlock();
+}
+
 void Model_Draw(float tsec)
 {
     D3DMATRIX w, saveW;
@@ -153,18 +199,24 @@ void Model_Draw(float tsec)
     float ca, sa, yaw;
     float kr, kg, kb, rr, rg, rb;
     float sx, sy, sz;
+    float bob, breathe, sway;
 
     if (!s_ready) { if (!Model_Init()) return; }
+    Model_UpdateVB(tsec);   // rest pose + procedural sway
 
-    // ---- world matrix: scale * rotateY(yaw) * translate ----
-    yaw = MDL_YAW0 + tsec * MDL_SPINRATE;
+    // ---- world matrix: scale * rotateY(yaw) * translate, with idle life ----
+    Gfx_SinCos(tsec * MDL_BOB_HZ, &bob, 0);
+    Gfx_SinCos(tsec * MDL_BRTH_HZ, &breathe, 0);
+    Gfx_SinCos(tsec * MDL_SWAY_HZ, &sway, 0);
+    yaw = MDL_YAW0 + tsec * MDL_SPINRATE + sway * MDL_SWAY_AMP;   // turntable + gentle sway
     Gfx_SinCos(yaw, &sa, &ca);
-    sx = sy = sz = MDL_HEIGHT;            // mesh normalized to height 1.0
+    sx = sz = MDL_HEIGHT;                                  // mesh normalized to height 1.0
+    sy = MDL_HEIGHT * (1.0f + breathe * MDL_BRTH_AMP);     // subtle breathing on Y
     memset(&w, 0, sizeof(w));
     w._11 = sx * ca;  w._13 = sx * (-sa);
     w._22 = sy;
     w._31 = sz * sa;  w._33 = sz * ca;
-    w._41 = MDL_X;     w._42 = MDL_Y;   w._43 = MDL_Z;  w._44 = 1.0f;
+    w._41 = MDL_X;  w._42 = MDL_Y + bob * MDL_BOB_AMP;  w._43 = MDL_Z;  w._44 = 1.0f;
 
     g_dev->GetTransform(D3DTS_WORLD, &saveW);
     g_dev->SetTransform(D3DTS_WORLD, &w);
