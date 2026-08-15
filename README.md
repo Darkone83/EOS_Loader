@@ -24,6 +24,7 @@ UI — all from the couch with a controller, or from a browser on your PC.
 - **Flash BIOS images** — push a new BIOS to a bank over FTP or the web control panel, then
   commit it. Supports **256K, 512K, and 1MB** images; oversized banks are auto-placed into
   the dynamic new-region layout.
+- **Flash .eos scripts** - Upload your own custom expansion scripts.
 - **Firmware backup / restore** — dump any bank to a file and restore it, per bank.
 - **Web control panel** — a browser page for bank management, plus **EEPROM backup / restore**,
   system info, XbDiag management, and a settings reset.
@@ -122,8 +123,11 @@ firmware image back to a size-matched bank (erased, programmed, and verified pag
 
 A **Cerbios config editor** — for reading and writing a bank's Cerbios configuration block
 without a PC — and a **CPU/GPU overclock calculator**, on-console and mirrored in the web
-control panel. Not yet in the loader; reserving this section so the shape stays consistent
-with the rest of Tools once it lands.
+control panel.
+
+### EOS Scripts
+
+Upload your custom expansion scripts to take full control of the programmable GPIO pins (EXP 1-8)
 
 ### HDD tools
 
