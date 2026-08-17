@@ -714,7 +714,33 @@ static void EosScripts_Frame(WORD b);
 #define EOS_SCRIPT_FRAME  16                 // FRAME_SIZE: frame 0x00-0x0F, text @ 0x10
 #define EOS_SCRIPT_MAXTXT 0x1FFF0            // MAX_TEXT_LEN = region 0x20000 - frame 0x10
 
+// Expansion runtime mailbox exposed by eos_i2c/eos_exp_mailbox.  The loader
+// uses this only after a script SYNC so a successful flash means "actually
+// running", not merely "EOSX exists in bank 9".
+#define EOS_EXP_SMB_ADDR      0xDC            // 7-bit 0x6E, shifted Xbox SMBus address
+#define EOS_EXP_REG_STATUS    0x40
+#define EOS_EXP_REG_FAULT     0x41
+#define EOS_EXP_ST_RUNNING    0x01
+#define EOS_EXP_ST_FAULT      0x02
+#define EOS_EXP_ST_VALID      0x04
+#define EOS_EXP_ST_BOOT_GATE  0x08
+
+enum ScriptFlashResult {
+    SCRIPT_FLASH_OK = 1,
+    SCRIPT_FLASH_BADFILE = -1,
+    SCRIPT_FLASH_ERASE_FAIL = -2,
+    SCRIPT_FLASH_PROGRAM_FAIL = -3,
+    SCRIPT_FLASH_MAGIC_FAIL = -4,
+    SCRIPT_FLASH_SYNC_FAIL = -5,
+    SCRIPT_FLASH_VERIFY_FAIL = -6,
+    SCRIPT_FLASH_ENGINE_TIMEOUT = -7,
+    SCRIPT_FLASH_ENGINE_FAULT = -8,
+    SCRIPT_FLASH_SMBUS_FAIL = -9
+};
+
 static int s_scriptPresent = 0;             // cached MAGIC-valid flag (menu grey-out)
+static unsigned char s_scriptLastStatus = 0;
+static unsigned char s_scriptLastFault = 0;
 
 // CRC-32 (IEEE, poly 0xEDB88320) over the text body -- matches eos_crc32.v.
 static unsigned int Script_Crc32(const unsigned char* p, int n)
@@ -738,17 +764,76 @@ static int Script_RefreshPresent(void)
 }
 static int Script_Present(void) { return s_scriptPresent; }
 
+// Program an already-erased script region without another block erase.  The
+// generic Flash_WriteImageAtNoSync() deliberately erases every covered block;
+// Script_FlashFrom() has already erased the full 128K script region so doing
+// that again only adds flash wear and another unnecessary state transition.
+static int Script_ProgramNoErase(const unsigned char* data, int len)
+{
+    int pages, page, off, i, rc;
+    unsigned char pg[256];
+
+    pages = (len + 255) / 256;
+    for (page = 0; page < pages; ++page) {
+        off = page * 256;
+        for (i = 0; i < 256; ++i)
+            pg[i] = (off + i < len) ? data[off + i] : 0xFF;
+        rc = Flash_ProgramPage(EOS_SCRIPT_BANK, page, pg);
+        if (rc != EOS_FLASH_OK) return rc;
+    }
+    return EOS_FLASH_OK;
+}
+
+// After bank 9 is synced into the expansion scratch window, wait for the
+// runtime to either report RUNNING+VALID+BOOT_GATE, raise a fault, or time out.
+// This closes the old false-positive path where "EOSX" was in flash but the
+// script had never actually started.
+static int Script_WaitForRun(void)
+{
+    int i, sawRead;
+    unsigned char st, fc;
+
+    s_scriptLastStatus = 0;
+    s_scriptLastFault = 0;
+    sawRead = 0;
+    Con_SmbReset();
+
+    for (i = 0; i < 100; ++i) {              // up to ~1 second
+        st = 0;
+        if (Con_SmbRead8(EOS_EXP_SMB_ADDR, EOS_EXP_REG_STATUS, &st)) {
+            sawRead = 1;
+            s_scriptLastStatus = st;
+
+            if (st & EOS_EXP_ST_FAULT) {
+                fc = 0;
+                if (Con_SmbRead8(EOS_EXP_SMB_ADDR, EOS_EXP_REG_FAULT, &fc))
+                    s_scriptLastFault = fc;
+                return SCRIPT_FLASH_ENGINE_FAULT;
+            }
+
+            if ((st & (EOS_EXP_ST_RUNNING | EOS_EXP_ST_VALID | EOS_EXP_ST_BOOT_GATE)) ==
+                (EOS_EXP_ST_RUNNING | EOS_EXP_ST_VALID | EOS_EXP_ST_BOOT_GATE))
+                return SCRIPT_FLASH_OK;
+        }
+        Sleep(10);
+    }
+
+    return sawRead ? SCRIPT_FLASH_ENGINE_TIMEOUT : SCRIPT_FLASH_SMBUS_FAIL;
+}
+
 // Erase the region -> blank -> engine idle (§5.5), then resync the scratch view
 // (Flash_Sync of bank 0x09 -> reload_base 0x800000 -> scratch; engine revalidates).
-static void Script_Clear(void)
+static int Script_Clear(void)
 {
-    Flash_EraseBank(EOS_SCRIPT_BANK);
-    Flash_Sync(EOS_SCRIPT_BANK);
+    if (Flash_EraseBank(EOS_SCRIPT_BANK) != EOS_FLASH_OK) return 0;
+    if (Flash_Sync(EOS_SCRIPT_BANK) != EOS_FLASH_OK) return 0;
     Script_RefreshPresent();
+    return s_scriptPresent ? 0 : 1;
 }
 
 // Read a .eos text file, wrap it in the §4.4 frame, and commit with MAGIC last.
-// Returns 1 on success (region now holds a valid, committed script).
+// Returns a ScriptFlashResult so the UI can distinguish storage, sync, and
+// runtime failures instead of reporting every failure as a bad .eos file.
 static int Script_FlashFrom(const char* src)
 {
     int textLen, i, total; unsigned int crc; unsigned char tgt;
@@ -756,7 +841,7 @@ static int Script_FlashFrom(const char* src)
 
     // text body lands at frame offset 16; leave 16 bytes for the frame header
     textLen = File_ReadInto(src, s_imgBuf + EOS_SCRIPT_FRAME, EOS_IMG_BUF_MAX - EOS_SCRIPT_FRAME);
-    if (textLen <= 0 || textLen > EOS_SCRIPT_MAXTXT) return 0;
+    if (textLen <= 0 || textLen > EOS_SCRIPT_MAXTXT) return SCRIPT_FLASH_BADFILE;
 
     // TARGET must equal the text's TARGET directive (§4.4/§5.5). Default NOHD(0);
     // HD(1) if a "TARGET HD" directive appears in the body.
@@ -789,18 +874,24 @@ static int Script_FlashFrom(const char* src)
     total = EOS_SCRIPT_FRAME + textLen;
 
     // §4.4 commit order: erase -> write frame(minus MAGIC) + text -> MAGIC last -> sync
-    if (Flash_EraseBank(EOS_SCRIPT_BANK) != EOS_FLASH_OK) return 0;
-    if (Flash_WriteImageAtNoSync(EOS_SCRIPT_BANK, 0, s_imgBuf, total) != EOS_FLASH_OK) return 0;
+    if (Flash_EraseBank(EOS_SCRIPT_BANK) != EOS_FLASH_OK) return SCRIPT_FLASH_ERASE_FAIL;
+    if (Script_ProgramNoErase(s_imgBuf, total) != EOS_FLASH_OK) return SCRIPT_FLASH_PROGRAM_FAIL;
 
     // Program page 0 again with just the MAGIC: 0xFF elsewhere clears no bits, so
     // the already-written frame fields + first text bytes stay intact.
     magicPage[0] = 'E'; magicPage[1] = 'O'; magicPage[2] = 'S'; magicPage[3] = 'X';
     for (i = 4; i < 256; ++i) magicPage[i] = 0xFF;
-    if (Flash_ProgramPage(EOS_SCRIPT_BANK, 0, magicPage) != EOS_FLASH_OK) return 0;
+    if (Flash_ProgramPage(EOS_SCRIPT_BANK, 0, magicPage) != EOS_FLASH_OK) return SCRIPT_FLASH_MAGIC_FAIL;
 
-    Flash_Sync(EOS_SCRIPT_BANK);                  // reload_base 0x800000 -> scratch; engine runs it
-    Script_RefreshPresent();
-    return s_scriptPresent;
+    // SYNC must complete before the expansion frame checker can safely consume
+    // the scratch copy.  Do not discard this return code.
+    if (Flash_Sync(EOS_SCRIPT_BANK) != EOS_FLASH_OK) return SCRIPT_FLASH_SYNC_FAIL;
+
+    // Verify that the committed MAGIC is really present in flash, then verify
+    // the expansion runtime itself reached RUNNING rather than just trusting
+    // the persistent image.
+    if (!Script_RefreshPresent()) return SCRIPT_FLASH_VERIFY_FAIL;
+    return Script_WaitForRun();
 }
 
 static int s_toolSel = 0;   // top category
@@ -2112,8 +2203,7 @@ static void EosScripts_Frame(WORD b)
             return;
         }
         else if (s_scriptSel == 1 && present) {      // Clear Script
-            Script_Clear();
-            SetStatus(Script_Present() ? "Clear FAILED" : "Script cleared");
+            SetStatus(Script_Clear() ? "Script cleared" : "Clear FAILED");
         }
     }
 
@@ -2344,10 +2434,53 @@ static void Browse_Frame(WORD b)
                 return;
             }
             if (s_browseScript) {
-                int ok;
+                int rc;
+                char msg[64];
                 buildFullPath(s_flashPath, e->name);   // plain "X:\\dir\\file"
-                ok = Script_FlashFrom(s_flashPath);    // §4.4 commit to the flash script region
-                SetStatus(ok ? "Script flashed" : "Flash FAILED -- bad/oversized .eos");
+                rc = Script_FlashFrom(s_flashPath);    // §4.4 commit + runtime verification
+
+                if (rc == SCRIPT_FLASH_OK) {
+                    SetStatus("Script flashed + running");
+                }
+                else if (rc == SCRIPT_FLASH_BADFILE) {
+                    SetStatus("Flash FAILED -- bad/oversized .eos");
+                }
+                else if (rc == SCRIPT_FLASH_ERASE_FAIL) {
+                    SetStatus("Script erase FAILED");
+                }
+                else if (rc == SCRIPT_FLASH_PROGRAM_FAIL) {
+                    SetStatus("Script program FAILED");
+                }
+                else if (rc == SCRIPT_FLASH_MAGIC_FAIL) {
+                    SetStatus("Script commit FAILED");
+                }
+                else if (rc == SCRIPT_FLASH_SYNC_FAIL) {
+                    SetStatus("Script SYNC FAILED");
+                }
+                else if (rc == SCRIPT_FLASH_VERIFY_FAIL) {
+                    SetStatus("Script verify FAILED");
+                }
+                else if (rc == SCRIPT_FLASH_ENGINE_FAULT) {
+                    static const char hx[] = "0123456789ABCDEF";
+                    int p = 0;
+                    p = appendStr(msg, p, "Script FAULT 0x");
+                    msg[p++] = hx[(s_scriptLastFault >> 4) & 0x0F];
+                    msg[p++] = hx[s_scriptLastFault & 0x0F];
+                    msg[p] = 0;
+                    SetStatus(msg);
+                }
+                else if (rc == SCRIPT_FLASH_SMBUS_FAIL) {
+                    SetStatus("Script flashed -- mailbox unreadable");
+                }
+                else {
+                    static const char hx[] = "0123456789ABCDEF";
+                    int p = 0;
+                    p = appendStr(msg, p, "Engine not running st=0x");
+                    msg[p++] = hx[(s_scriptLastStatus >> 4) & 0x0F];
+                    msg[p++] = hx[s_scriptLastStatus & 0x0F];
+                    msg[p] = 0;
+                    SetStatus(msg);
+                }
                 s_browseScript = 0;
                 GotoPhase(PH_EOS_SCRIPTS);
                 return;
