@@ -11,6 +11,8 @@
 #include "eos_console.h"
 #include "eos_logo_data.h"   // EOS_LOGO_W/H, EOS_LOGO_PAL[15][3], EOS_LOGO_4BPP[]
 #include "eos_file.h"        // File_ListDir/Exists/ReadInto, EosFileEntry (custom themes)
+#include "eos_sdcard.h"      // FatFs-backed SD BIOS manager
+#include "eos_led.h"         // Web launch LED handoff
 
 #define HTTP_PORT      80
 #define HTTP_REQ_MAX   8192
@@ -23,8 +25,9 @@ enum { ST_IDLE = 0, ST_HDR, ST_BODY, ST_SEND };
 enum { M_GET = 0, M_POST };
 enum {
     R_NONE = 0, R_PAGE, R_LOGO, R_BANKS, R_RENAME, R_DELETE, R_FLASH, R_LAUNCH, R_EEPROM, R_RESET, R_SYSINFO, R_CLRXBDIAG,
-    R_THEMES, R_TINI, R_TFILE, R_TDEL, R_SETCOLOR
-};   // custom-theme web tools (Phase 4)
+    R_THEMES, R_TINI, R_TFILE, R_TDEL, R_SETCOLOR,
+    R_SDLIST, R_SDDEL, R_SDUP
+};   // custom-theme + SD BIOS web tools
 
 static SOCKET s_listen = INVALID_SOCKET;
 static SOCKET s_conn = INVALID_SOCKET;
@@ -51,6 +54,7 @@ static char   s_json[HTTP_JSON_MAX];
 static char   s_resp[HTTP_RESP_MAX];
 static char   s_name[80];
 static char   s_tFolder[64], s_tName[64];       // theme route query params
+static char   s_sdPath[160];                    // SD manager path (root-relative)
 static char   s_colorStr[10];                   // /api/setcolor ?c=RRGGBB
 static HANDLE s_upFile = INVALID_HANDLE_VALUE;  // streaming theme-file upload
 
@@ -294,6 +298,7 @@ static const char* k_page =
 " }\n"
 " host.appendChild(c);\n"
 " await renderThemes();\n"
+" await renderSd('/');\n"
 "}\n"
 "const CK=[['bg_top','BG Top'],['bg_bottom','BG Bottom'],['panel','Panel'],['accent','Accent'],['glow','Glow'],['text','Text'],['text_dim','Text Dim']];\n"
 "const CDEF={bg_top:'#0a0a0f',bg_bottom:'#05050a',panel:'#15151c',accent:'#a855f7',glow:'#c77dff',text:'#e8e8ef',text_dim:'#6a6a78'};\n"
@@ -327,6 +332,16 @@ static const char* k_page =
 "  prog.textContent='';showModal(false);msg('Theme saved');renderThemes();\n"
 " }catch(e){prog.textContent='Save failed';}}\n"
 "async function delTheme(folder){if(!confirm('Delete theme \"'+folder+'\" ?'))return;try{await fetch('/api/theme/del?folder='+encodeURIComponent(folder),{method:'POST'});}catch(e){}msg('Theme deleted');renderThemes();}\n"
+"let sdPath='/';let sdUpload=document.createElement('input');sdUpload.type='file';sdUpload.accept='.bin';\n"
+"function sdFmt(n){if(n==1048576)return '1 MB';if(n==524288)return '512 KB';if(n==262144)return '256 KB';return n+' B';}\n"
+"function sdParent(p){if(p==='/'||!p)return '/';let q=p.replace(/\\/$/,'');let i=q.lastIndexOf('/');return i<=0?'/':q.slice(0,i+1);}\n"
+"async function renderSd(path){sdPath=path||'/';let host=document.getElementById('sys');let old=document.getElementById('sdcard');if(old)old.remove();let d={ok:false,entries:[]};try{let r=await fetch('/api/sd/list?path='+encodeURIComponent(sdPath));d=await r.json();}catch(e){}\n"
+" let c=document.createElement('div');c.className='card';c.id='sdcard';let h=document.createElement('h2');h.textContent='SD BIOS Manager';c.appendChild(h);let info=document.createElement('div');info.className='info';info.appendChild(kv('Path',sdPath));\n"
+" if(!d.ok){let e=document.createElement('div');e.className='kv';e.textContent=d.error||'SD card unavailable';info.appendChild(e);}else{if(sdPath!=='/'){let up=document.createElement('div');up.className='kv';let k=document.createElement('span');k.className='k';k.textContent='[..]';up.appendChild(k);let v=document.createElement('span');v.appendChild(btn('Up','',function(){renderSd(sdParent(sdPath));}));up.appendChild(v);info.appendChild(up);}\n"
+"  if(!d.entries||!d.entries.length){let e=document.createElement('div');e.className='kv';e.textContent='No BIOS files';info.appendChild(e);}else{for(const f of d.entries){let row=document.createElement('div');row.className='kv';let k=document.createElement('span');k.className='k';k.textContent=(f.d?'[D] ':'')+f.n+(f.d?'/':'  ('+sdFmt(f.s)+')');row.appendChild(k);let v=document.createElement('span');if(f.d){v.appendChild(btn('Open','',function(){let b=sdPath==='/'?'':sdPath.replace(/\\/$/,'');renderSd(b+'/'+f.n+'/');}));}else{v.appendChild(btn('Delete','danger',function(){sdDelete(f.n);}));}row.appendChild(v);info.appendChild(row);}}}\n"
+" c.appendChild(info);let rr=document.createElement('div');rr.className='row';rr.appendChild(btn('Upload BIOS','go',function(){sdUpload.value='';sdUpload.click();}));rr.appendChild(btn('Refresh','',function(){renderSd(sdPath);}));c.appendChild(rr);host.appendChild(c);}\n"
+"async function sdDelete(name){if(!confirm('Delete BIOS \"'+name+'\" from SD card?'))return;let b=sdPath==='/'?'':sdPath.replace(/\\/$/,'');let p=b+'/'+name;let r=await fetch('/api/sd/delete?path='+encodeURIComponent(p),{method:'POST'});msg(r.ok?'BIOS deleted':'Delete failed: '+(await r.text()));renderSd(sdPath);}\n"
+"sdUpload.onchange=async function(){let f=sdUpload.files[0];if(!f)return;if(!(f.size==262144||f.size==524288||f.size==1048576)){msg('BIOS must be exactly 256K, 512K, or 1MB');return;}let b=sdPath==='/'?'':sdPath.replace(/\\/$/,'');let p=b+'/'+f.name;msg('Uploading '+f.name+'...');let r=await fetch('/api/sd/upload?path='+encodeURIComponent(p),{method:'POST',body:await f.arrayBuffer()});msg(r.ok?'BIOS uploaded':'Upload failed: '+(await r.text()));renderSd(sdPath);};\n"
 "loadSys();\n"
 "load();\n"
 "buildColorInputs();initModal();\n"
@@ -557,6 +572,53 @@ static int safeName(const char* s)
     return 1;
 }
 
+// Validate a root-relative FatFs path. Directories may contain spaces/dots,
+// but traversal, drive prefixes and backslashes are never accepted.
+static int safeSdPath(const char* s)
+{
+    int i;
+    if (!s || s[0] != '/') return 0;
+    for (i = 0; s[i]; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == '\\' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<' || c == '>' || c == '|') return 0;
+        if (s[i] == '.' && s[i + 1] == '.') return 0;
+        if (i >= 158) return 0;
+    }
+    return 1;
+}
+
+static int sdBiosSize(FSIZE_t n)
+{
+    return n == (FSIZE_t)(256 * 1024) || n == (FSIZE_t)(512 * 1024) || n == (FSIZE_t)(1024 * 1024);
+}
+
+// JSON listing for the WebUI. Directories remain navigable, but non-BIOS files
+// are intentionally hidden: this is a BIOS manager, not a general SD editor.
+static int buildSdJson(char* o, const char* path)
+{
+    DIR dir; FILINFO fno; FRESULT fr; int p = 0, first = 1, shown = 0;
+    if (Sd_Mount() != EOS_SD_OK) return -1;
+    fr = f_opendir(&dir, (path[0] == '/' && path[1] == 0) ? "/" : path);
+    if (fr != FR_OK) return -2;
+    p += appS(o + p, "{\"ok\":true,\"entries\":[");
+    for (;;) {
+        fr = f_readdir(&dir, &fno);
+        if (fr != FR_OK || fno.fname[0] == 0) break;
+        if (fno.fname[0] == '.') continue;
+        if (!(fno.fattrib & AM_DIR) && !sdBiosSize(fno.fsize)) continue;
+        if (shown++ >= 48 || p > HTTP_JSON_MAX - 256) break;
+        if (!first) o[p++] = ','; first = 0;
+        p += appS(o + p, "{\"n\":\""); p += appJson(o + p, fno.fname);
+        p += appS(o + p, "\",\"d\":"); p += appI(o + p, (fno.fattrib & AM_DIR) ? 1 : 0);
+        p += appS(o + p, ",\"s\":"); p += appI(o + p, (int)fno.fsize);
+        o[p++] = '}';
+    }
+    f_closedir(&dir);
+    p += appS(o + p, "]}");
+    return p;
+}
+
 // Build "E:\Eos\Themes\<folder>" (+ "\<leaf>" when leaf != 0).
 static void themePath(char* out, int cap, const char* folder, const char* leaf)
 {
@@ -630,6 +692,9 @@ static void parseReq(void)
     else if (strEqN(path, "/api/theme/file", 15)) s_route = R_TFILE;
     else if (strEqN(path, "/api/theme/del", 14)) s_route = R_TDEL;
     else if (strEqN(path, "/api/setcolor", 13)) s_route = R_SETCOLOR;
+    else if (strEqN(path, "/api/sd/list", 12)) s_route = R_SDLIST;
+    else if (strEqN(path, "/api/sd/delete", 14)) s_route = R_SDDEL;
+    else if (strEqN(path, "/api/sd/upload", 14)) s_route = R_SDUP;
     else if (strEqN(path, "/logo.bmp", 9)) s_route = R_LOGO;
     else if (path[0] == '/' && (path[1] == ' ' || path[1] == '?')) s_route = R_PAGE;
 
@@ -640,6 +705,9 @@ static void parseReq(void)
     }
     if (s_route == R_SETCOLOR) {
         qStr(path, "c", s_colorStr, sizeof(s_colorStr));   // hex RRGGBB (no '#')
+    }
+    if (s_route == R_SDLIST || s_route == R_SDDEL || s_route == R_SDUP) {
+        qStr(path, "path", s_sdPath, sizeof(s_sdPath));
     }
     if (s_method == M_POST) s_clen = findCLen();
 }
@@ -678,6 +746,50 @@ static void process(void)
         respondText("200 OK", "XbDiag cleared"); return;
     }
     if (s_route == R_LOGO) { int len = buildLogoBmp(s_rx); respond("200 OK", "image/bmp", (const char*)s_rx, len); return; }
+
+    // ---- SD BIOS manager ---------------------------------------------------
+    if (s_route == R_SDLIST) {
+        int len;
+        if (!safeSdPath(s_sdPath)) { respondText("400 Bad Request", "bad SD path"); return; }
+        len = buildSdJson(s_json, s_sdPath);
+        if (len == -1) { respondText("503 Unavailable", "SD card not mounted"); return; }
+        if (len == -2) { respondText("404 Not Found", "directory not found"); return; }
+        respond("200 OK", "application/json", s_json, len); return;
+    }
+    if (s_route == R_SDDEL) {
+        FILINFO fi; FRESULT fr;
+        if (!safeSdPath(s_sdPath)) { respondText("400 Bad Request", "bad SD path"); return; }
+        if (Sd_Mount() != EOS_SD_OK) { respondText("503 Unavailable", "SD card not mounted"); return; }
+        fr = f_stat(s_sdPath, &fi);
+        if (fr != FR_OK) { respondText("404 Not Found", "file not found"); return; }
+        if ((fi.fattrib & AM_DIR) || !sdBiosSize(fi.fsize)) { respondText("403 Forbidden", "not a BIOS file"); return; }
+        fr = f_unlink(s_sdPath);
+        if (fr != FR_OK) { respondText("500 Error", "delete failed"); return; }
+        respondText("200 OK", "deleted"); return;
+    }
+    if (s_route == R_SDUP) {
+        FIL fp; FRESULT fr; UINT bw = 0;
+        if (!safeSdPath(s_sdPath)) { respondText("400 Bad Request", "bad SD path"); return; }
+        if (s_err == 413) { respondText("413 Too Large", "BIOS exceeds 1MB"); return; }
+        if (!sdBiosSize((FSIZE_t)s_clen) || s_rxStore != s_clen) {
+            respondText("400 Bad Request", "BIOS must be exactly 256K, 512K, or 1MB"); return;
+        }
+        if (Sd_Mount() != EOS_SD_OK) { respondText("503 Unavailable", "SD card not mounted"); return; }
+        fr = f_open(&fp, s_sdPath, FA_WRITE | FA_CREATE_ALWAYS);
+        if (fr != FR_OK) { respondText("500 Error", "open failed"); return; }
+        // Reserve one contiguous run up front so the existing raw-LBA launcher
+        // can precache the uploaded BIOS without fragmentation stitching.
+        fr = f_expand(&fp, (FSIZE_t)s_clen, 1);
+        if (fr == FR_OK) fr = f_lseek(&fp, 0);
+        if (fr == FR_OK) fr = f_write(&fp, s_rx, (UINT)s_clen, &bw);
+        if (fr == FR_OK && bw == (UINT)s_clen) fr = f_sync(&fp);
+        f_close(&fp);
+        if (fr != FR_OK || bw != (UINT)s_clen) {
+            f_unlink(s_sdPath);
+            respondText("500 Error", "SD write failed or no contiguous space"); return;
+        }
+        respondText("200 OK", "uploaded"); return;
+    }
 
     // ---- custom-theme web tools (Phase 4) ----
     if (s_route == R_THEMES) { int len = buildThemesJson(s_json); respond("200 OK", "application/json", s_json, len); return; }
@@ -893,9 +1005,8 @@ static void closeConn(void)
 static void beginBody(void)
 {
     s_rxRecv = 0; s_rxStore = 0; s_store = 1; s_err = 0;
-    if (s_route == R_FLASH) {
-        // Accept up to the full 1MB budget; an oversized image is routed to the
-        // new region and the slot-fit (free-run) check happens in the handler.
+    if (s_route == R_FLASH || s_route == R_SDUP) {
+        // Both flash and SD BIOS uploads share the existing 1MB receive buffer.
         int cap = HTTP_RX_MAX;
         if (s_clen > cap) { s_err = 413; s_store = 0; }   // drain then 413
     }
@@ -933,7 +1044,7 @@ static void stashBody(const char* src, int len)
 {
     int cap, room, i;
     if (!s_store) { s_rxRecv += len; return; }
-    if (s_route == R_FLASH || s_route == R_EEPROM) {
+    if (s_route == R_FLASH || s_route == R_EEPROM || s_route == R_SDUP) {
         cap = (s_route == R_EEPROM) ? EOS_EEPROM_SIZE : HTTP_RX_MAX;
         room = cap - s_rxStore; if (room > len) room = len;
         for (i = 0; i < room; ++i) s_rx[s_rxStore + i] = (unsigned char)src[i];
@@ -1040,9 +1151,16 @@ void Http_Poll(void)
         if (s_launch >= 0) {
             int bank = s_launch;
             closeConn();
-            // Every bank launches normally; the FPGA redirects an oversized anchor
-            // to the ext-region SDRAM copy.
-            Bank_Launch(bank);            // 0xEF + SMC warm reset -- does not return
+
+            // Match the local launch-menu LED handoff. Recovery uses the loader's
+            // breathing-white status; user banks use their stored descriptor color.
+            if (Bank_Ef(bank) == 0x0A)
+                Led_Show(EOS_LED_WHITE, 0);
+            else
+                Led_Show(EOS_LED_SOLID, Desc_GetColor(bank));
+
+            // Bank_Launch performs the clean firmware warm-reset handoff.
+            Bank_Launch(bank);            // does not return
             return;
         }
         closeConn();

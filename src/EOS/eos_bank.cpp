@@ -4,13 +4,17 @@
 // low nibble is the bank number tells the Eos FPGA which virtual region to map.
 // The FPGA bank register persists across a warm reset, so to boot a bank we:
 //     out 0xEF, <bank>           ; select (survives the warm reset)
-//     raw nForce SMBus write 0x10/0x02/0x01     ; SMC warm reset -> reboot into bank
-// 0x01 is the reliable SMC warm-reset command (0x40 is honored on fewer boxes).
+//     clear PIC scratch NO_ANIMATION bit       ; ensure BIOS animation is allowed
+//     HalReturnToFirmware(REBOOT)               ; kernel-managed warm reboot
+//
+// Directly commanding the PIC/SMC to reset bypasses the normal Xbox firmware
+// re-entry handoff and can preserve stale scratch-register state.
 //
 // RXDK / MSVC2003 constraints: declarations before statements, file-scope
 // statics, no CRT string funcs.
 #include "eos_bank.h"
 #include "eos_flash.h"
+#include "xboxinternals.h"   // PIC scratch register + HalReturnToFirmware
 
 struct EosBank {
     unsigned char ef;
@@ -202,32 +206,24 @@ static unsigned char io_in8(unsigned short port)
     return v;
 }
 
-// --- raw nForce SMBus byte write (self-contained; no kernel import) ----------
-// HalWriteSMBusValue is not resolvable by the RXDK linker for this project
-// (same issue XbDiag hit), so we drive the nForce SMBus controller directly,
-// the way Cromwell / the Xbox 2BL does. Register block base 0xC000:
-//   0xC000 status (W1C)   0xC002 control/protocol   0xC004 address (7-bit<<1|RW)
-//   0xC006 data           0xC008 command
-// Protocol 0x0A = byte-data transaction + start.
-static void smbus_write_byte(unsigned char addr7, unsigned char cmd, unsigned char val)
+// --- clean BIOS reboot handoff -------------------------------------------------
+// The PIC scratch register survives a warm reset. Bit 0x04 explicitly suppresses
+// the boot animation, so preserve every other scratch flag but clear that one.
+// Then use the kernel firmware re-entry path instead of directly resetting the SMC.
+static void reboot_to_firmware(void)
 {
-    volatile int t;
+    DWORD scratch;
 
-    // wait until not busy (bit3), bounded
-    for (t = 0; t < 100000; ++t) { if (!(io_in8(0xC000) & 0x08)) break; }
-
-    io_out8(0xC000, io_in8(0xC000));        // clear status (write-1-to-clear readback)
-    io_out8(0xC004, (unsigned char)(addr7 << 1)); // slave address, write (RW=0)
-    io_out8(0xC008, cmd);                    // command / register
-    io_out8(0xC006, val);                    // data byte
-    io_out8(0xC002, 0x0A);                   // byte-data protocol + start
-
-    // poll for completion (bit4) or error, bounded
-    for (t = 0; t < 100000; ++t) {
-        unsigned char st = io_in8(0xC000);
-        if (st & 0x10) break;                // cycle complete
-        if (st & 0x24) break;                // error/abort
+    scratch = 0;
+    if (HalReadSMBusByte(SMBDEV_PIC16L, PIC16L_CMD_SCRATCH_REGISTER, &scratch) == 0) {
+        HalWriteSMBusByte(SMBDEV_PIC16L, PIC16L_CMD_SCRATCH_REGISTER,
+            scratch & ~((DWORD)SCRATCH_REGISTER_BITVALUE_NO_ANIMATION));
     }
+
+    HalReturnToFirmware(RETURN_FIRMWARE_REBOOT);
+
+    // HalReturnToFirmware should never return.
+    for (;;) {}
 }
 
 void Bank_SetResting(void)
@@ -243,8 +239,7 @@ void Bank_LaunchEf(unsigned char ef)
     volatile int s;
     io_out8(0x00EF, ef);
     for (s = 0; s < 200000; ++s) {}
-    smbus_write_byte(0x10, 0x02, 0x01);
-    for (;;) {}
+    reboot_to_firmware();
 }
 
 void Bank_Launch(int idx)
@@ -269,12 +264,9 @@ void Bank_Launch(int idx)
     // 2) small settle so the 0xEF write completes on the LPC bus before reset
     for (s = 0; s < 200000; ++s) {}
 
-    // 3) SMC warm reset (PIC 7-bit 0x10, cmd 0x02 power, 0x01 = reliable warm
-    //    reset) -> Xbox reboots and the FPGA serves the selected bank.
-    smbus_write_byte(0x10, 0x02, 0x01);
-
-    // SMC pulls the reset within ~ms; spin so we never fall through
-    for (;;) {}
+    // 3) Clear stale NO_ANIMATION state and perform a normal firmware reboot.
+    //    The FPGA bank latch persists across this warm reset.
+    reboot_to_firmware();
 }
 
 // Eos_TsopBoot -- release D0 and warm-reset so the box boots the onboard TSOP.
@@ -294,10 +286,8 @@ void Eos_TsopBoot(void)
     // 2) settle so the LPC writes commit before the reset
     for (s = 0; s < 200000; ++s) {}
 
-    // 3) same SMC warm reset Bank_Launch uses (PIC 0x10, cmd 0x02, 0x01 = warm)
-    smbus_write_byte(0x10, 0x02, 0x01);
-
-    for (;;) {}
+    // 3) normal firmware reboot, with stale NO_ANIMATION cleared
+    reboot_to_firmware();
 }
 
 // Bank_XbDiagPresent -- 1 if XbDiag Lite is installed in bank 0xD. Probes page 0
@@ -337,8 +327,7 @@ void Eos_LaunchXbDiag(void)
     Flash_Sync(0xD);                      // reload 0xD flash -> SDRAM, waits for done
     io_out8(0x00EF, 0xD);                 // select for serve (persists across warm reset)
     for (s = 0; s < 200000; ++s) {}
-    smbus_write_byte(0x10, 0x02, 0x01);   // SMC warm reset -> boots XbDiag
-    for (;;) {}
+    reboot_to_firmware();                  // clean warm reboot -> boots XbDiag
 }
 
 void Bank_TestWrite(int idx)

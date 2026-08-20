@@ -1,22 +1,22 @@
 #pragma once
-#pragma once
 // eos_sdcard.h -- Eos SD card driver (host side of the 0xEC/0xED SD_*/SD_BR_*
 // register contract; see eos_flash_cmd.v / eos_sd_precache.v / eos_sd_spi.v).
 //
-// Two jobs, mirroring the two gateware commands:
+// Three jobs, mirroring the gateware commands:
 //   1) Single-sector browse reads, used by our FatFs diskio glue (eos_sddiskio.cpp)
 //      to walk the FAT32 volume -- directories, FAT table, cluster chains.
-//   2) The bulk precache: given a file's raw starting LBA + sector count
+//   2) Single-sector writes, used by FatFs for the WebUI BIOS manager.
+//   3) The bulk precache: given a file's raw starting LBA + sector count
 //      (resolved via FatFs, see Sd_ResolveFile below), copy it into NRGN_SD in
-//      hardware and launch it as bank 0x0. NEVER writes to the SD card and
-//      NEVER writes to on-board flash -- this is entirely separate from the
-//      TSOP/user-bank flashing path in eos_flash.cpp.
+//      hardware and launch it as bank 0x0. This remains entirely separate from
+//      the TSOP/user-bank flashing path in eos_flash.cpp.
 #include <xtl.h>
 #include "ff.h"
 
 // FatFs error surface for card-level problems (mirrors eos_sd_spi's err_code):
 //   0=none 1=cmd0 2=cmd8 3=acmd41_timeout 4=cmd58 6=cmd17(R1) 7=token_timeout
-//   8=legacy_card(unsupported) 13=refused,busy_with_other_op 14=card_not_ready
+//   8=legacy_card 9=cmd24(R1) 10=write_rejected 11=write_busy_timeout
+//   13=refused,busy_with_other_op 14=card_not_ready
 #define EOS_SD_OK          0
 #define EOS_SD_TIMEOUT    -1
 #define EOS_SD_CARDERR    -2   // see Sd_LastErrCode() for the specific reason
@@ -33,6 +33,10 @@
 // Reads exactly one 512-byte sector at 'lba' into buf512. Returns EOS_SD_OK or
 // EOS_SD_TIMEOUT/EOS_SD_CARDERR. Never touches NRGN_SD or the precache path.
 int Sd_ReadSector(unsigned long lba, unsigned char* buf512);
+
+// Writes exactly one 512-byte sector through the gateware CMD24 path. Used by
+// eos_sddiskio.cpp only; callers above FatFs should use f_write/f_unlink.
+int Sd_WriteSector(unsigned long lba, const unsigned char* buf512);
 
 // 1 if the card responded to init (cheap: reads the browse-path's card_ready
 // status; does not itself touch the card). Call after Sd_Mount()/first use.

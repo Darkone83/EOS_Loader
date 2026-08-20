@@ -2531,11 +2531,12 @@ static void Browse_Frame(WORD b)
 }
 
 // ---------------------------------------------------------------------------
-// SD CARD BROWSER: FAT32, read-only, our own driver (eos_sdcard.cpp / FatFs)
-// over the SD_BR_* LPC registers -- NOT File_ListDir/XTL (that's the HDD path
-// above). Selecting a file resolves it to a raw contiguous LBA run, precaches
-// it into NRGN_SD in hardware, and launches bank 0x0. Never writes to the SD
-// card and never touches on-board flash.
+// SD CARD BROWSER: FAT32, our own driver (eos_sdcard.cpp / FatFs) over the
+// SD_BR_* LPC registers -- NOT File_ListDir/XTL (that's the HDD path above).
+// This on-console browser remains read/launch only; the WebUI BIOS Manager may
+// additionally use the SD_BW_* path to upload/delete BIOS files. Selecting a
+// file here resolves it to a raw contiguous LBA run, precaches it into NRGN_SD
+// in hardware, and launches bank 0x0 without touching on-board flash.
 // ---------------------------------------------------------------------------
 static void sdSortEntries(void)
 {

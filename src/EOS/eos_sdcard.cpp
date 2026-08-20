@@ -30,6 +30,16 @@
 #define IDX_SD_BR_STATUS   0x23
 #define IDX_SD_BR_STATUS2  0x24
 
+// --- register indices: single-sector write ------------------------------
+#define IDX_SD_BW_LBA0     0x25
+#define IDX_SD_BW_LBA1     0x26
+#define IDX_SD_BW_LBA2     0x27
+#define IDX_SD_BW_LBA3     0x28
+#define IDX_SD_BW_BUF      0x29
+#define IDX_SD_BW_GO       0x2A
+#define IDX_SD_BW_STATUS   0x2B
+#define IDX_SD_BW_STATUS2  0x2C
+
 // STATUS2 bits (both precache and browse use the same layout)
 #define ST2_BUSY   0x01
 #define ST2_DONE   0x02
@@ -39,6 +49,7 @@
 // with LPC contention; a full 1MB precache can legitimately take a couple of
 // seconds, so its own poll uses a much larger bound (see Sd_PrecacheAndLaunch).
 #define POLL_LIMIT_SECTOR   2000000L
+#define POLL_LIMIT_WRITE    20000000L
 #define POLL_LIMIT_PRECACHE 200000000L
 
 // --- low-level port I/O (x86 IN/OUT) ----------------------------------------
@@ -111,6 +122,44 @@ int Sd_ReadSector(unsigned long lba, unsigned char* buf512)
     for (i = 0; i < 512; ++i)
         buf512[i] = io_in8(EOS_PORT_DATA);
 
+    return EOS_SD_OK;
+}
+
+// ---- single-sector write --------------------------------------------------
+// Fill the gateware's 512-byte staging buffer, then issue one CMD24 write.
+// The write path deliberately mirrors Sd_ReadSector(): one raw sector per
+// command keeps FatFs simple and avoids needing a multi-block SD protocol.
+int Sd_WriteSector(unsigned long lba, const unsigned char* buf512)
+{
+    volatile long t;
+    unsigned char st2;
+    int i;
+
+    regw(IDX_SD_BW_LBA0, (unsigned char)(lba & 0xFF));
+    regw(IDX_SD_BW_LBA1, (unsigned char)((lba >> 8) & 0xFF));
+    regw(IDX_SD_BW_LBA2, (unsigned char)((lba >> 16) & 0xFF));
+    regw(IDX_SD_BW_LBA3, (unsigned char)((lba >> 24) & 0xFF));
+
+    // Selecting SD_BW_BUF resets its write pointer. Each data write pushes
+    // one byte and auto-increments, exactly like the flash page buffer.
+    io_out8(EOS_PORT_INDEX, IDX_SD_BW_BUF);
+    for (i = 0; i < 512; ++i)
+        io_out8(EOS_PORT_DATA, buf512[i]);
+
+    regw(IDX_SD_BW_GO, 1);
+
+    io_out8(EOS_PORT_INDEX, IDX_SD_BW_STATUS2);
+    for (t = 0; t < POLL_LIMIT_WRITE; ++t) {
+        st2 = io_in8(EOS_PORT_DATA);
+        if (!(st2 & ST2_BUSY) && (st2 & ST2_DONE)) break;
+    }
+    if (t == POLL_LIMIT_WRITE) { s_lastErrCode = 11; return EOS_SD_TIMEOUT; }
+
+    if (st2 & ST2_ERR) {
+        s_lastErrCode = regr(IDX_SD_BW_STATUS) & 0x0F;
+        return EOS_SD_CARDERR;
+    }
+    s_lastErrCode = 0;
     return EOS_SD_OK;
 }
 

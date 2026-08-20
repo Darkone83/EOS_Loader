@@ -544,8 +544,8 @@ static int datetimeFrame(WORD b, WORD prev)
     }
     if (applied)
         Font_DrawCentered(0, g_scrW, LIST_Y0 + rows * LIST_DY + 6, applied, EOS_PURPLE);
-    if (Rtc_Present())
-        Font_DrawCentered(0, g_scrW, LIST_Y0 + rows * LIST_DY + 28,
+    else if (Rtc_Present())
+        Font_DrawCentered(0, g_scrW, LIST_Y0 + rows * LIST_DY + 6,
             "X-RTC detected -- date & time saved to the clock chip", EOS_DIM);
     footer("D-PAD  UP/DN FIELD   L/R ADJUST   A APPLY   B BACK");
     return 0;
