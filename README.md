@@ -320,3 +320,5 @@ Media/                    runtime media assets (background-music tracks, etc.)
 ## Credits
 
 Eos loader © Team Resurgent / Darkone83. FTP engine adapted from the DarkDash codebase.
+
+VSC HDD unlock support is based on the PrometheOS implementation by Team Resurgent and its contributors. The Western Digital and Seagate vendor-specific recovery flows were adapted for EOS while preserving the original PrometheOS behavior.
