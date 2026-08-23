@@ -147,6 +147,9 @@
     <ClCompile Include="eos_plasma.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="eos_vsc.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Text Include="Media\Copy Assets Here.txt">
@@ -296,6 +299,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="eos_plasma.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="eos_vsc.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

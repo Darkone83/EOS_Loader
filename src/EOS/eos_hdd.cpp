@@ -2,6 +2,7 @@
 // RXDK / MSVC2003 / C89: declarations before statements, no CRT, no sprintf.
 // SendATACommand logic + HDD password derivation ported from PrometheOS XKHDD.
 #include "eos_hdd.h"
+#include "eos_vsc.h"           // vendor-specific fallback only after normal unlock fails
 #include "eos_gfx.h"           // <xtl.h>: BYTE/WORD, Sleep
 #ifndef EOS_HOST_TEST
 #include "xboxinternals.h"     // KeStallExecutionProcessor, XboxHDKey
@@ -259,6 +260,7 @@ int Hdd_Identify(EosHddInfo* out)
 int Hdd_Unlock(void)
 {
     AtaCmd cmd; u8 pass[20]; unsigned short sec;
+    EosVscResult vsc; int vrc, saveRc;
 
     if (!identifyInto(&cmd)) return HDD_ERR_NODISK;
     genPwd(XboxHDKey, cmd.data, pass);
@@ -276,10 +278,22 @@ int Hdd_Unlock(void)
     { int i; for (i = 0; i < 20; i++) cmd.data[2 + i] = pass[i]; }
     sendATA(IDE_PRIMARY, &cmd, ATA_WR);
 
-    // verify
+    // Verify the normal EOS path first. Nothing vendor-specific runs unless the
+    // drive is still security-enabled after the existing unlock+disable flow.
     if (!identifyInto(&cmd)) return HDD_ERR_ATA;
     sec = (unsigned short)(cmd.data[OFF_SECWORD] | (cmd.data[OFF_SECWORD + 1] << 8));
-    return (sec & HDD_SEC_ENABLED) ? HDD_ERR_ATA : HDD_OK;
+    if (!(sec & HDD_SEC_ENABLED)) return HDD_OK;
+
+    // Normal console-derived password failed: transparently fall back to the
+    // PrometheOS-derived VSC recovery module. The normal lock path is untouched.
+    vrc = Vsc_TryUnlock(&vsc);
+    if (vrc != EOS_VSC_OK) return HDD_ERR_ATA;
+
+    // Preserve the recovered master + user passwords for future recovery. The
+    // disk is already unlocked here, so a file-write failure is a warning result
+    // rather than an unlock failure.
+    saveRc = Vsc_SaveCredentials(&vsc);
+    return (saveRc == EOS_VSC_OK) ? HDD_OK_VSC : HDD_OK_VSC_NOSAVE;
 }
 
 int Hdd_Lock(void)
@@ -308,4 +322,44 @@ int Hdd_Lock(void)
     if (!identifyInto(&cmd)) return HDD_ERR_ATA;
     sec = (unsigned short)(cmd.data[OFF_SECWORD] | (cmd.data[OFF_SECWORD + 1] << 8));
     return (sec & HDD_SEC_ENABLED) ? HDD_OK : HDD_ERR_ATA;
+}
+
+// Query mounted user-facing Xbox partitions for the Drive Info screen.
+// Missing volumes (normally F:/G: on smaller layouts) are simply omitted.
+int Hdd_GetPartitions(EosPartitionInfo* out, int maxCount)
+{
+    static const char drives[HDD_PART_MAX] = { 'C', 'E', 'F', 'G' };
+    int i, n;
+
+    if (!out || maxCount <= 0) return 0;
+
+    n = 0;
+    for (i = 0; i < HDD_PART_MAX && n < maxCount; ++i) {
+        char root[4];
+        ULARGE_INTEGER freeAvail, totalBytes, totalFree;
+        unsigned __int64 total, freeBytes, usedBytes;
+
+        root[0] = drives[i];
+        root[1] = ':';
+        root[2] = '\\';
+        root[3] = 0;
+
+        if (!GetDiskFreeSpaceExA(root, &freeAvail, &totalBytes, &totalFree))
+            continue;
+
+        total = totalBytes.QuadPart;
+        freeBytes = freeAvail.QuadPart;
+        usedBytes = (total > freeBytes) ? (total - freeBytes) : 0;
+
+        out[n].drive = drives[i];
+        out[n].present = 1;
+        out[n].totalMB = (unsigned long)(total / 1048576);
+        out[n].freeMB = (unsigned long)(freeBytes / 1048576);
+        out[n].usedMB = (unsigned long)(usedBytes / 1048576);
+        out[n].usedPercent = (total > 0) ? (unsigned int)((usedBytes * 100) / total) : 0;
+        if (out[n].usedPercent > 100) out[n].usedPercent = 100;
+        ++n;
+    }
+
+    return n;
 }

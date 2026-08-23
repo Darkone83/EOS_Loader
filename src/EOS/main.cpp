@@ -140,14 +140,27 @@ static DWORD s_statusUntil = 0;
 // every screen via the Gfx_End overlay hook.
 static EosLive s_live = { -1, -1, 0, 0, 0 };
 static DWORD   s_liveNext = 0;      // next GetTickCount() at which to re-poll
-static int     s_liveRev16 = 0;     // 1 once we know this is a 1.6 board
+static int     s_liveRev16 = 0;     // actual Xbox revision (temperature source)
+static int     s_eosMode16 = 0;     // physical EOS 1.6_EN strap, STATUS reg bit 1
 
 static void hudPoll(void)
 {
     DWORD now = GetTickCount();
+    unsigned char eosStatus = 0;
+
     if (now < s_liveNext) return;
     s_liveNext = now + 2000;         // 2s cadence
+
     Console_ReadLive(&s_live, s_liveRev16);
+
+    // EOS gateware exposes the physical 1.6_EN state at updater STATUS 0x04:
+    // bit 1 = mode_16.  Read it independently of Xbox revision detection so an
+    // accidentally-enabled 1.6_EN strap is visible immediately in the HUD.
+    Con_SmbReset();
+    if (Con_SmbRead8(0xDC, 0x04, &eosStatus))
+        s_eosMode16 = (eosStatus & 0x02) ? 1 : 0;
+    else
+        s_eosMode16 = 0;
 }
 
 // Draw one right-aligned "Label: value" line at y; returns next y.
@@ -174,9 +187,9 @@ static void hudDraw(void)
     hudPoll();
 
     // Thin frame (outline, not a solid fill) so labels/values stay legible over
-    // any theme. Sized for the scaled 3-line block.
+    // any theme. Grow by one line only while EOS 1.6_EN is asserted.
     {
-        int bx = g_scrW - 150, by = 10, bw = 140, bh = 62;
+        int bx = g_scrW - 150, by = 10, bw = 140, bh = s_eosMode16 ? 79 : 62;
         DWORD fr = EOS_PURPLE;
         Gfx_Fill((float)bx, (float)by, (float)bw, 1.0f, fr); // top
         Gfx_Fill((float)bx, (float)(by + bh - 1), (float)bw, 1.0f, fr); // bottom
@@ -224,6 +237,11 @@ static void hudDraw(void)
         *p++ = 'M'; *p++ = 'B'; *p = 0;
         y = hudLine(right, y, "RAM", buf, EOS_WHITE);
     }
+
+    // Configuration warning/status: show only when the physical EOS 1.6_EN
+    // strap is asserted. This is the gateware mode state, not Xbox revision.
+    if (s_eosMode16)
+        y = hudLine(right, y, "1.6 Mode", "Enabled", EOS_WHITE);
 }
 
 
@@ -1817,10 +1835,12 @@ static void FwRestConfirm_Frame(WORD b)
 // drive to this console's key. Both are armed (press A twice). The password is
 // derived from the kernel HDD key -- see eos_hdd.
 // ---------------------------------------------------------------------------
-static EosHddInfo s_hddInfo;
-static int        s_hddOk = 0;
-static int        s_hddToolSel = 0;
-static int        s_hddArm = 0;
+static EosHddInfo       s_hddInfo;
+static EosPartitionInfo s_hddParts[HDD_PART_MAX];
+static int              s_hddPartCount = 0;
+static int              s_hddOk = 0;
+static int              s_hddToolSel = 0;
+static int              s_hddArm = 0;
 
 static int appendUInt(char* out, int p, unsigned long v)
 {
@@ -1829,6 +1849,52 @@ static int appendUInt(char* out, int p, unsigned long v)
     while (v && n < 11) { tmp[n++] = (char)('0' + (int)(v % 10)); v /= 10; }
     while (n > 0) out[p++] = tmp[--n];
     return p;
+}
+
+// Append one partition size using the unit chosen for the whole row. For GB we
+// keep one decimal place without pulling floating point / sprintf into the UI.
+static int hddAppendSize(char* out, int p, unsigned long mb, int useGB)
+{
+    if (useGB) {
+        unsigned long whole = mb / 1024;
+        unsigned long tenth = ((mb % 1024) * 10 + 512) / 1024;
+        if (tenth >= 10) { ++whole; tenth = 0; }
+        p = appendUInt(out, p, whole);
+        out[p++] = '.';
+        out[p++] = (char)('0' + (int)tenth);
+    }
+    else {
+        p = appendUInt(out, p, mb);
+    }
+    out[p] = 0;
+    return p;
+}
+
+static void hddPartLine(const EosPartitionInfo* pi, char* out)
+{
+    int p = 0;
+    int useGB = (pi->totalMB >= 1024);
+
+    p = hddAppendSize(out, p, pi->usedMB, useGB);
+    p = appendStr(out, p, " / ");
+    p = hddAppendSize(out, p, pi->totalMB, useGB);
+    p = appendStr(out, p, useGB ? " GB   " : " MB   ");
+    p = hddAppendSize(out, p, pi->freeMB, useGB);
+    p = appendStr(out, p, useGB ? " GB free   " : " MB free   ");
+    p = appendUInt(out, p, (unsigned long)pi->usedPercent);
+    p = appendStr(out, p, "%");
+    out[p] = 0;
+}
+
+// Drive Info queries filesystem usage once on entry, not every rendered frame.
+static void HddInfo_Refresh(void)
+{
+    s_hddPartCount = 0;
+    s_hddOk = (Hdd_Identify(&s_hddInfo) == HDD_OK);
+    if (s_hddOk) {
+        File_MountDrives();
+        s_hddPartCount = Hdd_GetPartitions(s_hddParts, HDD_PART_MAX);
+    }
 }
 
 static void hddSecLine(unsigned short s, char* out)
@@ -1844,7 +1910,7 @@ static void hddSecLine(unsigned short s, char* out)
 static void HddTools_Enter(void)
 {
     s_hddToolSel = 0; s_hddArm = 0;
-    s_hddOk = (Hdd_Identify(&s_hddInfo) == HDD_OK);
+    HddInfo_Refresh();
     GotoPhase(PH_HDD_TOOLS);
 }
 
@@ -1858,17 +1924,23 @@ static void HddTools_Frame(WORD b)
     if (prev != s_hddToolSel) s_hddArm = 0;
 
     if (Pressed(b, s_prevBtn, BTN_A)) {
-        if (s_hddToolSel == 0) { GotoPhase(PH_HDD_INFO); return; }
+        if (s_hddToolSel == 0) {
+            HddInfo_Refresh();
+            GotoPhase(PH_HDD_INFO);
+            return;
+        }
         if (!s_hddOk) { SetStatus("No drive detected"); }
         else if (s_hddToolSel == 1) {                  // UNLOCK (remove security)
             if (!s_hddArm) s_hddArm = 1;
             else {
                 rc = Hdd_Unlock(); s_hddArm = 0;
                 SetStatus(rc == HDD_OK ? "Security removed"
+                    : rc == HDD_OK_VSC ? "VSC recovery used - saved E:\\Eos\\unlock.txt"
+                    : rc == HDD_OK_VSC_NOSAVE ? "VSC unlocked - password file NOT saved"
                     : rc == HDD_ERR_UNSUPP ? "Drive has no security"
                     : rc == HDD_ERR_NODISK ? "No drive detected"
                     : "Unlock FAILED");
-                s_hddOk = (Hdd_Identify(&s_hddInfo) == HDD_OK);
+                HddInfo_Refresh();
             }
         }
         else {                                       // LOCK to this console
@@ -1880,7 +1952,7 @@ static void HddTools_Frame(WORD b)
                     : rc == HDD_ERR_UNSUPP ? "Drive has no security"
                     : rc == HDD_ERR_NODISK ? "No drive detected"
                     : "Lock FAILED");
-                s_hddOk = (Hdd_Identify(&s_hddInfo) == HDD_OK);
+                HddInfo_Refresh();
             }
         }
     }
@@ -1893,7 +1965,7 @@ static void HddTools_Frame(WORD b)
 
 static void HddInfo_Frame(WORD b)
 {
-    char line[80]; int p, y;
+    char line[80]; int p, y, i;
 
     if (Pressed(b, s_prevBtn, BTN_B) || Pressed(b, s_prevBtn, BTN_A)) { GotoPhase(PH_HDD_TOOLS); return; }
 
@@ -1903,14 +1975,44 @@ static void HddInfo_Frame(WORD b)
         Font_DrawCentered(0, g_scrW, 160, "No drive detected on the primary channel.", EOS_DIM);
     }
     else {
-        y = 120;
-        Font_Draw(80, y, "Model", EOS_DIM); Font_Draw(260, y, s_hddInfo.model, EOS_WHITE); y += 40;
-        Font_Draw(80, y, "Serial", EOS_DIM); Font_Draw(260, y, s_hddInfo.serial, EOS_WHITE); y += 40;
+        // Compact the drive-identify block slightly so C/E/F/G usage fits cleanly
+        // on the same 480p screen without scrolling.
+        y = 82;
+        Font_Draw(70, y, "Model", EOS_DIM); Font_Draw(210, y, s_hddInfo.model, EOS_WHITE); y += 26;
+        Font_Draw(70, y, "Serial", EOS_DIM); Font_Draw(210, y, s_hddInfo.serial, EOS_WHITE); y += 26;
         p = 0; p = appendUInt(line, p, s_hddInfo.sizeMB / 1024); p = appendStr(line, p, " GB (");
         p = appendUInt(line, p, s_hddInfo.sizeMB); p = appendStr(line, p, " MB)"); line[p] = 0;
-        Font_Draw(80, y, "Size", EOS_DIM); Font_Draw(260, y, line, EOS_WHITE); y += 40;
+        Font_Draw(70, y, "Size", EOS_DIM); Font_Draw(210, y, line, EOS_WHITE); y += 26;
         hddSecLine(s_hddInfo.security, line);
-        Font_Draw(80, y, "Security", EOS_DIM); Font_Draw(260, y, line, EOS_WHITE); y += 40;
+        Font_Draw(70, y, "Security", EOS_DIM); Font_Draw(210, y, line, EOS_WHITE); y += 36;
+
+        Font_Draw(70, y, "PARTITIONS", EOS_PURPLE); y += 24;
+
+        if (s_hddPartCount <= 0) {
+            Font_Draw(100, y, "Partition usage unavailable.", EOS_DIM);
+        }
+        else {
+            for (i = 0; i < s_hddPartCount && i < HDD_PART_MAX; ++i) {
+                const EosPartitionInfo* pi = &s_hddParts[i];
+                char drv[4];
+                int barX = 110;
+                int barW = g_scrW - 180;
+                int fillW;
+
+                drv[0] = pi->drive; drv[1] = ':'; drv[2] = 0;
+                hddPartLine(pi, line);
+
+                Font_Draw(70, y, drv, EOS_WHITE);
+                Font_Draw(110, y, line, EOS_DIM);
+
+                // Small percentage bar directly beneath the numeric usage line.
+                fillW = (barW * (int)pi->usedPercent) / 100;
+                Gfx_Fill((float)barX, (float)(y + 19), (float)barW, 7.0f, EOS_ARGB(72, 255, 255, 255));
+                if (fillW > 0)
+                    Gfx_Fill((float)barX, (float)(y + 19), (float)fillW, 7.0f, EOS_PURPLE);
+                y += 40;
+            }
+        }
     }
     Ui_Footer("B  BACK");
     Gfx_End();

@@ -1,43 +1,46 @@
 #pragma once
 // eos_hdd.h -- ATA hard-disk tools for the OG Xbox (primary master).
 //
-// Raw ATA over the IDE ports (0x1F0), same in/out style as the flash driver.
-// IDENTIFY reads model/serial/size/security; the lock/unlock password is
-// HMAC-SHA1(XboxHDKey, model || serial) -- the kernel's decrypted HDD key, so
-// no EEPROM crypto is needed here. Unlock removes security (unlock + disable);
-// Lock enables it with this console's key. Both are guarded in the UI; Lock can
-// lock a drive to this console, so it confirms first.
-//
-// ATA command-send logic ported from PrometheOS XKHDD (hardware-validated).
-#pragma once
+// Normal lock/unlock uses the console-derived HDD password. If normal unlock
+// fails and security remains enabled, Hdd_Unlock() transparently falls back to
+// eos_vsc (PrometheOS-derived WD/Seagate vendor recovery).
 
-#define HDD_OK           0
-#define HDD_ERR_NODISK  -1   // IDENTIFY failed (no master drive / timeout)
-#define HDD_ERR_UNSUPP  -2   // drive doesn't support ATA security
-#define HDD_ERR_STATE   -3   // wrong precondition (e.g. lock when already enabled)
-#define HDD_ERR_ATA     -4   // a security command didn't take
+#define HDD_OK              0
+#define HDD_OK_VSC          1   // VSC fallback succeeded + credentials saved
+#define HDD_OK_VSC_NOSAVE   2   // VSC fallback succeeded, unlock.txt write failed
+#define HDD_ERR_NODISK     -1
+#define HDD_ERR_UNSUPP     -2
+#define HDD_ERR_STATE      -3
+#define HDD_ERR_ATA        -4
 
-// ATA IDENTIFY word-128 security-status bits.
 #define HDD_SEC_SUPPORTED 0x0001
 #define HDD_SEC_ENABLED   0x0002
 #define HDD_SEC_LOCKED    0x0004
 #define HDD_SEC_FROZEN    0x0008
 
+#define HDD_PART_MAX 4
+
 typedef struct EosHddInfo {
-    int            present;        // IDENTIFY succeeded
-    char           model[44];      // trimmed, byte-swap corrected
-    char           serial[24];     // trimmed
-    unsigned short security;       // raw word 128
-    unsigned long  sizeMB;         // capacity in MB
+    int            present;
+    char           model[44];
+    char           serial[24];
+    unsigned short security;
+    unsigned long  sizeMB;
 } EosHddInfo;
 
-// ATA IDENTIFY on the primary master and parse it. Returns HDD_OK / HDD_ERR_*.
+typedef struct EosPartitionInfo {
+    char          drive;        // C/E/F/G
+    int           present;
+    unsigned long totalMB;
+    unsigned long freeMB;
+    unsigned long usedMB;
+    unsigned int  usedPercent;
+} EosPartitionInfo;
+
 int Hdd_Identify(EosHddInfo* out);
-
-// Remove security from the primary master: ATA UNLOCK then DISABLE using the
-// console-derived password. No-op (HDD_OK) if already unlocked.
 int Hdd_Unlock(void);
-
-// Enable security on the primary master, locking it to THIS console's key
-// (sets master + user passwords). Refuses if already enabled. DANGER.
 int Hdd_Lock(void);
+
+// Query user-facing Xbox partitions C/E/F/G. Missing volumes are skipped.
+// Returns the number of valid entries written to out (0..maxCount).
+int Hdd_GetPartitions(EosPartitionInfo* out, int maxCount);

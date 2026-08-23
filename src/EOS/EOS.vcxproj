@@ -52,6 +52,7 @@
     <ClCompile Include="eos_theme.cpp" />
     <ClCompile Include="eos_theme_custom.cpp" />
     <ClCompile Include="eos_ui.cpp" />
+    <ClCompile Include="eos_vsc.cpp" />
     <ClCompile Include="ff.c" />
     <ClCompile Include="ffunicode.c" />
     <ClCompile Include="input.cpp" />
@@ -103,6 +104,7 @@
     <ClInclude Include="eos_theme.h" />
     <ClInclude Include="eos_theme_custom.h" />
     <ClInclude Include="eos_ui.h" />
+    <ClInclude Include="eos_vsc.h" />
     <ClInclude Include="ff.h" />
     <ClInclude Include="ffconf.h" />
     <ClInclude Include="input.h" />
