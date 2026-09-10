@@ -19,6 +19,7 @@
 #include "eos_clock.h"
 #include "eos_theme.h"
 #include "eos_config.h"
+#include "eos_bank.h"
 #include "eos_theme_custom.h"  // disk theme scan/apply/set.dat
 #include "eos_rtc.h"           // X-RTC presence for the Date & Time screen
 #include "eos_lcd.h"           // LCD settings screen
@@ -38,9 +39,9 @@
 #define INFO_LX   70
 #define INFO_VX   300
 
-enum Sub { SUB_HUB = 0, SUB_SYSINFO, SUB_VIDEO, SUB_AUDIO, SUB_REGION, SUB_NETWORK, SUB_DATETIME, SUB_THEME, SUB_LCD };
+enum Sub { SUB_HUB = 0, SUB_SYSINFO, SUB_VIDEO, SUB_AUDIO, SUB_AUTOBOOT, SUB_REGION, SUB_NETWORK, SUB_DATETIME, SUB_THEME, SUB_LCD };
 
-static const char* k_hub[] = { "Audio", "Date & Time", "LCD", "Network", "Region", "System Info", "Theme", "Video" };
+static const char* k_hub[] = { "Audio", "Auto Boot", "Date & Time", "LCD", "Network", "Region", "System Info", "Theme", "Video" };
 #define HUB_COUNT ((int)(sizeof(k_hub) / sizeof(k_hub[0])))
 
 static int       s_sub = SUB_HUB;
@@ -128,10 +129,11 @@ static int hubFrame(WORD b, WORD prev)
         s_row = 0;
         switch (s_sel) {
         case 0: s_sub = SUB_AUDIO;  s_aflags = Nvram_GetAudioFlags(); break;
-        case 1: s_sub = SUB_DATETIME; Clock_Get(&s_dt); s_dtField = 0; break;
-        case 2: s_sub = SUB_LCD; s_row = 0; break;
-        case 3: s_sub = SUB_NETWORK; networkEnter(); break;
-        case 4: s_sub = SUB_REGION; Eeprom_Read(&s_eep);
+        case 1: s_sub = SUB_AUTOBOOT; break;
+        case 2: s_sub = SUB_DATETIME; Clock_Get(&s_dt); s_dtField = 0; break;
+        case 3: s_sub = SUB_LCD; s_row = 0; break;
+        case 4: s_sub = SUB_NETWORK; networkEnter(); break;
+        case 5: s_sub = SUB_REGION; Eeprom_Read(&s_eep);
             s_dvd = Nvram_GetDvdRegion(); s_lang = Nvram_GetLanguage();
             s_vstdSel = (s_eep.avRegion == EE_VS_NTSC_J) ? 1
                 : (s_eep.avRegion == EE_VS_PAL_I) ? 2
@@ -142,14 +144,47 @@ static int hubFrame(WORD b, WORD prev)
                 s_grSel = (gr == EE_REGION_JAPAN) ? 1 : (gr == EE_REGION_EURO) ? 2 : 0;
             }
             s_vstdArm = 0; s_grArm = 0; s_regMsg = 0; break;
-        case 5: s_sub = SUB_SYSINFO; Eeprom_Read(&s_eep); Console_Read(&s_con); break;
-        case 6: s_sub = SUB_THEME; themeEnter(); break;
-        case 7: s_sub = SUB_VIDEO;  s_vflags = Nvram_GetVideoFlags(); break;
+        case 6: s_sub = SUB_SYSINFO; Eeprom_Read(&s_eep); Console_Read(&s_con); break;
+        case 7: s_sub = SUB_THEME; themeEnter(); break;
+        case 8: s_sub = SUB_VIDEO;  s_vflags = Nvram_GetVideoFlags(); break;
         }
     }
     titleBar("SETTINGS");
     Ui_Menu3D(k_hub, HUB_COUNT, s_sel);
     footer("D-PAD  MOVE      A  OPEN      B  BACK");
+    return 0;
+}
+
+// ---- auto boot -------------------------------------------------------------
+static int autoBootFrame(WORD b, WORD prev)
+{
+    int idx = Bank_AutoBootIndex();
+    int seconds = Config_GetAutoBootTimeout();
+    char sec[16];
+    int p;
+
+    if (Pressed(b, prev, BTN_B) || Pressed(b, prev, BTN_A)) { s_sub = SUB_HUB; return 0; }
+
+    if (Pressed(b, prev, BTN_DPAD_LEFT)) {
+        Config_SetAutoBootTimeout(seconds - 1);
+        seconds = Config_GetAutoBootTimeout();
+    }
+    if (Pressed(b, prev, BTN_DPAD_RIGHT)) {
+        Config_SetAutoBootTimeout(seconds + 1);
+        seconds = Config_GetAutoBootTimeout();
+    }
+
+    p = uitoa((unsigned)seconds, sec);
+    sec[p++] = ' '; sec[p++] = 's'; sec[p] = 0;
+
+    titleBar("AUTO BOOT");
+    rowPill(LIST_Y0, 0, 1, "Target BIOS", (idx >= 0) ? Bank_Name(idx) : "Not configured");
+    rowPill(LIST_Y0 + LIST_DY, 1, 0, "Timeout", sec);
+    Font_DrawCentered(0, g_scrW, LIST_Y0 + LIST_DY * 3,
+        "Set or clear the target with WHITE in Bank Management.", EOS_DIM);
+    Font_DrawCentered(0, g_scrW, LIST_Y0 + LIST_DY * 3 + 24,
+        "During countdown: B or EJECT cancels auto boot.", EOS_PURPLE);
+    footer("LEFT / RIGHT  TIMEOUT      A / B  BACK");
     return 0;
 }
 
@@ -789,6 +824,7 @@ int Settings_Frame(WORD b, WORD prevBtn)
     case SUB_SYSINFO:  return sysinfoFrame(b, prevBtn);
     case SUB_VIDEO:    return videoFrame(b, prevBtn);
     case SUB_AUDIO:    return audioFrame(b, prevBtn);
+    case SUB_AUTOBOOT: return autoBootFrame(b, prevBtn);
     case SUB_REGION:   return regionFrame(b, prevBtn);
     case SUB_NETWORK:  return networkFrame(b, prevBtn);
     case SUB_DATETIME: return datetimeFrame(b, prevBtn);

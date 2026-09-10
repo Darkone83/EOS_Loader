@@ -15,7 +15,7 @@ bool Font_Init()
 {
     int i, n = FONT_ATLAS_W * FONT_ATLAS_H;
     for (i = 0; i < n; ++i)
-        s_argb[i] = ((DWORD)FONT_ATLAS[i] << 24) | 0x00FFFFFF;   // white + coverage alpha
+        s_argb[i] = ((DWORD)FONT_ATLAS[i] << 24) | 0x00FFFFFF;
     s_atlas = Gfx_CreateTexARGB(FONT_ATLAS_W, FONT_ATLAS_H, s_argb);
     return (s_atlas != 0);
 }
@@ -33,7 +33,18 @@ static const short* glyph(int c)
 
 static int spaceAdv(void) { return FONT_GLYPH[' ' - FONT_FIRST][6]; }
 
-int Font_TextWidth(const char* s)
+// 480p readability trim.  The baked atlas is only 22px high and is drawn 1:1
+// at 480p, while HD modes naturally receive filtered enlargement.  A small
+// progressive-only bump keeps the text legible without disturbing the 640x480
+// authored layout.  This is deliberately one constant so it is easy to tune.
+#define FONT_480P_SCALE 1.08f
+
+static float modeScale(void)
+{
+    return g_is480p ? FONT_480P_SCALE : 1.0f;
+}
+
+static int rawTextWidth(const char* s)
 {
     int w = 0, i;
     if (!s) return 0;
@@ -44,23 +55,14 @@ int Font_TextWidth(const char* s)
     return w;
 }
 
+int Font_TextWidth(const char* s)
+{
+    return (int)((float)rawTextWidth(s) * modeScale() + 0.5f);
+}
+
 int Font_Draw(int x, int y, const char* s, DWORD color)
 {
-    int   cx = x, i;
-    float aw = (float)FONT_ATLAS_W, ah = (float)FONT_ATLAS_H;
-    if (!s) return x;
-    for (i = 0; s[i]; ++i) {
-        const short* g = glyph((unsigned char)s[i]);
-        if (!g) { cx += spaceAdv(); continue; }
-        if (g[2] > 0 && g[3] > 0) {                       // glyph has ink
-            float u0 = (float)g[0] / aw, v0 = (float)g[1] / ah;
-            float u1 = (float)(g[0] + g[2]) / aw, v1 = (float)(g[1] + g[3]) / ah;
-            Gfx_DrawTex(s_atlas, (float)(cx + g[4]), (float)(y + g[5]),
-                (float)g[2], (float)g[3], u0, v0, u1, v1, color);
-        }
-        cx += g[6];                                       // proportional advance
-    }
-    return cx;
+    return Font_DrawScaled(x, y, s, color, 1.0f);
 }
 
 int Font_DrawCentered(int x0, int width, int y, const char* s, DWORD color)
@@ -71,14 +73,15 @@ int Font_DrawCentered(int x0, int width, int y, const char* s, DWORD color)
     return sx;
 }
 
-// Scaled text: same atlas, glyph metrics multiplied by k (e.g. 0.72 for a
-// smaller HUD line). Position offsets, quad size, and advance all scale, so the
-// baseline stays at y and spacing stays proportional.
 int Font_DrawScaled(int x, int y, const char* s, DWORD color, float k)
 {
     float cx = (float)x, aw = (float)FONT_ATLAS_W, ah = (float)FONT_ATLAS_H;
     int i;
     if (!s) return x;
+
+    k *= modeScale();
+    if (g_is480p) Gfx_SetFilter(TRUE);
+
     for (i = 0; s[i]; ++i) {
         const short* g = glyph((unsigned char)s[i]);
         if (!g) { cx += (float)spaceAdv() * k; continue; }
@@ -90,33 +93,41 @@ int Font_DrawScaled(int x, int y, const char* s, DWORD color, float k)
         }
         cx += (float)g[6] * k;
     }
+
+    if (g_is480p) Gfx_SetFilter(FALSE);
     return (int)(cx + 0.5f);
 }
 
 int Font_TextWidthScaled(const char* s, float k)
 {
-    return (int)((float)Font_TextWidth(s) * k + 0.5f);
+    return (int)((float)rawTextWidth(s) * k * modeScale() + 0.5f);
 }
+
 // Emit a string as real 3D geometry on a tilted pill face. Glyphs are laid out
 // in the face's local space (centered about cx, vertically about cy), each one
-// emitted via Gfx_Quad3DP so it tilts/recedes with the pill. Screen-y-down atlas
+// emitted via Gfx_Quad3DP so it tilts/recedes with its pill. Screen-y-down atlas
 // is flipped to world-y-up.
 void Font_Draw3D(float cx, float cy, float cz, float ca, float sa,
     float k, const char* s, DWORD color)
 {
     float aw = (float)FONT_ATLAS_W, ah = (float)FONT_ATLAS_H;
-    float tw = (float)Font_TextWidth(s) * k;          // total advance width (world)
-    float penX = -tw * 0.5f;                            // left edge in face-local space
-    float topY = (float)FONT_CH * 0.5f * k;            // line top (local, world-up)
+    float tw, penX, topY;
     int i;
     if (!s) return;
+
+    k *= modeScale();
+    tw = (float)rawTextWidth(s) * k;
+    penX = -tw * 0.5f;
+    topY = (float)FONT_CH * 0.5f * k;
+    if (g_is480p) Gfx_SetFilter(TRUE);
+
     for (i = 0; s[i]; ++i) {
         const short* g = glyph((unsigned char)s[i]);
         if (!g) { penX += (float)spaceAdv() * k; continue; }
         if (g[2] > 0 && g[3] > 0) {
             float gw = (float)g[2] * k, gh = (float)g[3] * k;
-            float lcx = penX + (float)g[4] * k + gw * 0.5f;       // glyph center x (local)
-            float lcy = topY - (float)g[5] * k - gh * 0.5f;       // glyph center y (local)
+            float lcx = penX + (float)g[4] * k + gw * 0.5f;
+            float lcy = topY - (float)g[5] * k - gh * 0.5f;
             float u0 = (float)g[0] / aw, v0 = (float)g[1] / ah;
             float u1 = (float)(g[0] + g[2]) / aw, v1 = (float)(g[1] + g[3]) / ah;
             Gfx_Quad3DP(cx, cy, cz, ca, sa, lcx, lcy, gw * 0.5f, gh * 0.5f,
@@ -124,4 +135,6 @@ void Font_Draw3D(float cx, float cy, float cz, float ca, float sa,
         }
         penX += (float)g[6] * k;
     }
+
+    if (g_is480p) Gfx_SetFilter(FALSE);
 }

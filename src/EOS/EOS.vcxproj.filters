@@ -150,6 +150,12 @@
     <ClCompile Include="eos_vsc.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="eos_xboxrgb.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="eos_fan.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Text Include="Media\Copy Assets Here.txt">
@@ -302,6 +308,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="eos_vsc.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="eos_xboxrgb.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="eos_fan.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

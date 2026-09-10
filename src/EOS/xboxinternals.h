@@ -1,4 +1,4 @@
-#pragma once
+
 
 #include <xtl.h>
 
@@ -345,6 +345,7 @@ extern "C"
 	NTSTATUS WINAPI HalWriteSMBusValue(UCHAR devddress, UCHAR offset, UCHAR writedw, DWORD data);
 	NTSTATUS WINAPI HalReadSMBusValue(UCHAR devddress, UCHAR offset, UCHAR readdw, DWORD* pdata);
 	NTSTATUS WINAPI HalReadSMCTrayState(ULONG* TrayState, ULONG* EjectCount);
+	VOID WINAPI HalEnableSecureTrayEject(VOID);
 
 	NTSTATUS WINAPI XNetLoadConfigParams(XNetConfigParams* params);
 	NTSTATUS WINAPI XNetSaveConfigParams(const XNetConfigParams* params);
@@ -385,4 +386,4 @@ extern "C"
 #define HalReadSMBusByte(SlaveAddress, CommandCode, DataValue) HalReadSMBusValue(SlaveAddress, CommandCode, FALSE, DataValue)
 #define HalReadSMBusWord(SlaveAddress, CommandCode, DataValue) HalReadSMBusValue(SlaveAddress, CommandCode, TRUE, DataValue)
 #define HalWriteSMBusByte(SlaveAddress, CommandCode, DataValue) HalWriteSMBusValue(SlaveAddress, CommandCode, FALSE, DataValue)
-#define HalWriteSMBusWord(SlaveAddress, CommandCode, DataValue) HalWriteSMBusValue(SlaveAddress, CommandCode, TRUE, DataValue)
+#define HalWriteSMBusWord(SlaveAddress, CommandCode, DataValue) HalWriteSMBu

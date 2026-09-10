@@ -25,6 +25,7 @@
     <ClCompile Include="eos_eeprom_io.cpp" />
     <ClCompile Include="eos_ee_crypto.cpp" />
     <ClCompile Include="eos_ee_data.cpp" />
+    <ClCompile Include="eos_fan.cpp" />
     <ClCompile Include="eos_file.cpp" />
     <ClCompile Include="eos_firmware_io.cpp" />
     <ClCompile Include="eos_flash.cpp" />
@@ -53,6 +54,7 @@
     <ClCompile Include="eos_theme_custom.cpp" />
     <ClCompile Include="eos_ui.cpp" />
     <ClCompile Include="eos_vsc.cpp" />
+    <ClCompile Include="eos_xboxrgb.cpp" />
     <ClCompile Include="ff.c" />
     <ClCompile Include="ffunicode.c" />
     <ClCompile Include="input.cpp" />
@@ -77,6 +79,7 @@
     <ClInclude Include="eos_eeprom_io.h" />
     <ClInclude Include="eos_ee_crypto.h" />
     <ClInclude Include="eos_ee_data.h" />
+    <ClInclude Include="eos_fan.h" />
     <ClInclude Include="eos_file.h" />
     <ClInclude Include="eos_firmware_io.h" />
     <ClInclude Include="eos_flash.h" />
@@ -105,6 +108,7 @@
     <ClInclude Include="eos_theme_custom.h" />
     <ClInclude Include="eos_ui.h" />
     <ClInclude Include="eos_vsc.h" />
+    <ClInclude Include="eos_xboxrgb.h" />
     <ClInclude Include="ff.h" />
     <ClInclude Include="ffconf.h" />
     <ClInclude Include="input.h" />

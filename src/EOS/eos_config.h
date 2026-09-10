@@ -35,3 +35,15 @@ int         Config_GetBgmOn(void);
 void        Config_SetBgmOn(int on);
 const char* Config_GetBgmPath(void);
 void        Config_SetBgmPath(const char* path);
+
+// Fan control (persisted in settings bank). Auto is the backward-compatible
+// default. Manual percent is retained even while Auto is selected so returning
+// to Manual restores the user's last requested duty.
+int  Config_GetFanManual(void);
+int  Config_GetFanPercent(void);
+int  Config_SetFan(int manualMode, int percent);
+
+// BIOS auto-boot countdown. The target itself is a per-bank flag in the bank
+// table; only this timeout lives in the settings block. Range: 2..30 seconds.
+int  Config_GetAutoBootTimeout(void);
+int  Config_SetAutoBootTimeout(int seconds);

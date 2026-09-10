@@ -80,6 +80,7 @@ typedef struct {
 
 #define EOS_CLUSTER_16K 0x00004000UL
 #define EOS_IOCTL_DISK_GET_DRIVE_GEOMETRY 0x00070000UL
+#define EOS_IOCTL_SUBCMD_GET_INFO          0UL
 
 /* drive letters that make up the standard layout, in table order +1 */
 static const char s_lyrLetter[6] = { 'E','C','X','Y','Z','F' };
@@ -162,13 +163,20 @@ const char* Format_ErrStr(int code)
 static int fmtReadGeometry(unsigned long long* totalSectors, unsigned long* bytesPerSector)
 {
     STRING dev; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK iosb; HANDLE h; NTSTATUS st;
-    EOS_DISK_GEOMETRY g; char path[40];
+    EOS_DISK_GEOMETRY g; unsigned int geomIn[100]; char path[40];
     fmtDevicePath(0, path); RtlInitAnsiString(&dev, path);
     oa.RootDirectory = 0; oa.ObjectName = &dev; oa.Attributes = OBJ_CASE_INSENSITIVE;
     st = NtOpenFile(&h, (GENERIC_READ | 0x00100000), &oa, &iosb, (FILE_SHARE_READ | FILE_SHARE_WRITE), 0x10);
     if (st != STATUS_SUCCESS) return 0;
+
+    /* Match PrometheOS/XBpartitioner here.  Both issue the geometry query with
+       a 100-DWORD GET_INFO input buffer; EOS previously passed NULL/0.  Keep
+       the request shape identical to the known-good large-drive path. */
+    fmtMemSet(geomIn, 0, sizeof(geomIn));
+    geomIn[0] = (unsigned int)EOS_IOCTL_SUBCMD_GET_INFO;
     fmtMemSet(&g, 0, sizeof(g));
-    st = NtDeviceIoControlFile(h, 0, 0, 0, &iosb, EOS_IOCTL_DISK_GET_DRIVE_GEOMETRY, 0, 0, &g, sizeof(g));
+    st = NtDeviceIoControlFile(h, 0, 0, 0, &iosb, EOS_IOCTL_DISK_GET_DRIVE_GEOMETRY,
+        geomIn, sizeof(geomIn), &g, sizeof(g));
     NtClose(h);
     if (st != STATUS_SUCCESS) return 0;
     if (totalSectors)   *totalSectors = (unsigned long long)g.Cylinders.QuadPart;
@@ -176,12 +184,13 @@ static int fmtReadGeometry(unsigned long long* totalSectors, unsigned long* byte
     return 1;
 }
 
-/* Write the table to sector 0 and a backup at the end of the disk. */
-static int fmtWriteTable(const EosPartTable* t, unsigned long long totalSectors, unsigned long bps)
+/* Write the table to sector 0 and a backup at the physical end of Partition0.
+   PrometheOS deliberately asks the device for its allocation size here instead
+   of deriving the backup offset from the earlier geometry result. */
+static int fmtWriteTable(const EosPartTable* t)
 {
     STRING dev; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK iosb; HANDLE h; NTSTATUS st;
-    LARGE_INTEGER off; char path[40];
-    unsigned long long totalBytes = totalSectors * (unsigned long long)bps;
+    LARGE_INTEGER off; FILE_FS_SIZE_INFORMATION fsi; char path[40];
 
     fmtDevicePath(0, path); RtlInitAnsiString(&dev, path);
     InitializeObjectAttributes(&oa, &dev, OBJ_CASE_INSENSITIVE, 0);
@@ -193,13 +202,17 @@ static int fmtWriteTable(const EosPartTable* t, unsigned long long totalSectors,
     st = NtWriteFile(h, 0, 0, 0, &iosb, (PVOID)t, sizeof(EosPartTable), &off);
     if (st != STATUS_SUCCESS) { NtClose(h); return 0; }
 
-    if (totalBytes > sizeof(EosPartTable)) {
-        off.QuadPart = (LONGLONG)(totalBytes - sizeof(EosPartTable));
-        st = NtWriteFile(h, 0, 0, 0, &iosb, (PVOID)t, sizeof(EosPartTable), &off);
-        if (st != STATUS_SUCCESS) { NtClose(h); return 0; }
-    }
+    fmtMemSet(&fsi, 0, sizeof(fsi));
+    st = NtQueryVolumeInformationFile(h, &iosb, &fsi, sizeof(fsi), FileFsSizeInformation);
+    if (st != STATUS_SUCCESS) { NtClose(h); return 0; }
+
+    off.QuadPart = fsi.TotalAllocationUnits.QuadPart *
+        (LONGLONG)(fsi.BytesPerSector * fsi.SectorsPerAllocationUnit);
+    if (off.QuadPart < (LONGLONG)sizeof(EosPartTable)) { NtClose(h); return 0; }
+    off.QuadPart -= (LONGLONG)sizeof(EosPartTable);
+    st = NtWriteFile(h, 0, 0, 0, &iosb, (PVOID)t, sizeof(EosPartTable), &off);
     NtClose(h);
-    return 1;
+    return (st == STATUS_SUCCESS);
 }
 
 /* prom largePartitionFixup: correct on-disk SectorsPerCluster (0) for big F:. */
@@ -280,17 +293,17 @@ int Format_StageDrive(void)
     return FMT_OK;
 #else
     EosPartTable table;
-    unsigned long long total = 0; unsigned long bps = 512;
+    unsigned long long total = 0;
     int i, rc = FMT_OK;
 
-    if (!fmtReadGeometry(&total, &bps) || total == 0) return FMT_ERR_GEOM;
+    if (!fmtReadGeometry(&total, 0) || total == 0) return FMT_ERR_GEOM;
 
     fmtBuildTable(total, &table);
 
     /* drop every drive letter so the table write + formats have the disk. */
     for (i = 0; i < 6; ++i) fmtUnmount(s_lyrLetter[i], s_lyrPartNum[i]);
 
-    if (!fmtWriteTable(&table, total, bps)) { rc = FMT_ERR_TABLE; goto remount; }
+    if (!fmtWriteTable(&table)) { rc = FMT_ERR_TABLE; goto remount; }
 
     for (i = 0; i < 14; ++i) {
         EosPartEntry* e = &table.TableEntries[i];
@@ -366,6 +379,31 @@ int main(void)
         fails += chkEntry(&t, 4, "XBOX CACHE Z", CACHE_Z_START, CACHE_SIZE);
         fails += chkEntry(&t, 5, "DRIVE F", DATA_F_START, fSize);
         if (t.TableEntries[6].Flags != EOS_PART_NOTINUSE) { printf("FAIL e6 should be unused\n"); ++fails; }
+    }
+
+    /* full-capacity regression checks: F always consumes every sector after
+       the fixed Xbox partitions, except the final backup-table sector. */
+    {
+        static const unsigned long long totals[] = {
+            1953125000ULL,   /* 1 TB decimal */
+            3906250000ULL,   /* 2 TB decimal */
+            7812500000ULL,   /* 4 TB decimal */
+            15625000000ULL   /* 8 TB decimal */
+        };
+        static const unsigned long clusters[] = { 64, 128, 256, 512 };
+        int n;
+        for (n = 0; n < 4; ++n) {
+            unsigned long long want = totals[n] - DATA_F_START - 1ULL;
+            fmtBuildTable(totals[n], &t);
+            if (fmtGetSize(&t.TableEntries[5]) != want) {
+                printf("FAIL full-capacity %d size %llX want %llX\n", n,
+                    fmtGetSize(&t.TableEntries[5]), want); ++fails;
+            }
+            if (fmtCalcClusterKB(want) != clusters[n]) {
+                printf("FAIL full-capacity %d cluster %lu want %lu\n", n,
+                    fmtCalcClusterKB(want), clusters[n]); ++fails;
+            }
+        }
     }
 
     /* cluster doubling threshold is 0x20000000 sectors (256 GB) */

@@ -5,16 +5,16 @@
 // The FPGA bank register persists across a warm reset, so to boot a bank we:
 //     out 0xEF, <bank>           ; select (survives the warm reset)
 //     clear PIC scratch NO_ANIMATION bit       ; ensure BIOS animation is allowed
-//     HalReturnToFirmware(REBOOT)               ; kernel-managed warm reboot
+//     release PIC LED override                  ; return front-panel control
+//     PIC/SMC power cmd RESET                    ; hardware warm reset
 //
-// Directly commanding the PIC/SMC to reset bypasses the normal Xbox firmware
-// re-entry handoff and can preserve stale scratch-register state.
+// Use the direct PIC/SMC warm-reset path for the final BIOS handoff.
 //
 // RXDK / MSVC2003 constraints: declarations before statements, file-scope
 // statics, no CRT string funcs.
 #include "eos_bank.h"
 #include "eos_flash.h"
-#include "xboxinternals.h"   // PIC scratch register + HalReturnToFirmware
+#include "xboxinternals.h"   // PIC scratch/LED/power registers
 
 struct EosBank {
     unsigned char ef;
@@ -23,6 +23,7 @@ struct EosBank {
     unsigned char occupied;
     unsigned char size_code;
     unsigned char locked;      // 1 = system bank: no user delete / flash / rename
+    unsigned char auto_boot;   // 1 = boot this user bank after loader timeout
 };
 
 static EosBank s_banks[EOS_BANK_MAX];
@@ -45,6 +46,7 @@ static void addBank(unsigned char ef, const char* nm, unsigned char occ, unsigne
     s_banks[s_count].occupied = occ;
     s_banks[s_count].size_code = sz;
     s_banks[s_count].locked = lock;
+    s_banks[s_count].auto_boot = 0;
     ++s_count;
 }
 
@@ -119,6 +121,50 @@ void Bank_SetOccupied(int idx, int occupied, int sizeCode)
     if (idx < 0 || idx >= s_count) return;
     s_banks[idx].occupied = (unsigned char)(occupied ? 1 : 0);
     s_banks[idx].size_code = (unsigned char)sizeCode;
+    if (!occupied) s_banks[idx].auto_boot = 0;
+}
+
+int Bank_IsAutoBoot(int idx)
+{
+    unsigned char ef;
+    ensureInit();
+    if (idx < 0 || idx >= s_count) return 0;
+    ef = s_banks[idx].ef;
+    if (ef < 0x3 || ef > 0x6) return 0;
+    return (s_banks[idx].occupied && s_banks[idx].auto_boot) ? 1 : 0;
+}
+
+void Bank_SetAutoBoot(int idx, int enabled)
+{
+    int i;
+    unsigned char ef;
+    ensureInit();
+    if (idx < 0 || idx >= s_count) return;
+    ef = s_banks[idx].ef;
+
+    // Banks 1-4 only. Empty banks cannot become an auto-boot target.
+    if (ef < 0x3 || ef > 0x6 || !s_banks[idx].occupied) {
+        s_banks[idx].auto_boot = 0;
+        return;
+    }
+
+    if (!enabled) {
+        s_banks[idx].auto_boot = 0;
+        return;
+    }
+
+    // Exactly one auto-boot BIOS at a time.
+    for (i = 0; i < s_count; ++i) s_banks[i].auto_boot = 0;
+    s_banks[idx].auto_boot = 1;
+}
+
+int Bank_AutoBootIndex(void)
+{
+    int i;
+    ensureInit();
+    for (i = 0; i < s_count; ++i)
+        if (Bank_IsAutoBoot(i)) return i;
+    return -1;
 }
 
 // Fully clear a slot after its flash is erased: mark empty, drop to the default
@@ -129,6 +175,7 @@ void Bank_ClearEntry(int idx)
     if (idx < 0 || idx >= s_count) return;
     s_banks[idx].occupied = 0;
     s_banks[idx].size_code = EOS_BANK_SIZE_256K;
+    s_banks[idx].auto_boot = 0;
     copyName(s_banks[idx].name, s_banks[idx].defname);
 }
 
@@ -206,10 +253,33 @@ static unsigned char io_in8(unsigned short port)
     return v;
 }
 
+// --- MakeMHz XboxHD+ 1.0/1.1 NV2A freeze workaround --------------------------
+// Production XboxHD+ kpatch and XeniumOS v2.3.5 both apply this exact PFIFO
+// state before handing off a Conexant/pre-1.6 HD+ boot:
+//   NV_PFIFO_CACHE1_DMA_SUBROUTINE (0xFD00124C) = 0
+//   NV_PFIFO_CACHE1_PULL0          (0xFD001250) = 0x00007800
+//
+// EOS's user BIOS EFs are 0x3..0x9 (native 256K plus oversized aliases). Keep
+// this out of Recovery/XbDiag/TSOP paths. This test targets the current pre-1.6
+// Conexant system; production can additionally gate by encoder/1.6 state.
+static void hdplus_apply_nv2a_freeze_fix(unsigned char ef)
+{
+    volatile DWORD* dma_subroutine;
+    volatile DWORD* pull0;
+
+    if (ef < 0x03 || ef > 0x09) return;
+
+    dma_subroutine = (volatile DWORD*)0xFD00124C;
+    pull0 = (volatile DWORD*)0xFD001250;
+
+    *dma_subroutine = 0x00000000;
+    *pull0 = 0x00007800;
+}
+
 // --- clean BIOS reboot handoff -------------------------------------------------
 // The PIC scratch register survives a warm reset. Bit 0x04 explicitly suppresses
 // the boot animation, so preserve every other scratch flag but clear that one.
-// Then use the kernel firmware re-entry path instead of directly resetting the SMC.
+// Then release the LED override and issue the direct PIC/SMC warm reset.
 static void reboot_to_firmware(void)
 {
     DWORD scratch;
@@ -220,9 +290,14 @@ static void reboot_to_firmware(void)
             scratch & ~((DWORD)SCRATCH_REGISTER_BITVALUE_NO_ANIMATION));
     }
 
-    HalReturnToFirmware(RETURN_FIRMWARE_REBOOT);
+    // Release any loader-requested front-panel LED override so the SMC / next
+    // BIOS owns the Xbox LED state after the warm handoff.
+    HalWriteSMBusByte(SMBDEV_PIC16L, PIC16L_CMD_LED_MODE, 0x00);
 
-    // HalReturnToFirmware should never return.
+    // Direct hardware warm reset: PIC power command 0x02, subcommand 0x01.
+    HalWriteSMBusByte(SMBDEV_PIC16L, PIC16L_CMD_POWER, POWER_SUBCMD_RESET);
+
+    // The SMC should assert reset within milliseconds; never fall through.
     for (;;) {}
 }
 
@@ -239,6 +314,10 @@ void Bank_LaunchEf(unsigned char ef)
     volatile int s;
     io_out8(0x00EF, ef);
     for (s = 0; s < 200000; ++s) {}
+
+    // Apply the same NV2A PFIFO workaround MakeMHz added to XeniumOS for the
+    // HD+ 1.0/1.1 freeze before the warm BIOS handoff.
+
     reboot_to_firmware();
 }
 
@@ -264,7 +343,11 @@ void Bank_Launch(int idx)
     // 2) small settle so the 0xEF write completes on the LPC bus before reset
     for (s = 0; s < 200000; ++s) {}
 
-    // 3) Clear stale NO_ANIMATION state and perform a normal firmware reboot.
+    // 3) Apply MakeMHz's production HD+ 1.0/1.1 NV2A PFIFO freeze workaround.
+    //    This is deliberately after the bank/LPC settle and immediately before
+    //    firmware re-entry, matching the modchip-OS handoff role XeniumOS used.
+
+    // 4) Clear stale NO_ANIMATION state and perform a normal firmware reboot.
     //    The FPGA bank latch persists across this warm reset.
     reboot_to_firmware();
 }

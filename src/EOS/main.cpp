@@ -1,4 +1,4 @@
-// main.cpp -- EOS Loader entry point.
+
 // Flow: goddess splash (fade-in, skippable) -> main menu loop.
 // Menu items are selectable stubs for the POC (Launch Bank / Bank Management /
 // Settings). The loader never exits; Launch Bank will later write the Eos 0xEF
@@ -11,6 +11,7 @@
 #include "eos_splash.h"
 #include "eos_menu.h"
 #include "input.h"
+#include "xboxinternals.h"   // HalReadSMCTrayState for physical Eject cancel
 #include "eos_bank.h"
 #include "eos_descriptor.h"
 #include "eos_led.h"
@@ -19,6 +20,7 @@
 #include "eos_eeprom_io.h"
 #include "eos_firmware_io.h"
 #include "eos_hdd.h"
+#include "eos_fan.h"
 #include "eos_format.h"
 #include "eos_flash.h"
 #include "eos_file.h"
@@ -31,8 +33,16 @@
 #include "eos_cerbios.h"        // Cerbios .ini editor + overclock calculator
 #include "eos_ui.h"
 #include "dd_net.h"
+#include "eos_xboxrgb.h"  // optional XBOX-RGB LAN discovery + bank handoff effect
 #include "eos_http.h"
 #include "dd_ftp.h"
+
+// Experimental A/B control for the FPGA onboard HDMI HUD engine.
+// 1 = expose the Tools-row runtime toggle; 0 = compile it out completely.
+#ifndef EOS_TEST_ONBOARD_HDMI_TOGGLE
+#define EOS_TEST_ONBOARD_HDMI_TOGGLE 1
+#endif
+
 
 
 // ---------------------------------------------------------------------------
@@ -40,10 +50,10 @@
 // input is pumped exactly once per frame and shared across splash + menu.
 // ---------------------------------------------------------------------------
 enum AppPhase {
-    PH_SPLASH = 0, PH_MENU, PH_BANKSEL, PH_BANKMGMT, PH_CONFIRM, PH_BROWSE, PH_RENAME, PH_TOOLS, PH_EE_TOOLS, PH_FW_TOOLS, PH_FW_BACKUP, PH_FW_RPICK,
+    PH_SPLASH = 0, PH_AUTOBOOT, PH_MENU, PH_BANKSEL, PH_BANKMGMT, PH_CONFIRM, PH_BROWSE, PH_RENAME, PH_TOOLS, PH_EE_TOOLS, PH_FW_TOOLS, PH_FW_BACKUP, PH_FW_RPICK,
     PH_FW_RTARGET, PH_FW_RCONFIRM, PH_HDD_TOOLS, PH_HDD_INFO, PH_EE_RESTORE, PH_EE_CONFIRM, PH_FORMAT, PH_FORMAT_CONFIRM, PH_SETTINGS, PH_ABOUT, PH_CLEARCFG,
     PH_CERB_MENU, PH_CERB_EDIT, PH_CERB_SAVED, PH_CERB_OC, PH_CERB_COMBO,
-    PH_LEDCOLOR, PH_SDBROWSE, PH_EOS_SCRIPTS
+    PH_LEDCOLOR, PH_SDBROWSE, PH_EOS_SCRIPTS, PH_FAN
 };
 
 static AppPhase s_phase = PH_SPLASH;
@@ -52,6 +62,9 @@ static int      s_menuIntro = 0;   // 1 = play the splash->menu settle ONCE
 static WORD     s_prevBtn = 0;
 static int      s_bankSel = 0;   // highlighted bank in PH_BANKSEL
 static int      s_mgmtSel = 0;   // highlighted bank in PH_BANKMGMT
+static int      s_autoBank = -1; // table index selected by persisted auto-boot flag
+static ULONG    s_autoEjectBase = 0;
+static DWORD    s_autoEjectNext = 0;
 static EosLayout s_layout;        // dynamic bank layout (descriptor mirror)
 static int       s_layoutOk = 0;  // 1 = a valid descriptor is loaded
 static int       s_extReady = 0;  // DEBUG: STATUS bit5 after last large flash
@@ -260,6 +273,7 @@ static bool Pressed(WORD now, WORD prev, WORD mask)
 static const char* PhaseName(AppPhase p)
 {
     switch (p) {
+    case PH_AUTOBOOT:    return "Auto Boot";
     case PH_MENU:        return "Main Menu";
     case PH_BANKSEL:     return "Launch Bank";
     case PH_BANKMGMT:    return "Bank Manager";
@@ -279,6 +293,7 @@ static const char* PhaseName(AppPhase p)
     case PH_FW_RCONFIRM: return "Firmware";
     case PH_HDD_TOOLS:
     case PH_HDD_INFO:    return "HDD Tools";
+    case PH_FAN:         return "Fan Control";
     case PH_FORMAT:
     case PH_FORMAT_CONFIRM: return "Format";
     case PH_CLEARCFG:    return "Reset Settings";
@@ -309,6 +324,32 @@ static void GotoPhase(AppPhase p)
     if (p == PH_SETTINGS) Settings_Enter();
 }
 
+// Choose the normal post-splash destination. Auto boot is deliberately limited
+// to a persisted, occupied user bank (Banks 1-4); SD, Recovery, XbDiag and TSOP
+// are never eligible. Snapshot the SMC eject counter so a physical Eject press
+// during the countdown can cancel even when no controller is connected.
+static void EnterAfterSplash(void)
+{
+    ULONG tray = 0, ejects = 0;
+    int idx = Bank_AutoBootIndex();
+
+    if (idx >= 0) {
+        s_autoBank = idx;
+        // Prevent the normal title-mode reset-on-eject behavior while Eject is
+        // serving as the controller-free escape from the auto-boot countdown.
+        HalEnableSecureTrayEject();
+        HalReadSMCTrayState(&tray, &ejects);
+        s_autoEjectBase = ejects;
+        s_autoEjectNext = GetTickCount() + 100;
+        GotoPhase(PH_AUTOBOOT);
+        return;
+    }
+
+    s_autoBank = -1;
+    GotoPhase(PH_MENU);
+    s_menuIntro = 1;
+}
+
 // ---------------------------------------------------------------------------
 // SPLASH: fade the logo in over ~0.6s, hold, advance on A/START or ~2s timeout.
 // ---------------------------------------------------------------------------
@@ -322,8 +363,7 @@ static void Splash_Frame(WORD b)
     DWORD dt = GetTickCount() - s_phaseT0;
 
     if (Pressed(b, s_prevBtn, BTN_A) || Pressed(b, s_prevBtn, BTN_START) || dt > 2000) {
-        GotoPhase(PH_MENU);
-        s_menuIntro = 1;          // arm the settle AFTER GotoPhase (only path that sets it)
+        EnterAfterSplash();
         return;
     }
 
@@ -405,6 +445,97 @@ static void Menu_Frame(WORD b)
     Gfx_End();
 }
 
+// Shared hand-off for an on-board flash bank. Auto Boot only calls this for
+// Banks 1-4; the manual bank picker may also use it for Recovery.
+static void LaunchTableBank(int idx)
+{
+    unsigned char ef = Bank_Ef(idx);
+    unsigned int rgb;
+    int eventBank;
+
+    if (ef == 0x0A) {
+        rgb = 0xFEFEFEu;
+        eventBank = 5;
+        Led_Show(EOS_LED_WHITE, 0);
+    }
+    else {
+        rgb = Desc_GetColor(idx);
+        eventBank = (ef >= 0x3 && ef <= 0x6) ? (int)(ef - 0x2) : 0;
+        Led_Show(EOS_LED_SOLID, rgb);
+    }
+
+    if (XboxRgb_BankEvent(eventBank, rgb, 7000UL)) Sleep(15);
+    Lcd_HandOff(Bank_Name(idx));
+    Bank_Launch(idx);
+}
+
+static void AutoBoot_Frame(WORD b)
+{
+    DWORD now = GetTickCount();
+    DWORD elapsed = now - s_phaseT0;
+    DWORD totalMs;
+    int seconds;
+    int remain;
+    ULONG tray = 0, ejects = 0;
+    char line[64];
+    char num[12];
+    int p, n;
+
+    // The target must still be the persisted, occupied user-bank target. If not,
+    // fail safely into the menu instead of ever falling through to another bank.
+    if (s_autoBank < 0 || s_autoBank != Bank_AutoBootIndex()) {
+        s_autoBank = -1;
+        GotoPhase(PH_MENU);
+        SetStatus("Auto boot target unavailable");
+        return;
+    }
+
+    // Controller escape. Using level state (not edge-only) means holding B while
+    // leaving the splash also cancels the countdown immediately.
+    if (b & BTN_B) {
+        s_autoBank = -1;
+        GotoPhase(PH_MENU);
+        SetStatus("Auto boot cancelled");
+        return;
+    }
+
+    // Physical eject escape, sampled at 10 Hz to avoid hammering the shared SMC
+    // bus. EjectCount changes only for a new eject-button event, unlike tray state.
+    if (now >= s_autoEjectNext) {
+        s_autoEjectNext = now + 100;
+        HalReadSMCTrayState(&tray, &ejects);
+        if (ejects != s_autoEjectBase) {
+            s_autoBank = -1;
+            GotoPhase(PH_MENU);
+            SetStatus("Auto boot cancelled by Eject");
+            return;
+        }
+    }
+
+    seconds = Config_GetAutoBootTimeout();
+    totalMs = (DWORD)seconds * 1000UL;
+    if (elapsed >= totalMs) {
+        LaunchTableBank(s_autoBank);
+        return;
+    }
+
+    remain = (int)((totalMs - elapsed + 999UL) / 1000UL);
+    n = 0;
+    do { num[n++] = (char)('0' + (remain % 10)); remain /= 10; } while (remain && n < 10);
+    p = 0; while (n) line[p++] = num[--n];
+    line[p++] = ' '; line[p++] = 's'; line[p] = 0;
+
+    Gfx_Begin(EOS_BG); Ui_Backdrop();
+    Ui_TitleBar("AUTO BOOT");
+    Font_DrawCentered(0, g_scrW, 150, "Booting", EOS_DIM);
+    Font_DrawCentered(0, g_scrW, 184, Bank_Name(s_autoBank), EOS_WHITE);
+    Font_DrawCentered(0, g_scrW, 238, "in", EOS_DIM);
+    Font_DrawCentered(0, g_scrW, 270, line, EOS_PURPLE);
+    Font_DrawCentered(0, g_scrW, 326, "Press B or the console EJECT button to cancel", EOS_WHITE);
+    Ui_Footer("B / EJECT = CANCEL");
+    Gfx_End();
+}
+
 // ---------------------------------------------------------------------------
 // BANK SELECT: launchable banks plus a TSOP entry (last). A launches -- real
 // banks via 0xEF + SMC warm reset (D0 stays asserted, the FPGA serves the bank);
@@ -451,18 +582,10 @@ static void BankSel_Frame(WORD b)
             Eos_LaunchXbDiag();
         }
         else {
-            // Every bank launches NORMALLY. If the descriptor marks this bank as
-            // an oversized anchor, the FPGA redirects its serve to the ext-region
-            // SDRAM copy -- no special launch EF needed here. Set the bank LED
-            // (persists across the warm reset into the launched bank): Recovery
-            // (EF 0xA) breathes white; a user bank shows its stored color.
+            // Normal on-board bank launch. Oversized anchors are redirected by
+            // the descriptor/gateware inside the normal Bank_Launch path.
             int _li = Bank_LaunchIndex(s_bankSel);
-            if (Bank_Ef(_li) == 0x0A)
-                Led_Show(EOS_LED_WHITE, 0);
-            else
-                Led_Show(EOS_LED_SOLID, Desc_GetColor(_li));
-            Lcd_HandOff(Bank_Name(_li));
-            Bank_Launch(_li);
+            LaunchTableBank(_li);
         }
         return;
     }
@@ -557,6 +680,7 @@ static void buildMgmtRow(char* out, int idx)
                 p = appendStr(out, p, "[EMPTY]");
             }
         }
+        if (Bank_IsAutoBoot(idx)) p = appendStr(out, p, " [AUTO]");
     }
 }
 
@@ -719,6 +843,7 @@ static void FwBackup_Enter(void);
 static void FwRestore_Enter(void);
 static void HddTools_Enter(void);
 static void Format_Enter(void);
+static void FanControl_Enter(void);
 
 static void EnterEosScripts(void);
 static void EosScripts_Frame(WORD b);
@@ -1510,21 +1635,168 @@ static void CerbOc_Frame(WORD b)
 }
 
 
+#if EOS_TEST_ONBOARD_HDMI_TOGGLE
+#define EOS_CMD_HUDMODE 0x3D
+static int s_onboardHudEnabled = 1;
+
+static int OnboardHud_SetEnabled(int enabled)
+{
+    unsigned char rb = 0;
+    Con_SmbReset();
+    if (!Con_SmbWrite8(0xDC, 0x11, enabled ? 1 : 0)) return 0;  // ARG0
+    if (!Con_SmbWrite8(0xDC, 0x10, EOS_CMD_HUDMODE)) return 0;  // CMD
+    if (!Con_SmbRead8(0xDC, 0x10, &rb) || rb != EOS_CMD_HUDMODE) return 0;
+    s_onboardHudEnabled = enabled ? 1 : 0;
+    return 1;
+}
+#endif
+
 static void Tools_Frame(WORD b)             // top level: tool categories
 {
-    static const char* cats[7] = { "EEPROM", "Firmware", "HDD", "Cerbios Config Editor", "EOS Scripts", "Format", "Clear Settings" };
+#if EOS_TEST_ONBOARD_HDMI_TOGGLE
+    const char* cats[9] = { "EEPROM", "Firmware", "HDD", "Fan Control", "Cerbios Config Editor", "EOS Scripts", "Format",
+                            s_onboardHudEnabled ? "Onboard HDMI HUD: ON" : "Onboard HDMI HUD: OFF", "Clear Settings" };
+    const int catCount = 9;
+#else
+    static const char* cats[8] = { "EEPROM", "Firmware", "HDD", "Fan Control", "Cerbios Config Editor", "EOS Scripts", "Format", "Clear Settings" };
+    const int catCount = 8;
+#endif
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_MENU); return; }
-    s_toolSel = navSel(b, s_toolSel, 7);
+    s_toolSel = navSel(b, s_toolSel, catCount);
     if (Pressed(b, s_prevBtn, BTN_A)) {
         if (s_toolSel == 0) { s_eeToolSel = 0; GotoPhase(PH_EE_TOOLS); }
         else if (s_toolSel == 1) { s_fwToolSel = 0; GotoPhase(PH_FW_TOOLS); }
         else if (s_toolSel == 2) { HddTools_Enter(); }
-        else if (s_toolSel == 3) { s_cerbMenuSel = 0; GotoPhase(PH_CERB_MENU); }
-        else if (s_toolSel == 4) { EnterEosScripts(); }
-        else if (s_toolSel == 5) { Format_Enter(); }
+        else if (s_toolSel == 3) { FanControl_Enter(); }
+        else if (s_toolSel == 4) { s_cerbMenuSel = 0; GotoPhase(PH_CERB_MENU); }
+        else if (s_toolSel == 5) { EnterEosScripts(); }
+        else if (s_toolSel == 6) { Format_Enter(); }
+#if EOS_TEST_ONBOARD_HDMI_TOGGLE
+        else if (s_toolSel == 7) {
+            int want = !s_onboardHudEnabled;
+            if (OnboardHud_SetEnabled(want))
+                SetStatus(want ? "Onboard HDMI HUD enabled" : "Onboard HDMI HUD disabled");
+            else
+                SetStatus("Onboard HDMI HUD command FAILED");
+        }
+#endif
         else { GotoPhase(PH_CLEARCFG); }
     }
-    listScreen("Tools", cats, 7, s_toolSel);
+    listScreen("Tools", cats, catCount, s_toolSel);
+}
+
+
+// ---------------------------------------------------------------------------
+// FAN CONTROL: runtime SMC fan override. Auto is the safe/default path; Manual
+// uses 20..100% in 5% UI steps. The SMC itself has 2% duty granularity, so the
+// readback may differ from an odd 5% request by 1% (25% -> 26%, etc.).
+// ---------------------------------------------------------------------------
+static int   s_fanSel = 0;
+static int   s_fanManual = 0;
+static int   s_fanPct = EOS_FAN_MIN_PERCENT;
+static int   s_fanReadback = -1;
+static DWORD s_fanPollT0 = 0;
+static int   s_fanDirty = 0;
+
+static int fanSnap5(int p)
+{
+    int n = ((p + 2) / 5) * 5;
+    if (n < EOS_FAN_MIN_PERCENT) n = EOS_FAN_MIN_PERCENT;
+    if (n > EOS_FAN_MAX_PERCENT) n = EOS_FAN_MAX_PERCENT;
+    return n;
+}
+
+static void fanRefreshReadback(void)
+{
+    int pct = 0;
+    if (Fan_ReadPercent(&pct)) s_fanReadback = pct;
+    else s_fanReadback = -1;
+    s_fanPollT0 = GetTickCount();
+}
+
+static void FanControl_Enter(void)
+{
+    int pct = 0;
+    s_fanSel = 0;
+    s_fanManual = Config_GetFanManual();
+    s_fanPct = fanSnap5(Config_GetFanPercent());
+    s_fanDirty = 0;
+    if (Fan_ReadPercent(&pct)) s_fanReadback = pct;
+    else s_fanReadback = -1;
+    s_fanPollT0 = GetTickCount();
+    GotoPhase(PH_FAN);
+}
+
+static void FanControl_Frame(WORD b)
+{
+    char speed[16], readback[32], nb[12];
+    int p, changed = 0;
+
+    if (Pressed(b, s_prevBtn, BTN_B)) {
+        if (s_fanDirty) {
+            int rc = Config_SetFan(s_fanManual, s_fanPct);
+            SetStatus(rc == EOS_FLASH_OK ? "Fan setting saved" : "Fan setting save FAILED");
+            s_fanDirty = 0;
+        }
+        GotoPhase(PH_TOOLS);
+        return;
+    }
+    s_fanSel = navSel(b, s_fanSel, 2);
+
+    // Mode row: A/L/R toggles Auto <-> Manual. Entering Manual immediately
+    // applies the staged percentage; returning to Auto releases the override.
+    if (s_fanSel == 0 &&
+        (Pressed(b, s_prevBtn, BTN_A) || Pressed(b, s_prevBtn, BTN_DPAD_LEFT) || Pressed(b, s_prevBtn, BTN_DPAD_RIGHT))) {
+        if (s_fanManual) {
+            if (Fan_SetAuto()) { s_fanManual = 0; s_fanDirty = 1; SetStatus("Fan returned to SMC Auto"); }
+            else SetStatus("Fan Auto write FAILED");
+        }
+        else {
+            if (Fan_SetManual(s_fanPct)) { s_fanManual = 1; s_fanDirty = 1; SetStatus("Manual fan control enabled"); }
+            else SetStatus("Manual fan write FAILED");
+        }
+        fanRefreshReadback();
+    }
+
+    // Speed row: 5% requested increments. Writes are live only in Manual mode.
+    if (s_fanSel == 1 && s_fanManual) {
+        if (Pressed(b, s_prevBtn, BTN_DPAD_LEFT)) { s_fanPct -= EOS_FAN_STEP_PERCENT; changed = 1; }
+        if (Pressed(b, s_prevBtn, BTN_DPAD_RIGHT)) { s_fanPct += EOS_FAN_STEP_PERCENT; changed = 1; }
+        if (s_fanPct < EOS_FAN_MIN_PERCENT) s_fanPct = EOS_FAN_MIN_PERCENT;
+        if (s_fanPct > EOS_FAN_MAX_PERCENT) s_fanPct = EOS_FAN_MAX_PERCENT;
+        if (Pressed(b, s_prevBtn, BTN_A)) changed = 1;   // re-apply current value
+        if (changed) {
+            if (Fan_SetManual(s_fanPct)) { s_fanDirty = 1; SetStatus("Fan speed applied"); }
+            else SetStatus("Fan speed write FAILED");
+            fanRefreshReadback();
+        }
+    }
+
+    if ((DWORD)(GetTickCount() - s_fanPollT0) >= 1000) fanRefreshReadback();
+
+    p = 0; p = appendStr(speed, p, iToB(s_fanPct, nb)); p = appendStr(speed, p, "%"); speed[p] = 0;
+    if (s_fanReadback >= 0) {
+        p = 0; p = appendStr(readback, p, "SMC readback: ");
+        p = appendStr(readback, p, iToB(s_fanReadback, nb));
+        p = appendStr(readback, p, "%"); readback[p] = 0;
+    }
+    else {
+        cstrCopy(readback, (int)sizeof(readback), "SMC readback unavailable");
+    }
+
+    Gfx_Begin(EOS_BG); Ui_Backdrop();
+    Ui_TitleBar("Fan Control");
+    Ui_PillRow(PILL_X, 170, PILL_W, PILL_H, PILL_R, s_fanSel == 0, 0,
+        "Mode", s_fanManual ? "Manual" : "Auto");
+    Ui_PillRow(PILL_X, 218, PILL_W, PILL_H, PILL_R, s_fanSel == 1, s_fanManual ? 0 : 1,
+        "Manual Speed", speed);
+    Font_DrawCentered(0, g_scrW, 296, readback, EOS_WHITE);
+    Font_DrawCentered(0, g_scrW, 326, "Auto = Xbox SMC thermal control", EOS_DIM);
+    Font_DrawCentered(0, g_scrW, 350, "Manual range 20-100%; UI step 5% (SMC resolution 2%)", EOS_DIM);
+    if (s_status[0] && GetTickCount() < s_statusUntil)
+        Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
+    Ui_Footer("UP/DN MOVE   L/R CHANGE   A APPLY   B SAVE/BACK");
+    Gfx_End();
 }
 
 // Clear the two config banks (bank table 0xB + settings 0xC) back to factory.
@@ -1537,6 +1809,7 @@ static void ClearCfg_Frame(WORD b)
         Desc_Erase();                    // wipe descriptor -> back to legacy geometry
         Flash_EraseBank(EOS_BANK_NEWREGION);  // clear the oversized-bank region too
         Theme_Init();                    // re-apply the default theme now
+        Fan_SetAuto();                    // settings reset also releases manual override
         SetStatus(rc == EOS_FLASH_OK ? "Settings + descriptor cleared" : "Clear FAILED -- flash error");
         GotoPhase(PH_TOOLS);
         return;
@@ -2170,6 +2443,39 @@ static void BankMgmt_Frame(WORD b)
         }
     }
 
+    // White -> toggle the one persisted auto-boot target. Banks 1-4 only; an
+    // empty bank or a shadow slot cannot be selected. Setting one bank clears any
+    // previous auto-boot flag in the table before Config_Save serializes it.
+    if (Pressed(b, s_prevBtn, BTN_WHITE)) {
+        int slot = descSlotForBank(s_mgmtSel);
+        int oldAuto = Bank_AutoBootIndex();
+        int enable;
+        int rc;
+        if (Bank_IsLocked(s_mgmtSel) || slot < 0) {
+            SetStatus("Auto boot is Banks 1-4 only");
+        }
+        else if (!Bank_Occupied(s_mgmtSel)) {
+            SetStatus("Flash a BIOS before enabling auto boot");
+        }
+        else if (s_layoutOk && s_layout.slot[slot].state == EOS_SLOT_SHADOW) {
+            SetStatus("Cannot auto boot a shadow slot");
+        }
+        else {
+            enable = Bank_IsAutoBoot(s_mgmtSel) ? 0 : 1;
+            Bank_SetAutoBoot(s_mgmtSel, enable);
+            rc = Config_Save();
+            if (rc == EOS_FLASH_OK) {
+                SetStatus(enable ? "Auto boot enabled" : "Auto boot disabled");
+            }
+            else {
+                // Keep the live table consistent with what remains in flash.
+                Bank_SetAutoBoot(s_mgmtSel, 0);
+                if (oldAuto >= 0) Bank_SetAutoBoot(oldAuto, 1);
+                SetStatus("Auto boot save FAILED");
+            }
+        }
+    }
+
     // Black -> set this bank's LED color. Excluded: locked banks and shadowed
     // slots (a slot swallowed by a large bank's shadow has no independent LED
     // color -- the color lives on the anchor).
@@ -2214,7 +2520,7 @@ static void BankMgmt_Frame(WORD b)
     }
 
     Font_DrawCentered(0, g_scrW, g_scrH - 66,
-        "A = FLASH   X = DELETE   Y = RENAME   Blk = LED COLOR", EOS_DIM);
+        "A=FLASH  X=DELETE  Y=RENAME  Wht=AUTO BOOT  Blk=LED", EOS_DIM);
     if (s_status[0] && GetTickCount() < s_statusUntil)
         Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
     Gfx_End();
@@ -2896,6 +3202,11 @@ void __cdecl main() {
     Bank_SetResting();   // boot bank = safe resting selection
     File_MountDrives();  // bind HDD partitions so E:/F:/... resolve for browsing
     Config_Load();       // pull persisted bank table from the Eos config bank
+    // Re-assert the saved fan policy on every Loader start. This makes manual
+    // control deterministic across warm/cold reboot instead of relying on SMC
+    // register retention or on whatever the previously-running BIOS requested.
+    if (Config_GetFanManual()) Fan_SetManual(Config_GetFanPercent());
+    else Fan_SetAuto();
     Bank_XbDiagPresent(); // prime the XbDiag probe cache at boot: the one-time
     // flash read happens here, never in the web request path
     Theme_Init();        // built-in theme (fallback base)
@@ -2911,6 +3222,7 @@ void __cdecl main() {
     audioSync();         // start background music if enabled in settings
     // (exercises the real read path; graceful on fresh chip)
     Net_Start();         // bring the network up; DHCP resolves over the next frames
+    XboxRgb_Init();      // opens lazily once Net_IsUp(); no device = silent no-op
     Ftp_Init();          // FTP service: deferred bind once the link resolves
     Ftp_Want(1);         // enable FTP (2 sessions, xbox/xbox, passive, port 21)
     if (!Font_Init()) { Gfx_Shutdown(); return; }
@@ -2938,6 +3250,7 @@ void __cdecl main() {
         // network + web server, serviced every frame regardless of phase.
         // The HTTP listener follows the link: bound while up, dropped on loss.
         Net_Poll();
+        XboxRgb_Tick();   // non-blocking UDP discovery / presence maintenance
         if (Net_IsUp() && !Http_IsUp()) Http_Start();
         if (!Net_IsUp() && Http_IsUp()) Http_Stop();
         Http_Poll();
@@ -2946,6 +3259,7 @@ void __cdecl main() {
         Lcd_Tick(&s_live);   // optional status LCD (throttled + shadow-diffed; no-op if none)
 
         if (s_phase == PH_SPLASH)   Splash_Frame(b);
+        else if (s_phase == PH_AUTOBOOT) AutoBoot_Frame(b);
         else if (s_phase == PH_BANKSEL)  BankSel_Frame(b);
         else if (s_phase == PH_BANKMGMT) BankMgmt_Frame(b);
         else if (s_phase == PH_LEDCOLOR) {
@@ -2958,6 +3272,7 @@ void __cdecl main() {
         else if (s_phase == PH_RENAME)   Rename_Frame(b);
         else if (s_phase == PH_TOOLS)    Tools_Frame(b);
         else if (s_phase == PH_EOS_SCRIPTS) EosScripts_Frame(b);
+        else if (s_phase == PH_FAN)       FanControl_Frame(b);
         else if (s_phase == PH_EE_TOOLS) EeTools_Frame(b);
         else if (s_phase == PH_FW_TOOLS) FwTools_Frame(b);
         else if (s_phase == PH_FW_BACKUP)   FwBackup_Frame(b);

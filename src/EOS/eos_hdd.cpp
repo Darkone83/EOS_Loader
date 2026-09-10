@@ -213,7 +213,8 @@ static void genPwd(const u8* hddKey, const u8* ideData, u8 pass[20])
 
 static void parseIdentify(const u8* d, EosHddInfo* out)
 {
-    u8 tmp[0x28]; int n, i; u32 sectors;
+    u8 tmp[0x28]; int n, i;
+    unsigned long long sectors;
 
     n = cleanATA(tmp, d + OFF_MODEL, 0x28);
     if (n > 43) n = 43;
@@ -226,13 +227,26 @@ static void parseIdentify(const u8* d, EosHddInfo* out)
     out->security = (unsigned short)(d[OFF_SECWORD] | (d[OFF_SECWORD + 1] << 8));
 
     // LBA28 total sectors = words 60..61 (bytes 0x78..0x7B), little-endian.
-    sectors = (u32)d[0x78] | ((u32)d[0x79] << 8) | ((u32)d[0x7A] << 16) | ((u32)d[0x7B] << 24);
-    // LBA48 (words 100..103) only if word 83 bit 10 says the drive supports it.
+    sectors = (unsigned long long)d[0x78]
+        | ((unsigned long long)d[0x79] << 8)
+        | ((unsigned long long)d[0x7A] << 16)
+        | ((unsigned long long)d[0x7B] << 24);
+
+    // LBA48 total sectors = words 100..103 (bytes 0xC8..0xCF).
+    // The old code only consumed the low 32 bits, so drives above 2^32
+    // sectors (~2 TiB) wrapped in the Drive Info size display.
     if ((d[0xA6] | (d[0xA7] << 8)) & 0x0400) {
-        u32 s48 = (u32)d[0xC8] | ((u32)d[0xC9] << 8) | ((u32)d[0xCA] << 16) | ((u32)d[0xCB] << 24);
+        unsigned long long s48 = (unsigned long long)d[0xC8]
+            | ((unsigned long long)d[0xC9] << 8)
+            | ((unsigned long long)d[0xCA] << 16)
+            | ((unsigned long long)d[0xCB] << 24)
+            | ((unsigned long long)d[0xCC] << 32)
+            | ((unsigned long long)d[0xCD] << 40)
+            | ((unsigned long long)d[0xCE] << 48)
+            | ((unsigned long long)d[0xCF] << 56);
         if (s48 > sectors) sectors = s48;
     }
-    out->sizeMB = sectors / 2048;   // 512-byte sectors -> MB
+    out->sizeMB = (unsigned long)(sectors / 2048ULL);   // 512-byte sectors -> MB
 }
 
 // ===========================================================================

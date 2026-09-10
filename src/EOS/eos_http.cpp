@@ -13,6 +13,7 @@
 #include "eos_file.h"        // File_ListDir/Exists/ReadInto, EosFileEntry (custom themes)
 #include "eos_sdcard.h"      // FatFs-backed SD BIOS manager
 #include "eos_led.h"         // Web launch LED handoff
+#include "eos_xboxrgb.h"     // mirror bank launch to optional XBOX-RGB transient effect
 
 #define HTTP_PORT      80
 #define HTTP_REQ_MAX   8192
@@ -1152,12 +1153,24 @@ void Http_Poll(void)
             int bank = s_launch;
             closeConn();
 
-            // Match the local launch-menu LED handoff. Recovery uses the loader's
-            // breathing-white status; user banks use their stored descriptor color.
-            if (Bank_Ef(bank) == 0x0A)
-                Led_Show(EOS_LED_WHITE, 0);
-            else
-                Led_Show(EOS_LED_SOLID, Desc_GetColor(bank));
+            // Match the local launch-menu LED handoff and mirror the same
+            // bank color into XBOX-RGB's temporary EOS effect.
+            {
+                unsigned char ef = Bank_Ef(bank);
+                unsigned int rgb;
+                int eventBank;
+                if (ef == 0x0A) {
+                    rgb = 0xFEFEFEu;
+                    eventBank = 5;
+                    Led_Show(EOS_LED_WHITE, 0);
+                }
+                else {
+                    rgb = Desc_GetColor(bank);
+                    eventBank = (ef >= 0x3 && ef <= 0x6) ? (int)(ef - 0x2) : 0;
+                    Led_Show(EOS_LED_SOLID, rgb);
+                }
+                if (XboxRgb_BankEvent(eventBank, rgb, 7000UL)) Sleep(15);
+            }
 
             // Bank_Launch performs the clean firmware warm-reset handoff.
             Bank_Launch(bank);            // does not return

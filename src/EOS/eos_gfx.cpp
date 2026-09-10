@@ -10,6 +10,7 @@ IDirect3DDevice8* g_dev = 0;
 int         g_scrW = 640;   // DESIGN-space width  (layout authored here)
 int         g_scrH = 480;   // DESIGN-space height (layout authored here)
 BOOL        g_isWide = FALSE;
+BOOL        g_is480p = FALSE;
 const char* g_videoMode = "480i";
 // Backbuffer scale/offset: the 640x480 design space is scaled (pillarbox for HD)
 // onto the real backbuffer, so 720p renders natively instead of a 480p upscale.
@@ -138,6 +139,10 @@ bool Gfx_Init()
             D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &g_dev);
         if (FAILED(hr) || !g_dev) return false;
     }
+
+    // Font mode state only; does not alter video-mode selection or device creation.
+    g_is480p = (bbW == 640 && bbH == 480 &&
+        (pp.Flags & D3DPRESENTFLAG_PROGRESSIVE)) ? TRUE : FALSE;
 
     // Compute design->backbuffer scale, honoring the EEPROM aspect.
     // Integer offsets only -- no float->int casts (this project has no __ftol2_sse).

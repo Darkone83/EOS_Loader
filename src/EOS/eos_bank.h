@@ -32,6 +32,13 @@ int  Bank_Occupied(int idx);               // 1 = bank holds a BIOS
 int  Bank_SizeCode(int idx);               // EOS_BANK_SIZE_*
 void Bank_SetOccupied(int idx, int occupied, int sizeCode);
 
+// Auto-boot flag. Only occupied user banks (EF 0x3..0x6 = Banks 1..4) may
+// carry it, and setting one bank automatically clears the flag from the other
+// user banks. The flag itself is serialized by Config_Save() with the bank table.
+int  Bank_IsAutoBoot(int idx);
+void Bank_SetAutoBoot(int idx, int enabled);
+int  Bank_AutoBootIndex(void);              // flagged+occupied user bank, or -1
+
 // Clear a slot after erasing its flash: empty + default size + factory name.
 void Bank_ClearEntry(int idx);
 

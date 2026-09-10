@@ -12,6 +12,8 @@ EEPROM, run firmware and hard-drive tools, watch live console telemetry, and per
 UI — all from the couch with a controller, or from a browser on your PC.
 
 > Team Resurgent · Darkone83
+>
+> **Current release: 1.0.5-1**
 
 ---
 
@@ -19,21 +21,26 @@ UI — all from the couch with a controller, or from a browser on your PC.
 
 - **Choose your BIOS** — switch between BIOS banks on the Eos board, boot the console's
   original **TSOP** BIOS, launch **XbDiag Lite** when it's installed, or boot a BIOS image
-  straight off an **SD card** (FAT32, read-only — nothing is written to the card or to the
-  board's flash).
+  straight off a **FAT32 SD card** without flashing that BIOS to the Eos board.
+- **Auto Boot a user BIOS** — mark one of Banks 1–4 as the automatic boot target and choose a
+  **2–30 second** countdown. Press **B** or the console **EJECT** button to cancel and remain in
+  the loader.
 - **Flash BIOS images** — push a new BIOS to a bank over FTP or the web control panel, then
   commit it. Supports **256K, 512K, and 1MB** images; oversized banks are auto-placed into
   the dynamic new-region layout.
 - **Flash .eos scripts** - Upload your own custom expansion scripts.
 - **Firmware backup / restore** — dump any bank to a file and restore it, per bank.
-- **Web control panel** — a browser page for bank management, plus **EEPROM backup / restore**,
-  system info, XbDiag management, and a settings reset.
+- **Web control panel** — a browser page for bank management, **SD BIOS upload / delete / browse**,
+  **EEPROM backup / restore**, system info, XbDiag management, and a settings reset.
 - **FTP server** — move banks and files to and from the console over your network.
 - **EEPROM tools** — read, decode, edit, repair, back up, and restore the Xbox EEPROM,
   including **video standard** (NTSC-M/J, PAL-I/M) and **game / DVD region** editing.
-- **HDD tools** — drive info, plus **ATA security lock / unlock** (bind a drive to this
-  console or remove security).
-- **Hard-drive setup** — stage a fresh drive with the standard Xbox partitions.
+- **HDD tools** — drive info, including full LBA48 capacity reporting and mounted-partition
+  usage, plus **ATA security lock / unlock** (bind a drive to this console or remove security).
+- **Fan control** — leave cooling on the Xbox SMC's automatic thermal control, or use a persistent
+  manual setting from **20–100%** in **5%** steps with live SMC readback.
+- **Hard-drive setup** — stage a fresh drive with the standard Xbox partitions and use the full
+  available capacity on large drives.
 - **Cerbios tools** — a Cerbios config editor and CPU/GPU overclock calculator,
   on-console and in the web panel.
 - **Live telemetry HUD** — a top-right overlay shows **CPU / motherboard temperature** and
@@ -46,6 +53,9 @@ UI — all from the couch with a controller, or from a browser on your PC.
 - **Status LCD** — drive an optional **character LCD** on the Xbox SMBus (US2066 OLED or an
   HD44780 via a PCF8574 backpack) showing a live status screen: current screen, IP, temps,
   and free RAM.
+- **Optional XBOX-RGB handoff effects** — the loader can discover XBOX-RGB on the local network
+  and send a short bank-colour effect when a BIOS is launched. No device present simply means
+  the launch continues normally.
 
 ---
 
@@ -53,8 +63,9 @@ UI — all from the couch with a controller, or from a browser on your PC.
 
 The console cold-boots straight into the Eos loader UI. Navigate with the **D-pad**, **A**
 selects, **B** goes back. The main menu gets you to **Banks**, **Tools**, and **Settings**,
-and a top-right HUD shows live console telemetry (CPU / motherboard temperature and RAM). From
-here you choose what actually runs.
+and a top-right HUD shows live console telemetry (CPU / motherboard temperature and RAM). If an
+Auto Boot target is configured, a countdown appears after the splash; **B** or the console
+**EJECT** button cancels it and returns control to the loader.
 
 ---
 
@@ -67,6 +78,11 @@ launch it — a warm reset boots into the chosen BIOS. Protected banks (the boot
 recovery) are marked **[LOCKED]** and can't be deleted or overwritten by accident. When
 **XbDiag Lite** is installed on the board, it also appears here as a launchable entry.
 
+To configure **Auto Boot**, open **Bank Management** and press **WHITE** on an occupied user BIOS
+in Banks 1–4. Only one bank can be the target at a time. Set the countdown length under
+**Settings → Auto Boot**. SD Card, Recovery, XbDiag Lite, TSOP, empty banks, and shadow slots are
+not eligible.
+
 To **flash a new BIOS**: get the image onto the console (FTP or the web panel), pick a target
 bank, and commit — the loader writes it to the Eos flash and can serve it live. **256K, 512K,
 and 1MB** images are supported; larger images are automatically placed into the board's
@@ -77,14 +93,16 @@ the Xbox boots its original onboard BIOS; a normal power cycle returns you to Eo
 
 To **boot from an SD card**: choose the **SD Card** entry in the bank list, browse the card's
 FAT32 filesystem, and pick a BIOS image (**256K, 512K, or 1MB**). It's staged into SDRAM and
-booted directly — the loader never writes to the card and never touches the Eos flash. Write
-BIOS images to the card from a PC; the loader only reads it.
+booted directly, so that BIOS is not written to the Eos flash. The on-console boot path is a
+reader; SD-card file writes are exposed separately through the WebUI's **SD BIOS Manager**.
 
 ### Web control panel
 
 Point a browser at the console's IP address for a control panel with:
 
-- **Bank management** — rename, delete, and flash banks from your desktop.
+- **Bank management** — rename, delete, flash, and launch banks from your desktop.
+- **SD BIOS Manager** — browse the FAT32 SD card and upload or delete 256K, 512K, and 1MB BIOS
+  images from the browser.
 - **System info** — console revision, CPU speed, RAM, encoder, serial, MAC, video standard,
   region, language, and bank/slot usage.
 - **Backup EEPROM** — download your console's EEPROM as a file. **Do this once and keep it
@@ -104,8 +122,8 @@ port **21** (all changeable in Settings). Up to two sessions at once; a third ge
 
 ### Tools
 
-**Tools** groups the maintenance functions: **EEPROM**, **Firmware**, **HDD**, **Cerbios**,
-**Format**, and **Clear Settings**.
+**Tools** groups the maintenance functions: **EEPROM**, **Firmware**, **HDD**, **Fan Control**,
+**Cerbios**, **EOS Scripts**, **Format**, and **Clear Settings**.
 
 ### EEPROM tools
 
@@ -135,10 +153,19 @@ Upload your custom expansion scripts to take full control of the programmable GP
 to this console's key; **Unlock** removes security. Both are armed (press twice) to prevent an
 accidental change.
 
+### Fan Control
+
+**Tools → Fan Control** offers **Auto** and **Manual** cooling modes. Auto returns fan control to
+the Xbox SMC thermal algorithm. Manual accepts **20–100%** in **5%** UI steps and shows the live
+SMC readback; the SMC's own hardware resolution is 2%, so an odd 5% request can read back 1%
+higher. The selected policy persists across loader restarts.
+
 ### Hard-drive setup (Format)
 
 **Tools → Format** stages a fresh Xbox drive: it lays down the standard partitions
-(E, C, X, Y, Z, and F spanning the rest), with correct handling for large drives.
+(E, C, X, Y, Z, and F spanning the rest). The large-drive path uses the disk's full reported
+geometry, selects FATX cluster sizes as capacity grows, and writes the backup partition table at
+the physical end of Partition0.
 
 > ⚠️ **This wipes the entire drive.** Only run it on a drive you intend to erase, and test on
 > a scratch disk first.
@@ -182,6 +209,8 @@ simply inert.
 
 ### Settings
 
+- **Auto Boot** — set the **2–30 second** countdown for the user BIOS marked in Bank Management.
+  During the countdown, **B** or the physical **EJECT** button cancels it.
 - **Network** — IP / DHCP and the FTP credentials.
 - **Video / Audio / Region** — EEPROM-backed video standard, and game / DVD region editing.
 - **Clock / NVRAM** — console time and NVRAM values. With an optional **X-RTC** clock module
@@ -193,6 +222,14 @@ simply inert.
 - **LCD** — set the **Driver** (Disabled / HD44780 / US2066), the I2C **Address**, and
   **Brightness** (US2066 only); a live **Detected** line confirms the panel is answering.
 - **About** — version and build info.
+
+---
+
+## 1.0.5-1 notes
+
+This release adds Auto Boot and fan control, improves large-drive formatting and capacity
+reporting, adds optional XBOX-RGB bank-handoff effects, and improves font readability at 480p.
+See `CHANGELOG.md` for the release-level summary.
 
 ---
 
@@ -279,7 +316,8 @@ eos_sddiskio              FatFs disk I/O glue (single-sector reads over the onbo
 ff / ffunicode / diskio   vendored FatFs (read-only, LFN, fast-seek) -- see bundled-library note below
 eos_descriptor            dynamic bank geometry descriptor (256K/512K/1MB slot layout)
 eos_flash                 flash engine bridge
-eos_hdd / eos_format      drive info + ATA security + HDD staging/format
+eos_hdd / eos_format      drive info + full LBA48 capacity + ATA security + HDD staging/format
+eos_fan                   Xbox SMC fan control (Auto / persistent Manual)
 dd_mount / eos_file       mount lifecycle + file ops
 
 eos_eeprom                EEPROM read/decode/edit/repair/restore
@@ -287,10 +325,11 @@ eos_eeprom_io             EEPROM transport
 eos_ee_crypto             EEPROM SHA-1 / HMAC / RC4 / CRC (ported crypto core)
 eos_ee_data               EEPROM raw-image decode/encode (video std, region, serial, MAC)
 
-eos_config / eos_settings config + settings hub (video/region, theme + custom-theme picker, music)
+eos_config / eos_settings config + settings hub (auto boot, video/region, theme, music, persisted fan policy)
 eos_clock / eos_nvram     clock + NVRAM
 eos_rtc                   optional X-RTC (DS1307-class SMBus clock): read/write + boot seed & mirror
 eos_lcd                   optional SMBus status LCD (US2066 + HD44780/PCF8574 drivers, lcd.dat)
+eos_xboxrgb               optional LAN discovery + transient XBOX-RGB bank-handoff effects
 eos_ftoi                  float->int helper (MSVC2003 /GL: __ftol2_sse)
 
 minimp3.h                 bundled MP3 decoder (background music)

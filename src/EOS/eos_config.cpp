@@ -1,4 +1,4 @@
-// eos_config.cpp -- Eos loader config persistence, split into TWO independent
+
 // flash regions so a settings write can never disturb the bank table:
 //
 //   bank 0xB  (phys 0x7F0000, its own 64K erase block)  -> BANK TABLE   "EOSB"
@@ -21,15 +21,24 @@
 #define CFG_THEME_MAX 31
 #define CFG_VERIFY_FAIL (-2)
 
-#define BANKS_VER   1
-#define SET_VER     2
+#define BANKS_VER   2
+#define SET_VER     4
 #define OLD_SET_OFF 240           /* theme offset in the legacy combined "EOSC" page */
+#define SET_FAN_MODE_OFF 231       /* byte after BGM path [7..230] */
+#define SET_FAN_PCT_OFF  232
+#define SET_AUTOBOOT_TIMEOUT_OFF 233
 
 static int s_themeIdx = 0;        /* cached setting, loaded by Config_Load */
 static int s_bgmOn = 0;        /* background music enabled */
 static char s_bgmPath[EOS_BGM_PATH_MAX] = { 0 };  /* selected track path */
+static int s_fanManual = 0;       /* 0=SMC Auto, 1=fixed manual duty */
+static int s_fanPercent = 20;     /* last requested manual percentage */
+static int s_autoBootTimeout = 5; /* seconds; target flag lives in bank table */
 
 int Config_GetThemeIdx(void) { return s_themeIdx; }
+int Config_GetFanManual(void) { return s_fanManual ? 1 : 0; }
+int Config_GetFanPercent(void) { return s_fanPercent; }
+int Config_GetAutoBootTimeout(void) { return s_autoBootTimeout; }
 
 int         Config_GetBgmOn(void) { return s_bgmOn ? 1 : 0; }
 const char* Config_GetBgmPath(void) { return s_bgmPath; }
@@ -40,6 +49,34 @@ void Config_SetBgmPath(const char* path)
     if (path) for (; path[i] && i < EOS_BGM_PATH_MAX - 1; ++i) s_bgmPath[i] = path[i];
     s_bgmPath[i] = 0;
     Config_SaveSettings();
+}
+
+
+
+int Config_SetAutoBootTimeout(int seconds)
+{
+    int old = s_autoBootTimeout;
+    int rc;
+    if (seconds < 2) seconds = 2;
+    if (seconds > 30) seconds = 30;
+    if (seconds == s_autoBootTimeout) return EOS_FLASH_OK;
+    s_autoBootTimeout = seconds;
+    rc = Config_SaveSettings();
+    if (rc != EOS_FLASH_OK) s_autoBootTimeout = old;
+    return rc;
+}
+
+int Config_SetFan(int manualMode, int percent)
+{
+    int snapped;
+    if (percent < 20) percent = 20;
+    if (percent > 100) percent = 100;
+    snapped = ((percent + 2) / 5) * 5;
+    if (snapped < 20) snapped = 20;
+    if (snapped > 100) snapped = 100;
+    s_fanManual = manualMode ? 1 : 0;
+    s_fanPercent = snapped;
+    return Config_SaveSettings();
 }
 
 // --- shared helpers ----------------------------------------------------------
@@ -96,7 +133,7 @@ int Config_Save(void)
         buf[off + 0] = (unsigned char)Bank_Occupied(i);
         buf[off + 1] = Bank_Ef(i);
         buf[off + 2] = (unsigned char)Bank_SizeCode(i);
-        buf[off + 3] = 0;
+        buf[off + 3] = (unsigned char)(Bank_IsAutoBoot(i) ? 0x01 : 0x00);
         nm = Bank_Name(i);
         for (k = 0; k < EOS_BANK_NAMELEN && nm[k]; ++k)
             buf[off + 4 + k] = (unsigned char)nm[k];
@@ -131,6 +168,7 @@ static int loadBanks(void)
     for (i = 0; i < n; ++i) {
         off = CFG_HDR + i * CFG_RECSZ;
         Bank_SetOccupied(i, buf[off + 0], buf[off + 2]);
+        Bank_SetAutoBoot(i, (!isOld && buf[4] >= 2 && (buf[off + 3] & 0x01)) ? 1 : 0);
         for (k = 0; k < EOS_BANK_NAMELEN - 1; ++k) nm[k] = (char)buf[off + 4 + k];
         nm[EOS_BANK_NAMELEN - 1] = 0;
         Bank_SetName(i, nm);
@@ -158,8 +196,11 @@ int Config_SaveSettings(void)
     {
         int i = 0;
         while (s_bgmPath[i] && i < EOS_BGM_PATH_MAX - 1) { buf[7 + i] = (unsigned char)s_bgmPath[i]; ++i; }
-        buf[7 + i] = 0;                            /* NUL-terminated track path [7..253] */
+        buf[7 + i] = 0;                            /* NUL-terminated track path [7..230] */
     }
+    buf[SET_FAN_MODE_OFF] = (unsigned char)(s_fanManual ? 1 : 0);
+    buf[SET_FAN_PCT_OFF] = (unsigned char)s_fanPercent;
+    buf[SET_AUTOBOOT_TIMEOUT_OFF] = (unsigned char)s_autoBootTimeout;
     putSum(buf);
     return writePage(EOS_SETTINGS_BANK, buf);
 }
@@ -172,6 +213,9 @@ int Config_ResetSettings(void)
     s_themeIdx = 0;
     s_bgmOn = 0;
     s_bgmPath[0] = 0;
+    s_fanManual = 0;
+    s_fanPercent = 20;
+    s_autoBootTimeout = 5;
     return Config_SaveSettings();
 }
 
@@ -183,6 +227,9 @@ int Config_ClearAll(void)
     int r1 = Flash_EraseBank(EOS_CONFIG_BANK);
     int r2 = Flash_EraseBank(EOS_SETTINGS_BANK);
     s_themeIdx = 0;
+    s_fanManual = 0;
+    s_fanPercent = 20;
+    s_autoBootTimeout = 5;
     return (r1 == EOS_FLASH_OK && r2 == EOS_FLASH_OK) ? EOS_FLASH_OK : -1;
 }
 
@@ -203,6 +250,20 @@ static void loadSettings(void)
         s_bgmOn = buf[6] ? 1 : 0;
         for (i = 0; i < EOS_BGM_PATH_MAX - 1 && buf[7 + i]; ++i) s_bgmPath[i] = (char)buf[7 + i];
         s_bgmPath[i] = 0;
+    }
+    if (buf[4] >= 3) {
+        int pct = (int)buf[SET_FAN_PCT_OFF];
+        s_fanManual = buf[SET_FAN_MODE_OFF] ? 1 : 0;
+        if (pct < 20 || pct > 100) pct = 20;
+        pct = ((pct + 2) / 5) * 5;
+        if (pct < 20) pct = 20;
+        if (pct > 100) pct = 100;
+        s_fanPercent = pct;
+    }
+    if (buf[4] >= 4) {
+        int seconds = (int)buf[SET_AUTOBOOT_TIMEOUT_OFF];
+        if (seconds < 2 || seconds > 30) seconds = 5;
+        s_autoBootTimeout = seconds;
     }
 }
 
