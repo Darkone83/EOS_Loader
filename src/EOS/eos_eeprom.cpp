@@ -4,39 +4,6 @@
 #include "eos_eeprom.h"
 #include "eos_ee_data.h"   // decrypted EEPROM layer (raw image + crypto)
 
-// xboxkrnl ExQueryNonVolatileSetting value indices (XAPI.H / PrometheOS /
-// XbDiag). The kernel decrypts the factory section, so these individual queries
-// return plaintext. NOTE: the previous map was WRONG (language/video/dvd indices
-// were mis-assigned), which is why video/region read garbage. Corrected here.
-#define XC_VIDEO_STANDARD          0x04   // NTSC-M/J, PAL-I/M dword
-#define XC_VIDEO_FLAGS             0x05   // HDTV/widescreen/50-60hz bitmask
-#define XC_AUDIO_FLAGS             0x06
-#define XC_GAME_REGION             0x07   // 1=NA, 2=Japan, 4=Europe
-#define XC_DVD_REGION              0x08   // DVD playback zone
-#define XC_LANGUAGE                0x11   // menu language ID
-#define XC_FACTORY_SERIAL_NUMBER   0x100
-#define XC_FACTORY_ETHERNET_ADDR   0x101
-#define XC_FACTORY_AV_REGION       0x102
-#define XC_FACTORY_GAME_REGION     0x103
-
-// Video standard dwords (from xboxConfig): NTSC-M 0x00400100, NTSC-J 0x00400200,
-// PAL-I 0x00800300. High byte 0x40 = NTSC family, 0x80 = PAL family.
-#define VS_NTSC_M                  0x00400100
-#define VS_NTSC_J                  0x00400200
-#define VS_PAL_I                   0x00800300
-
-// XC_VIDEO flag bits (from xboxinternals.h).
-#define VF_WIDESCREEN              0x00010000
-#define VF_HDTV_720p               0x00020000
-#define VF_HDTV_1080i              0x00040000
-#define VF_HDTV_480p               0x00080000
-
-// The kernel export. RXDK's xtl.h declares it; PrometheOS calls it the same way.
-extern "C" ULONG __stdcall ExQueryNonVolatileSetting(DWORD ValueIndex, DWORD* Type,
-    PVOID Value, DWORD ValueLength,
-    DWORD* ResultLength);
-
-
 void Eeprom_Read(EosEeprom* e)
 {
     EeData d;
@@ -137,7 +104,3 @@ void Eeprom_MacStr(const EosEeprom* e, char* out16)
     out16[p] = 0;
 }
 
-BOOL Eeprom_Has480p(const EosEeprom* e) { return e->videoValid && (e->videoFlags & VF_HDTV_480p) != 0; }
-BOOL Eeprom_Has720p(const EosEeprom* e) { return e->videoValid && (e->videoFlags & VF_HDTV_720p) != 0; }
-BOOL Eeprom_Has1080i(const EosEeprom* e) { return e->videoValid && (e->videoFlags & VF_HDTV_1080i) != 0; }
-BOOL Eeprom_IsWidescreen(const EosEeprom* e) { return e->videoValid && (e->videoFlags & VF_WIDESCREEN) != 0; }

@@ -253,29 +253,6 @@ static unsigned char io_in8(unsigned short port)
     return v;
 }
 
-// --- MakeMHz XboxHD+ 1.0/1.1 NV2A freeze workaround --------------------------
-// Production XboxHD+ kpatch and XeniumOS v2.3.5 both apply this exact PFIFO
-// state before handing off a Conexant/pre-1.6 HD+ boot:
-//   NV_PFIFO_CACHE1_DMA_SUBROUTINE (0xFD00124C) = 0
-//   NV_PFIFO_CACHE1_PULL0          (0xFD001250) = 0x00007800
-//
-// EOS's user BIOS EFs are 0x3..0x9 (native 256K plus oversized aliases). Keep
-// this out of Recovery/XbDiag/TSOP paths. This test targets the current pre-1.6
-// Conexant system; production can additionally gate by encoder/1.6 state.
-static void hdplus_apply_nv2a_freeze_fix(unsigned char ef)
-{
-    volatile DWORD* dma_subroutine;
-    volatile DWORD* pull0;
-
-    if (ef < 0x03 || ef > 0x09) return;
-
-    dma_subroutine = (volatile DWORD*)0xFD00124C;
-    pull0 = (volatile DWORD*)0xFD001250;
-
-    *dma_subroutine = 0x00000000;
-    *pull0 = 0x00007800;
-}
-
 // --- clean BIOS reboot handoff -------------------------------------------------
 // The PIC scratch register survives a warm reset. Bit 0x04 explicitly suppresses
 // the boot animation, so preserve every other scratch flag but clear that one.
@@ -315,9 +292,6 @@ void Bank_LaunchEf(unsigned char ef)
     io_out8(0x00EF, ef);
     for (s = 0; s < 200000; ++s) {}
 
-    // Apply the same NV2A PFIFO workaround MakeMHz added to XeniumOS for the
-    // HD+ 1.0/1.1 freeze before the warm BIOS handoff.
-
     reboot_to_firmware();
 }
 
@@ -343,11 +317,7 @@ void Bank_Launch(int idx)
     // 2) small settle so the 0xEF write completes on the LPC bus before reset
     for (s = 0; s < 200000; ++s) {}
 
-    // 3) Apply MakeMHz's production HD+ 1.0/1.1 NV2A PFIFO freeze workaround.
-    //    This is deliberately after the bank/LPC settle and immediately before
-    //    firmware re-entry, matching the modchip-OS handoff role XeniumOS used.
-
-    // 4) Clear stale NO_ANIMATION state and perform a normal firmware reboot.
+    // 3) Clear stale NO_ANIMATION state and perform a normal firmware reboot.
     //    The FPGA bank latch persists across this warm reset.
     reboot_to_firmware();
 }

@@ -14,6 +14,7 @@
 #include "eos_console.h"   /* Con_SmbReset / Con_SmbRead8 / Con_SmbWrite8, EosLive */
 #include "dd_net.h"        /* Net_Ip */
 #include "eos_file.h"      /* File_ReadInto / File_Exists (lcd.dat)          */
+#include "eos_http.h"      /* EOS_LOADER_VERSION                               */
 
 #define LCD_COLS       20
 #define LCD_ROWS       4
@@ -251,36 +252,46 @@ static int Probe(unsigned char a)
 /* ---- status layout -------------------------------------------------------- */
 static void BuildLines(const EosLive* v, char out[LCD_ROWS][LCD_COLS + 1])
 {
-    char t[40];
+    static const char spin[4] = { '|', '/', '-', '\\' };
+    char t[48];
     int  p;
 
-    /* row 0: current menu / selected item */
-    PadLine(out[0], s_ctxTop);
+    /* row 0: EOS-branded live context with a restrained activity spinner. */
+    p = AppS(t, 0, "EOS ");
+    t[p++] = spin[(GetTickCount() / 500) & 3];
+    t[p] = 0;
+    p = AppS(t, p, " ");
+    p = AppS(t, p, s_ctxTop);
+    PadLine(out[0], t);
 
-    /* row 1: IP */
-    p = AppS(t, 0, "IP: ");
+    /* row 1: network identity.  A full IPv4 address still fits in 20 cols. */
+    p = AppS(t, 0, "NET ");
     p = AppS(t, p, Net_Ip());
     PadLine(out[1], t);
 
-    /* row 2: CPU / MB temps */
-    p = AppS(t, 0, "CPU:");
+    /* row 2: compact instrument-style temperature strip. */
+    p = AppS(t, 0, "CPU ");
     p = AppT(t, p, v ? v->cpuTempC : -1);
-    p = AppS(t, p, "c   MB:");
+    p = AppS(t, p, "C | MB ");
     p = AppT(t, p, v ? v->mbTempC : -1);
-    p = AppS(t, p, "c");
+    p = AppS(t, p, "C");
     PadLine(out[2], t);
 
-    /* row 3: RAM free (+ bank tag, right-aligned, if it fits) */
-    p = AppS(t, 0, "RAM:");
+    /* row 3: free/total RAM plus loader identity.  If a bank tag is supplied,
+       it replaces the version at the right edge so handoff context wins. */
+    p = AppS(t, 0, "RAM ");
     p = AppI(t, p, v ? (int)v->ramFreeMB : 0);
-    p = AppS(t, p, "M free");
+    p = AppS(t, p, "/");
+    p = AppI(t, p, v ? (int)v->ramTotalMB : 0);
+    p = AppS(t, p, "M  ");
+    p = AppS(t, p, EOS_LOADER_VERSION);
     PadLine(out[3], t);
     if (s_ctxBank[0]) {
         int bl = SL(s_ctxBank);
-        if (bl <= LCD_COLS && (p + 1) <= (LCD_COLS - bl)) {
-            int i, start = LCD_COLS - bl;
-            for (i = 0; i < bl; ++i) out[3][start + i] = s_ctxBank[i];
-        }
+        int i, start;
+        if (bl > LCD_COLS) bl = LCD_COLS;
+        start = LCD_COLS - bl;
+        for (i = 0; i < bl; ++i) out[3][start + i] = s_ctxBank[i];
     }
 }
 
@@ -416,15 +427,20 @@ void Lcd_SetContext(const char* top, const char* bank)
 
 void Lcd_HandOff(const char* bankName)
 {
-    char l1[LCD_COLS + 1], l2[LCD_COLS + 1];
+    char l0[LCD_COLS + 1], l1[LCD_COLS + 1];
+    char l2[LCD_COLS + 1], l3[LCD_COLS + 1];
     if (!s_d || !s_present) return;
     Con_SmbReset();
     ShadowInvalidate();
     LCDCmd(CMD_CLEAR); Sleep(2);
-    CenterLine(l1, "Booting");
+    CenterLine(l0, "==      EOS       ==");
+    CenterLine(l1, "Launching BIOS");
     CenterLine(l2, bankName ? bankName : "");
+    CenterLine(l3, "Please wait...");
+    LCDGoto(0, 0); LCDPuts(l0, LCD_COLS);
     LCDGoto(1, 0); LCDPuts(l1, LCD_COLS);
     LCDGoto(2, 0); LCDPuts(l2, LCD_COLS);
+    LCDGoto(3, 0); LCDPuts(l3, LCD_COLS);
     s_frozen = 1;                     /* stop status updates while the game runs */
 }
 

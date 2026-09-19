@@ -152,45 +152,6 @@ int EeData_Read(EeData* d)
 }
 
 // ============================================================================
-// Public: strings
-// ============================================================================
-const char* EeData_VideoStdStr(const EeData* d)
-{
-    if (!d->valid) return "Unknown";
-    switch (d->videoStd) {
-    case EE_VS_NTSC_M: return "NTSC-M (N. America)";
-    case EE_VS_NTSC_J: return "NTSC-J (Japan)";
-    case EE_VS_PAL_I:  return "PAL-I (Europe/AUS)";
-    case EE_VS_PAL_M:  return "PAL-M (Brazil)";
-    }
-    if ((d->videoStd & 0x00FF0000) == 0x00400000) return "NTSC";
-    if ((d->videoStd & 0x00FF0000) == 0x00800000) return "PAL";
-    return "Unknown";
-}
-
-const char* EeData_GameRegionStr(const EeData* d)
-{
-    if (!d->decrypted) return "Unknown";
-    switch (d->gameRegion) {
-    case EE_REGION_NA:    return "North America";
-    case EE_REGION_JAPAN: return "Japan";
-    case EE_REGION_EURO:  return "Europe / RoW";
-    case 0x80000000:      return "Manufacturing";
-    }
-    return "Unknown";
-}
-
-const char* EeData_DvdRegionStr(const EeData* d)
-{
-    static char s[12];
-    if (!d->valid) return "Unknown";
-    if (d->dvdRegion == 0 || d->dvdRegion > 8) return "Region-free";
-    s[0] = 'R'; s[1] = 'e'; s[2] = 'g'; s[3] = 'i'; s[4] = 'o'; s[5] = 'n'; s[6] = ' ';
-    s[7] = (char)('0' + (int)d->dvdRegion); s[8] = 0;
-    return s;
-}
-
-// ============================================================================
 // Public: writers
 // ============================================================================
 int EeData_SetVideoStd(DWORD videoStd)

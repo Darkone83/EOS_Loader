@@ -58,7 +58,9 @@ void Gfx_Fill(float x, float y, float w, float h, DWORD color);
 // Corners use a generated mask drawn with LINEAR filtering for a smooth edge;
 // the filter is restored to POINT afterward so following text stays crisp.
 void Gfx_FillRounded(int x, int y, int w, int h, int radius, DWORD color);
-void Gfx_FillVGradient(int x, int y, int w, int h, DWORD top, DWORD bottom);
+// Seam-free capsule rendered as one convex fan. Use for translucent/full pill
+// faces where separate rounded-corner/body primitives can expose raster seams.
+void Gfx_FillCapsule(int x, int y, int w, int h, DWORD color);
 void Gfx_GlowRounded(int x, int y, int w, int h, int r, DWORD color);
 void Gfx_GlowSoft(int cx, int cy, int w, int h, DWORD color, int peak);
 
@@ -72,14 +74,7 @@ void Gfx_SetFilter(BOOL linear);   // TRUE=LINEAR (logo), FALSE=POINT (text/menu
 void Gfx_Begin3D(void);
 void Gfx_End3D(void);
 
-// Camera-facing quad at world (cx,cy,cz), half extents (hw,hh), tinted by the
-// vertex diffuse color (alpha honored). Fill = solid white tex; Add = additive
-// (glow/highlight). Orb3D billboards the soft glow sprite additively.
-void Gfx_Quad3D(float cx, float cy, float cz, float hw, float hh, DWORD c,
-    IDirect3DTexture8* tex, float u0, float v0, float u1, float v1);
-void Gfx_Quad3DFill(float cx, float cy, float cz, float hw, float hh, DWORD c);
-void Gfx_Quad3DAdd(float cx, float cy, float cz, float hw, float hh, DWORD c,
-    IDirect3DTexture8* tex);
+// Camera-facing orb primitive used by the menu background.
 void Gfx_Orb3D(float cx, float cy, float cz, float size, DWORD color, int peak);
 
 // Additive soft glow sprite at a rotated 3D position (same transform basis as
@@ -99,7 +94,7 @@ void Gfx_Quad3DP(float cx, float cy, float cz, float ca, float sa,
     float lcx, float lcy, float hw, float hh, DWORD c,
     IDirect3DTexture8* tex, float u0, float v0, float u1, float v1);
 
-// Rounded, translucent 3D pill (3-slice: flat middle + disc end-caps), tilted
-// by (ca,sa). 'c' carries tint + alpha so pills are properly see-through.
+// Rounded, translucent 3D pill rendered as one convex capsule, tilted by
+// (ca,sa). 'c' carries tint + alpha so pills are properly see-through.
 void Gfx_PillX3D(float cx, float cy, float cz, float ca, float sa,
     float hw, float hh, DWORD c);

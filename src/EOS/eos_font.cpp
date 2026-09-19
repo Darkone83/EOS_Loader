@@ -110,26 +110,57 @@ int Font_TextWidthScaled(const char* s, float k)
 void Font_Draw3D(float cx, float cy, float cz, float ca, float sa,
     float k, const char* s, DWORD color)
 {
-    float aw = (float)FONT_ATLAS_W, ah = (float)FONT_ATLAS_H;
-    float tw, penX, topY;
-    int i;
-    if (!s) return;
+    float aw, ah, penX, minX, maxX, minY, maxY, shiftX, shiftY;
+    float gl, gr, gt, gb, gw, gh, lcx, lcy, u0, v0, u1, v1;
+    const short* g;
+    int i, haveInk;
+
+    if (!s || !s[0]) return;
 
     k *= modeScale();
-    tw = (float)rawTextWidth(s) * k;
-    penX = -tw * 0.5f;
-    topY = (float)FONT_CH * 0.5f * k;
+    aw = (float)FONT_ATLAS_W;
+    ah = (float)FONT_ATLAS_H;
+    penX = 0.0f;
+    minX = 1000000.0f; maxX = -1000000.0f;
+    minY = 1000000.0f; maxY = -1000000.0f;
+    haveInk = 0;
+
+    // Measure visible glyph bounds so the label is visually centered in the
+    // capsule rather than merely centering the font's advance/line box.
+    for (i = 0; s[i]; ++i) {
+        g = glyph((unsigned char)s[i]);
+        if (!g) { penX += (float)spaceAdv() * k; continue; }
+        if (g[2] > 0 && g[3] > 0) {
+            gl = penX + (float)g[4] * k;
+            gr = gl + (float)g[2] * k;
+            gt = -(float)g[5] * k;
+            gb = gt - (float)g[3] * k;
+            if (gl < minX) minX = gl;
+            if (gr > maxX) maxX = gr;
+            if (gb < minY) minY = gb;
+            if (gt > maxY) maxY = gt;
+            haveInk = 1;
+        }
+        penX += (float)g[6] * k;
+    }
+    if (!haveInk) return;
+
+    shiftX = -(minX + maxX) * 0.5f;
+    shiftY = -(minY + maxY) * 0.5f;
+    penX = 0.0f;
+
     if (g_is480p) Gfx_SetFilter(TRUE);
 
     for (i = 0; s[i]; ++i) {
-        const short* g = glyph((unsigned char)s[i]);
+        g = glyph((unsigned char)s[i]);
         if (!g) { penX += (float)spaceAdv() * k; continue; }
         if (g[2] > 0 && g[3] > 0) {
-            float gw = (float)g[2] * k, gh = (float)g[3] * k;
-            float lcx = penX + (float)g[4] * k + gw * 0.5f;
-            float lcy = topY - (float)g[5] * k - gh * 0.5f;
-            float u0 = (float)g[0] / aw, v0 = (float)g[1] / ah;
-            float u1 = (float)(g[0] + g[2]) / aw, v1 = (float)(g[1] + g[3]) / ah;
+            gw = (float)g[2] * k;
+            gh = (float)g[3] * k;
+            lcx = penX + (float)g[4] * k + gw * 0.5f + shiftX;
+            lcy = -(float)g[5] * k - gh * 0.5f + shiftY;
+            u0 = (float)g[0] / aw; v0 = (float)g[1] / ah;
+            u1 = (float)(g[0] + g[2]) / aw; v1 = (float)(g[1] + g[3]) / ah;
             Gfx_Quad3DP(cx, cy, cz, ca, sa, lcx, lcy, gw * 0.5f, gh * 0.5f,
                 color, s_atlas, u0, v0, u1, v1);
         }

@@ -1,4 +1,4 @@
-// eos_gfx.cpp -- D3D8 2D layer (NV2A-correct: swizzled A8R8G8B8 + XGSwizzleRect).
+
 // Matches the proven XbTyrian/ScorchedXB/XbDiag pattern:
 //   - swizzled D3DFMT_A8R8G8B8 textures (LIN_* does NOT render on NV2A)
 //   - XGSwizzleRect to convert linear CPU pixels -> swizzled GPU texture
@@ -18,12 +18,11 @@ float       g_sx = 1.0f;
 float       g_sy = 1.0f;
 int         g_ox = 0;
 int         g_oy = 0;
-int         g_bbW = 640;   // native backbuffer size (mode-dependent):
-int         g_bbH = 480;   // 1280x720 @720p, 640x480 @480p/i, 640x576 @576i
+int         g_bbW = 640;
+int         g_bbH = 480;
 static IDirect3D8* s_d3d = 0;
 static IDirect3DTexture8* s_white = 0;   // 1x1 white, for solid fills
 static IDirect3DTexture8* s_glowTex = 0;   // 64x64 radial glow sprite
-static IDirect3DTexture8* s_discTex = 0;   // 64x64 hard disc (pill caps, 3-slice)
 static IDirect3DTexture8* s_ballTex = 0;   // 64x64 lit sphere (3D orbs)
 static DWORD              s_glowPix[64 * 64];
 static DWORD              s_baseFilter = D3DTEXF_POINT;   // LINEAR when HD-scaled
@@ -61,6 +60,28 @@ void Gfx_SetFilter(BOOL linear)
     DWORD m = linear ? D3DTEXF_LINEAR : s_baseFilter;
     g_dev->SetTextureStageState(0, D3DTSS_MINFILTER, m);
     g_dev->SetTextureStageState(0, D3DTSS_MAGFILTER, m);
+}
+
+// Prefer Xbox 2x linear multisampling. If this exact video/depth combination
+// rejects it, retry the same mode without AA before any resolution fallback.
+static HRESULT CreateDevicePreferredAA(D3DPRESENT_PARAMETERS* pp)
+{
+    HRESULT hr;
+
+    if (!pp || !s_d3d) return E_FAIL;
+
+    g_dev = 0;
+    pp->MultiSampleType = D3DMULTISAMPLE_2_SAMPLES_MULTISAMPLE_LINEAR;
+    hr = s_d3d->CreateDevice(0, D3DDEVTYPE_HAL, NULL,
+        D3DCREATE_HARDWARE_VERTEXPROCESSING, pp, &g_dev);
+
+    if (FAILED(hr) || !g_dev) {
+        if (g_dev) { g_dev->Release(); g_dev = 0; }
+        pp->MultiSampleType = D3DMULTISAMPLE_NONE;
+        hr = s_d3d->CreateDevice(0, D3DDEVTYPE_HAL, NULL,
+            D3DCREATE_HARDWARE_VERTEXPROCESSING, pp, &g_dev);
+    }
+    return hr;
 }
 
 bool Gfx_Init()
@@ -120,29 +141,33 @@ bool Gfx_Init()
     ZeroMemory(&pp, sizeof(pp));
     pp.BackBufferWidth = bbW;
     pp.BackBufferHeight = bbH;
-    pp.BackBufferFormat = D3DFMT_A8R8G8B8;
+    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
     pp.BackBufferCount = 1;
     pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    pp.EnableAutoDepthStencil = TRUE;              // Darkone83 model needs a depth buffer
+    pp.EnableAutoDepthStencil = TRUE;              // Darkone83 model needs depth
     pp.AutoDepthStencilFormat = D3DFMT_D24S8;
     pp.Flags = ppFlags;
     pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_ONE;
 
-    HRESULT hr = s_d3d->CreateDevice(0, D3DDEVTYPE_HAL, NULL,
-        D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &g_dev);
+    HRESULT hr = CreateDevicePreferredAA(&pp);
     if (FAILED(hr) || !g_dev) {
         // HD mode rejected (e.g. VRAM) -> fall back to 640x480 480p/480i.
         bbW = 640; bbH = 480; g_videoMode = "480p";
         pp.BackBufferWidth = 640; pp.BackBufferHeight = 480;
         pp.Flags = D3DPRESENTFLAG_PROGRESSIVE;
-        hr = s_d3d->CreateDevice(0, D3DDEVTYPE_HAL, NULL,
-            D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &g_dev);
+        hr = CreateDevicePreferredAA(&pp);
         if (FAILED(hr) || !g_dev) return false;
     }
 
-    // Font mode state only; does not alter video-mode selection or device creation.
+    // Publish the final mode exactly as the rest of the loader expects.
     g_is480p = (bbW == 640 && bbH == 480 &&
         (pp.Flags & D3DPRESENTFLAG_PROGRESSIVE)) ? TRUE : FALSE;
+    g_bbW = bbW;
+    g_bbH = bbH;
+
+    // Match USB2XB: enable multisample antialiasing after successful device creation.
+    // If CreateDevicePreferredAA had to retry with D3DMULTISAMPLE_NONE this is harmless.
+    g_dev->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, TRUE);
 
     // Compute design->backbuffer scale, honoring the EEPROM aspect.
     // Integer offsets only -- no float->int casts (this project has no __ftol2_sse).
@@ -169,7 +194,6 @@ bool Gfx_Init()
         g_ox = (bbW - scaledW) / 2;               // integer math, no ftol
         g_oy = (bbH - scaledH) / 2;
     }
-    g_bbW = bbW; g_bbH = bbH;   // publish the final native backbuffer size
     s_baseFilter = (g_sx > 1.01f || g_sy > 1.01f) ? D3DTEXF_LINEAR : D3DTEXF_POINT;
 
     DWORD wpx = 0xFFFFFFFF;
@@ -190,24 +214,8 @@ bool Gfx_Init()
         s_glowTex = Gfx_CreateTexARGB(64, 64, s_glowPix);
     }
 
-    // Hard-edged disc with a ~1px AA rim, reused (left/right halves) as the
-    // rounded end-caps of the 3D pills via a horizontal 3-slice. The disc fills
-    // the whole texture (centre 31.5, radius 31.5) so its vertical diameter is
-    // full height -- the flat side butts the middle rect seamlessly. Integer math.
-    {
-        int dx2, dy2;
-        for (dy2 = 0; dy2 < 64; ++dy2)
-            for (dx2 = 0; dx2 < 64; ++dx2) {
-                int ddx = dx2 * 2 - 63, ddy = dy2 * 2 - 63;   // *2 to keep integer (half-px)
-                int d2 = ddx * ddx + ddy * ddy;               // radius 63 in this doubled space
-                int a;
-                if (d2 <= 61 * 61) a = 255;
-                else if (d2 >= 63 * 63) a = 0;
-                else a = (63 * 63 - d2) * 255 / (63 * 63 - 61 * 61);
-                s_glowPix[dy2 * 64 + dx2] = ((DWORD)a << 24) | 0x00FFFFFF;
-            }
-        s_discTex = Gfx_CreateTexARGB(64, 64, s_glowPix);
-    }
+    // 3D pill end-caps are geometry now (see Gfx_PillX3D), so there is no
+    // filtered half-disc texture or cap/body sampling seam to initialize.
 
     // Lit-sphere impostor for the 3D orbs: per-pixel surface normal of a sphere,
     // shaded by a fixed upper-left/front light (N.L diffuse + ambient), with a
@@ -243,7 +251,6 @@ bool Gfx_Init()
 void Gfx_Shutdown()
 {
     if (s_ballTex) { s_ballTex->Release(); s_ballTex = 0; }
-    if (s_discTex) { s_discTex->Release(); s_discTex = 0; }
     if (s_glowTex) { s_glowTex->Release(); s_glowTex = 0; }
     if (s_white) { s_white->Release(); s_white = 0; }
     if (g_dev) { g_dev->Release();   g_dev = 0; }
@@ -257,9 +264,8 @@ void Gfx_Begin(DWORD clear_argb)
     SetState2D();
 }
 
-// Optional overlay hook: drawn on top of every frame, inside the open scene,
-// just before EndScene/Present. Lets a persistent HUD render across all screens
-// without editing each screen's draw path. NULL = no overlay.
+// Optional persistent overlay hook. Drawn inside the open scene immediately
+// before EndScene/Present so the HUD stays above every loader screen.
 static void (*s_overlayCb)(void) = 0;
 void Gfx_SetOverlay(void (*cb)(void)) { s_overlayCb = cb; }
 
@@ -310,50 +316,32 @@ void Gfx_Fill(float x, float y, float w, float h, DWORD color)
     DrawQuadUV(s_white, x, y, w, h, 0, 0, 1, 1, color);
 }
 
-// Vertical gradient via horizontal bands (no FVF/pipeline change -- reuses the
-// white-texture tint path). The TV's scaler blurs the band seams away.
-void Gfx_FillVGradient(int x, int y, int w, int h, DWORD top, DWORD bottom)
-{
-    int   bands = h / 6; int i;
-    int   a0 = (top >> 24) & 0xFF, r0 = (top >> 16) & 0xFF, g0 = (top >> 8) & 0xFF, b0 = top & 0xFF;
-    int   a1 = (bottom >> 24) & 0xFF, r1 = (bottom >> 16) & 0xFF, g1 = (bottom >> 8) & 0xFF, b1 = bottom & 0xFF;
-    if (bands < 2) bands = 2;
-    for (i = 0; i < bands; ++i) {
-        int by = y + (h * i) / bands;
-        int by2 = y + (h * (i + 1)) / bands;
-        DWORD c = ((DWORD)(a0 + (a1 - a0) * i / (bands - 1)) << 24) |
-            ((DWORD)(r0 + (r1 - r0) * i / (bands - 1)) << 16) |
-            ((DWORD)(g0 + (g1 - g0) * i / (bands - 1)) << 8) |
-            ((DWORD)(b0 + (b1 - b0) * i / (bands - 1)));
-        Gfx_Fill((float)x, (float)by, (float)w, (float)(by2 - by), c);
-    }
-}
-
 // --- rounded pill ----------------------------------------------------------
 // Corners are drawn as solid triangle fans (pure geometry) rather than a
 // scaled/mirrored mask texture: UV-mirroring a corner mask with bilinear
 // filtering leaves a half-texel offset that shows up as faint seams. Fans share
 // exact integer edges with the body fills, so there are no seams at all.
 
-// Unit quarter-arc, cos/sin * 1024 over 0..90 deg (9 samples = 8 facets).
-static const int k_arc[9][2] = {
-    {1024,0},{1004,200},{946,392},{851,569},{724,724},
-    {569,851},{392,946},{200,1004},{0,1024}
+// Unit quarter-arc, cos/sin * 1024 over 0..90 deg (17 samples = 16 facets).
+// The denser fan materially smooths pill/title geometry on large radii.
+static const int k_arc[17][2] = {
+    {1024,0},{1019,100},{1004,200},{980,298},{946,392},{904,482},{851,569},{789,650},{724,724},
+    {650,789},{569,851},{482,904},{392,946},{298,980},{200,1004},{100,1019},{0,1024}
 };
 
 static void cornerFan(int cx, int cy, int r, int sx, int sy, DWORD color)
 {
-    QVtx v[10];
+    QVtx v[18];
     int i;
     v[0].x = g_ox + (float)cx * g_sx; v[0].y = g_oy + (float)cy * g_sy;   // fan hub
-    for (i = 0; i < 9; ++i) {
+    for (i = 0; i < 17; ++i) {
         v[i + 1].x = g_ox + (float)(cx + sx * (r * k_arc[i][0]) / 1024) * g_sx;
         v[i + 1].y = g_oy + (float)(cy + sy * (r * k_arc[i][1]) / 1024) * g_sy;
     }
-    for (i = 0; i < 10; ++i) { v[i].z = 0.0f; v[i].rhw = 1.0f; v[i].u = 0.0f; v[i].v = 0.0f; }
+    for (i = 0; i < 18; ++i) { v[i].z = 0.0f; v[i].rhw = 1.0f; v[i].u = 0.0f; v[i].v = 0.0f; }
     g_dev->SetRenderState(D3DRS_TEXTUREFACTOR, color);
     g_dev->SetTexture(0, s_white);
-    g_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 8, v, sizeof(QVtx));
+    g_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 16, v, sizeof(QVtx));
 }
 
 void Gfx_FillRounded(int x, int y, int w, int h, int r, DWORD color)
@@ -377,6 +365,66 @@ void Gfx_FillRounded(int x, int y, int w, int h, int r, DWORD color)
 // Soft ambient glow blob: one additive, LINEAR-scaled draw of the radial glow
 // sprite -- perfectly smooth (no concentric banding). color tints it, peak sets
 // overall intensity (the sprite's alpha falloff does the shaping).
+// Seam-free 2D capsule. Unlike Gfx_FillRounded(), this is one convex polygon
+// and therefore has no internal body/corner boundaries for alpha/MSAA to expose.
+void Gfx_FillCapsule(int x, int y, int w, int h, DWORD color)
+{
+    QVtx v[68];
+    float cx, cy, hw, hh, mid, lx, ly;
+    int n, i;
+
+    if (w <= 0 || h <= 0) return;
+    if (w < h) { Gfx_FillRounded(x, y, w, h, w / 2, color); return; }
+
+    cx = (float)x + (float)w * 0.5f;
+    cy = (float)y + (float)h * 0.5f;
+    hw = (float)w * 0.5f;
+    hh = (float)h * 0.5f;
+    mid = hw - hh;
+
+    n = 0;
+    v[n].x = g_ox + cx * g_sx;
+    v[n].y = g_oy + cy * g_sy;
+    v[n].z = 0.0f; v[n].rhw = 1.0f; v[n].u = 0.0f; v[n].v = 0.0f; ++n;
+
+    // Left semicircle: top seam -> leftmost -> bottom seam.
+    for (i = 16; i >= 0; --i) {
+        lx = -mid - hh * (float)k_arc[i][0] / 1024.0f;
+        ly = hh * (float)k_arc[i][1] / 1024.0f;
+        v[n].x = g_ox + (cx + lx) * g_sx;
+        v[n].y = g_oy + (cy + ly) * g_sy;
+        v[n].z = 0.0f; v[n].rhw = 1.0f; v[n].u = 0.0f; v[n].v = 0.0f; ++n;
+    }
+    for (i = 1; i <= 16; ++i) {
+        lx = -mid - hh * (float)k_arc[i][0] / 1024.0f;
+        ly = -hh * (float)k_arc[i][1] / 1024.0f;
+        v[n].x = g_ox + (cx + lx) * g_sx;
+        v[n].y = g_oy + (cy + ly) * g_sy;
+        v[n].z = 0.0f; v[n].rhw = 1.0f; v[n].u = 0.0f; v[n].v = 0.0f; ++n;
+    }
+
+    // Right semicircle: bottom seam -> rightmost -> top seam.
+    for (i = 16; i >= 0; --i) {
+        lx = mid + hh * (float)k_arc[i][0] / 1024.0f;
+        ly = -hh * (float)k_arc[i][1] / 1024.0f;
+        v[n].x = g_ox + (cx + lx) * g_sx;
+        v[n].y = g_oy + (cy + ly) * g_sy;
+        v[n].z = 0.0f; v[n].rhw = 1.0f; v[n].u = 0.0f; v[n].v = 0.0f; ++n;
+    }
+    for (i = 1; i <= 16; ++i) {
+        lx = mid + hh * (float)k_arc[i][0] / 1024.0f;
+        ly = hh * (float)k_arc[i][1] / 1024.0f;
+        v[n].x = g_ox + (cx + lx) * g_sx;
+        v[n].y = g_oy + (cy + ly) * g_sy;
+        v[n].z = 0.0f; v[n].rhw = 1.0f; v[n].u = 0.0f; v[n].v = 0.0f; ++n;
+    }
+
+    v[n] = v[1]; ++n;
+    g_dev->SetRenderState(D3DRS_TEXTUREFACTOR, color);
+    g_dev->SetTexture(0, s_white);
+    g_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, n - 2, v, sizeof(QVtx));
+}
+
 void Gfx_GlowSoft(int cx, int cy, int w, int h, DWORD color, int peak)
 {
     DWORD tint = (color & 0x00FFFFFF) | ((DWORD)(peak & 0xFF) << 24);
@@ -510,25 +558,6 @@ static void quad3(float cx, float cy, float cz, float hw, float hh, DWORD c,
     g_dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(V3));
 }
 
-void Gfx_Quad3D(float cx, float cy, float cz, float hw, float hh, DWORD c,
-    IDirect3DTexture8* tex, float u0, float v0, float u1, float v1)
-{
-    quad3(cx, cy, cz, hw, hh, c, tex, u0, v0, u1, v1);
-}
-
-void Gfx_Quad3DFill(float cx, float cy, float cz, float hw, float hh, DWORD c)
-{
-    quad3(cx, cy, cz, hw, hh, c, s_white, 0.0f, 0.0f, 1.0f, 1.0f);
-}
-
-void Gfx_Quad3DAdd(float cx, float cy, float cz, float hw, float hh, DWORD c,
-    IDirect3DTexture8* tex)
-{
-    g_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
-    quad3(cx, cy, cz, hw, hh, c, tex ? tex : s_white, 0.0f, 0.0f, 1.0f, 1.0f);
-    g_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-}
-
 void Gfx_Orb3D(float cx, float cy, float cz, float size, DWORD color, int peak)
 {
     // Lit sphere, alpha-blended (NOT additive) so the dark limb occludes the
@@ -544,14 +573,10 @@ void Gfx_Orb3D(float cx, float cy, float cz, float size, DWORD color, int peak)
 void Gfx_GlowX3D(float cx, float cy, float cz, float ca, float sa,
     float hw, float hh, DWORD color, int peak)
 {
-    // Soft additive halo behind a rotated 3D pill. Same rotated-quad basis as
-    // Gfx_PillX3D so it tracks the pill exactly (including the idle sway); the
-    // radial glow texture + additive blend means it only adds light and fades to
-    // nothing at its edges, so it can never draw a hard box or dim anything.
     DWORD c = (color & 0x00FFFFFF) | ((DWORD)(peak & 0xFF) << 24);
     if (!s_glowTex) return;
-    g_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);   // additive
-    Gfx_SetFilter(TRUE);                                    // smooth the sprite
+    g_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+    Gfx_SetFilter(TRUE);
     Gfx_Quad3DP(cx, cy, cz, ca, sa, 0.0f, 0.0f, hw, hh, c,
         s_glowTex, 0.0f, 0.0f, 1.0f, 1.0f);
     Gfx_SetFilter(FALSE);
@@ -577,17 +602,66 @@ void Gfx_Quad3DP(float cx, float cy, float cz, float ca, float sa,
     g_dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(V3));
 }
 
-// Rounded, translucent 3D pill, tilted by (ca,sa). Horizontal 3-slice: a flat
-// white middle + two disc-half end-caps, so the corner radius never distorts
-// with width. 'c' carries the tint AND the alpha (transparency).
+// Rounded, translucent 3D pill rendered as ONE convex polygon. Drawing the
+// capsule as a center rectangle plus independent end caps leaves shared alpha/
+// MSAA raster edges that can show as vertical seams. One triangle fan removes
+// those internal boundaries completely.
 void Gfx_PillX3D(float cx, float cy, float cz, float ca, float sa,
     float hw, float hh, DWORD c)
 {
-    float mid = hw - hh;                 // half-width of the flat middle section
-    if (mid < 0.0f) { hw = hh; mid = 0.0f; }
-    if (mid > 0.0f)
-        Gfx_Quad3DP(cx, cy, cz, ca, sa, 0.0f, 0.0f, mid, hh, c, s_white, 0.0f, 0.0f, 1.0f, 1.0f);
-    // left cap = left half of the disc; right cap = right half.
-    Gfx_Quad3DP(cx, cy, cz, ca, sa, -(mid + hh * 0.5f), 0.0f, hh * 0.5f, hh, c, s_discTex, 0.0f, 0.0f, 0.5f, 1.0f);
-    Gfx_Quad3DP(cx, cy, cz, ca, sa, (mid + hh * 0.5f), 0.0f, hh * 0.5f, hh, c, s_discTex, 0.5f, 0.0f, 1.0f, 1.0f);
+    V3 v[68];
+    float mid, lx, ly;
+    int n, i;
+
+    mid = hw - hh;
+    if (mid < 0.0f) {
+        hw = hh;
+        mid = 0.0f;
+    }
+
+    n = 0;
+    v[n].x = cx; v[n].y = cy; v[n].z = cz;
+    v[n].c = c; v[n].u = 0.5f; v[n].v = 0.5f; ++n;
+
+    // Left semicircle: top seam -> leftmost -> bottom seam.
+    for (i = 16; i >= 0; --i) {
+        lx = -mid - hh * (float)k_arc[i][0] / 1024.0f;
+        ly = hh * (float)k_arc[i][1] / 1024.0f;
+        v[n].x = cx + lx;
+        v[n].y = cy + ly * ca;
+        v[n].z = cz + ly * sa;
+        v[n].c = c; v[n].u = 0.0f; v[n].v = 0.0f; ++n;
+    }
+    for (i = 1; i <= 16; ++i) {
+        lx = -mid - hh * (float)k_arc[i][0] / 1024.0f;
+        ly = -hh * (float)k_arc[i][1] / 1024.0f;
+        v[n].x = cx + lx;
+        v[n].y = cy + ly * ca;
+        v[n].z = cz + ly * sa;
+        v[n].c = c; v[n].u = 0.0f; v[n].v = 0.0f; ++n;
+    }
+
+    // Right semicircle: bottom seam -> rightmost -> top seam. The straight
+    // top/bottom portions are simply perimeter edges of the same polygon.
+    for (i = 16; i >= 0; --i) {
+        lx = mid + hh * (float)k_arc[i][0] / 1024.0f;
+        ly = -hh * (float)k_arc[i][1] / 1024.0f;
+        v[n].x = cx + lx;
+        v[n].y = cy + ly * ca;
+        v[n].z = cz + ly * sa;
+        v[n].c = c; v[n].u = 0.0f; v[n].v = 0.0f; ++n;
+    }
+    for (i = 1; i <= 16; ++i) {
+        lx = mid + hh * (float)k_arc[i][0] / 1024.0f;
+        ly = hh * (float)k_arc[i][1] / 1024.0f;
+        v[n].x = cx + lx;
+        v[n].y = cy + ly * ca;
+        v[n].z = cz + ly * sa;
+        v[n].c = c; v[n].u = 0.0f; v[n].v = 0.0f; ++n;
+    }
+
+    v[n] = v[1]; ++n;
+
+    g_dev->SetTexture(0, s_white);
+    g_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, n - 2, v, sizeof(V3));
 }

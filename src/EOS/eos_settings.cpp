@@ -20,9 +20,10 @@
 #include "eos_theme.h"
 #include "eos_config.h"
 #include "eos_bank.h"
-#include "eos_theme_custom.h"  // disk theme scan/apply/set.dat
+#include "eos_theme_custom.h"  // disk theme scan/apply + flash-backed selection
 #include "eos_rtc.h"           // X-RTC presence for the Date & Time screen
 #include "eos_lcd.h"           // LCD settings screen
+#include "eos_osk.h"           // numeric OSK for network address entry
 #include "dd_net.h"
 #include "input.h"
 
@@ -39,9 +40,9 @@
 #define INFO_LX   70
 #define INFO_VX   300
 
-enum Sub { SUB_HUB = 0, SUB_SYSINFO, SUB_VIDEO, SUB_AUDIO, SUB_AUTOBOOT, SUB_REGION, SUB_NETWORK, SUB_DATETIME, SUB_THEME, SUB_LCD };
+enum Sub { SUB_HUB = 0, SUB_SYSINFO, SUB_VIDEO, SUB_AUDIO, SUB_AUTOBOOT, SUB_REGION, SUB_NETWORK, SUB_DATETIME, SUB_THEME, SUB_LCD, SUB_EOS };
 
-static const char* k_hub[] = { "Audio", "Auto Boot", "Date & Time", "LCD", "Network", "Region", "System Info", "Theme", "Video" };
+static const char* k_hub[] = { "Audio", "Auto Boot", "Date & Time", "LCD", "Network", "Region", "System Info", "Theme", "Video", "EOS Settings" };
 #define HUB_COUNT ((int)(sizeof(k_hub) / sizeof(k_hub[0])))
 
 static int       s_sub = SUB_HUB;
@@ -50,7 +51,7 @@ static int       s_row = 0;            // row cursor inside an editor
 static int       s_themePreview = 0;
 static int       s_bgmWork = 0;   // working bg-music on/off (persisted on exit)
 static int       s_returnTheme = 0;   // 1 = re-enter THEME after the song browser
-static char      s_ctList[32][EOS_FILE_NAME_MAX]; // scanned custom theme folders
+static EosThemeEntry s_ctList[32];              // scanned custom themes + source
 static int       s_ctCount = 0;                   // number of custom themes found
 static EosEeprom s_eep;
 static EosConsole s_con;
@@ -66,26 +67,31 @@ static int       s_grOk = 0;          // EEPROM decrypted OK -> region editable
 static DWORD     s_lang = 1;           // working language
 static EosDateTime s_dt;               // working date/time
 static int       s_dtField = 0;        // 0..5 = Y M D h m s
+static const char* s_eosMsg = 0;
+
+// ---- EOS runtime controls --------------------------------------------------
+#define EOS_CMD_HUDMODE 0x3D
+
+static int eosHdmiHudHw(int enabled)
+{
+    unsigned char rb = 0;
+    Con_SmbReset();
+    if (!Con_SmbWrite8(0xDC, 0x11, enabled ? 1 : 0)) return 0;
+    if (!Con_SmbWrite8(0xDC, 0x10, EOS_CMD_HUDMODE)) return 0;
+    if (!Con_SmbRead8(0xDC, 0x10, &rb) || rb != EOS_CMD_HUDMODE) return 0;
+    return 1;
+}
+
+void Settings_ApplyEosRuntime(void)
+{
+    eosHdmiHudHw(Config_GetHdmiHudOn());
+}
 
 // ---- tiny helpers (no CRT) -------------------------------------------------
 
 static void networkEnter(void);   /* defined in the network section, used by the hub */
 static void themeEnter(void);     /* scans customs + sets the picker index */
 static bool Pressed(WORD now, WORD prev, WORD mask) { return (now & mask) && !(prev & mask); }
-
-// Case-insensitive folder-name compare (FATX is case-insensitive).
-static int folderEq(const char* a, const char* b)
-{
-    int i = 0;
-    for (;;) {
-        char ca = a[i], cb = b[i];
-        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
-        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
-        if (ca != cb) return 0;
-        if (!ca) return 1;
-        ++i;
-    }
-}
 
 // unsigned int -> decimal string (into out), returns length
 static int uitoa(unsigned int v, char* out)
@@ -147,11 +153,52 @@ static int hubFrame(WORD b, WORD prev)
         case 6: s_sub = SUB_SYSINFO; Eeprom_Read(&s_eep); Console_Read(&s_con); break;
         case 7: s_sub = SUB_THEME; themeEnter(); break;
         case 8: s_sub = SUB_VIDEO;  s_vflags = Nvram_GetVideoFlags(); break;
+        case 9: s_sub = SUB_EOS; s_row = 0; s_eosMsg = 0; break;
         }
     }
     titleBar("SETTINGS");
     Ui_Menu3D(k_hub, HUB_COUNT, s_sel);
     footer("D-PAD  MOVE      A  OPEN      B  BACK");
+    return 0;
+}
+
+// ---- EOS settings ----------------------------------------------------------
+static int eosSettingsFrame(WORD b, WORD prev)
+{
+    int rc;
+    int old;
+    int want;
+
+    if (Pressed(b, prev, BTN_B)) { s_eosMsg = 0; s_sub = SUB_HUB; return 0; }
+    if (Pressed(b, prev, BTN_DPAD_UP))   s_row = (s_row + 1) % 2;
+    if (Pressed(b, prev, BTN_DPAD_DOWN)) s_row = (s_row + 1) % 2;
+
+    if (Pressed(b, prev, BTN_A) || Pressed(b, prev, BTN_DPAD_LEFT) || Pressed(b, prev, BTN_DPAD_RIGHT)) {
+        if (s_row == 0) {
+            old = Config_GetHdmiHudOn();
+            want = old ? 0 : 1;
+            if (!eosHdmiHudHw(want)) {
+                s_eosMsg = "HDMI HUD command failed";
+            }
+            else {
+                rc = Config_SetHdmiHudOn(want);
+                if (rc == 0) s_eosMsg = want ? "HDMI HUD enabled" : "HDMI HUD disabled";
+                else { eosHdmiHudHw(old); s_eosMsg = "HDMI HUD save failed"; }
+            }
+        }
+        else {
+            want = Config_GetSystemCardOn() ? 0 : 1;
+            rc = Config_SetSystemCardOn(want);
+            s_eosMsg = (rc == 0) ? (want ? "System info card enabled" : "System info card disabled")
+                : "System info card save failed";
+        }
+    }
+
+    titleBar("EOS SETTINGS");
+    rowPill(LIST_Y0, s_row == 0, 0, "HDMI HUD", Config_GetHdmiHudOn() ? "On" : "Off");
+    rowPill(LIST_Y0 + LIST_DY, s_row == 1, 0, "System Info Card", Config_GetSystemCardOn() ? "On" : "Off");
+    if (s_eosMsg) Font_DrawCentered(0, g_scrW, LIST_Y0 + LIST_DY * 3, s_eosMsg, EOS_DIM);
+    footer("D-PAD  MOVE / CHANGE      A  TOGGLE      B  BACK");
     return 0;
 }
 
@@ -401,28 +448,68 @@ static int regionFrame(WORD b, WORD prev)
 static int          s_netMode = DD_NET_DHCP;
 static unsigned long s_ip = 0, s_mask = 0, s_gw = 0, s_dns = 0, s_dns2 = 0;
 static int          s_netRow = 0;     // 0 Mode,1 IP,2 Subnet,3 Gateway,4 DNS,5 Apply
-static int          s_netEdit = 0;    // 1 = editing octets of the current row
-static int          s_octet = 0;      // 0..3
+static int          s_netOskRow = 0;  // 1..4 while the numeric OSK owns input
 static const char* s_netMsg = 0;
 
 static int getOctet(unsigned long a, int o) { return (int)((a >> (o * 8)) & 0xFF); }
-static void setOctet(unsigned long* a, int o, int v)
+
+// Strict dotted-quad parser used for OSK confirmation. The existing network
+// storage layout is little-endian by octet: a.b.c.d -> a | b<<8 | c<<16 | d<<24.
+static int parseIpStrict(const char* s, unsigned long* out)
 {
-    unsigned long m = 0xFFUL << (o * 8);
-    *a = (*a & ~m) | (((unsigned long)(v & 0xFF)) << (o * 8));
+    unsigned long o[4];
+    int idx = 0, val = 0, digits = 0, i = 0;
+
+    if (!s || !out) return 0;
+
+    while (1) {
+        char c = s[i++];
+
+        if (c >= '0' && c <= '9') {
+            if (digits >= 3) return 0;
+            val = val * 10 + (c - '0');
+            if (val > 255) return 0;
+            ++digits;
+        }
+        else if (c == '.' || c == 0) {
+            if (digits == 0 || idx >= 4) return 0;
+            o[idx++] = (unsigned long)val;
+
+            if (c == 0) break;
+            if (idx >= 4) return 0;
+
+            val = 0;
+            digits = 0;
+        }
+        else {
+            return 0;
+        }
+    }
+
+    if (idx != 4) return 0;
+
+    *out = o[0] | (o[1] << 8) | (o[2] << 16) | (o[3] << 24);
+    return 1;
 }
 
 static unsigned long parseIp(const char* s)
 {
-    unsigned long o[4]; int idx = 0, val = 0, have = 0, i;
-    o[0] = o[1] = o[2] = o[3] = 0;
-    for (i = 0; s[i]; ++i) {
-        if (s[i] >= '0' && s[i] <= '9') { val = val * 10 + (s[i] - '0'); have = 1; }
-        else if (s[i] == '.') { if (idx < 3) o[idx++] = (unsigned long)(val & 0xFF); val = 0; have = 0; }
-        else break;
+    unsigned long a = 0;
+    parseIpStrict(s, &a);
+    return a;
+}
+
+static void formatIp(unsigned long a, char out[16])
+{
+    char octet[6];
+    int i, j, n, p = 0;
+
+    for (i = 0; i < 4; ++i) {
+        n = uitoa((unsigned)getOctet(a, i), octet);
+        for (j = 0; j < n && p < 15; ++j) out[p++] = octet[j];
+        if (i < 3 && p < 15) out[p++] = '.';
     }
-    if (have && idx < 4) o[idx] = (unsigned long)(val & 0xFF);
-    return o[0] | (o[1] << 8) | (o[2] << 16) | (o[3] << 24);
+    out[p] = 0;
 }
 
 static unsigned long* netAddr(int row)
@@ -445,23 +532,17 @@ static void networkEnter(void)
     if (s_mask == 0 && Net_IsUp()) s_mask = parseIp(Net_Subnet());
     if (s_gw == 0 && Net_IsUp()) s_gw = parseIp(Net_Gateway());
     if (s_dns == 0 && Net_IsUp()) s_dns = parseIp(Net_Dns());
-    s_netRow = 0; s_netEdit = 0; s_octet = 0; s_netMsg = 0;
+    s_netRow = 0; s_netOskRow = 0; s_netMsg = 0;
 }
 
-// Draw an editable a.b.c.d inside the pill, right-aligned, highlighting the
-// active octet while editing.
-static void drawAddr(int y, int rowSel, unsigned long a, int editingRow)
+static void drawAddr(int y, int rowSel, unsigned long a)
 {
-    char oc[4][6]; int i, w = 0, x;
-    for (i = 0; i < 4; ++i) uitoa((unsigned)getOctet(a, i), oc[i]);
-    for (i = 0; i < 4; ++i) w += Font_TextWidth(oc[i]);
-    w += 3 * Font_TextWidth(".");             // three dots
-    x = PILL_X + PILL_W - 22 - w;
-    for (i = 0; i < 4; ++i) {
-        DWORD c = (editingRow && i == s_octet) ? EOS_PURPLE : (rowSel ? EOS_WHITE : EOS_DIM);
-        Font_Draw(x, y + 11, oc[i], c); x += Font_TextWidth(oc[i]);
-        if (i < 3) { Font_Draw(x, y + 11, ".", rowSel ? EOS_WHITE : EOS_DIM); x += Font_TextWidth("."); }
-    }
+    char addr[16];
+    int x;
+
+    formatIp(a, addr);
+    x = PILL_X + PILL_W - 22 - Font_TextWidth(addr);
+    Font_Draw(x, y + 11, addr, rowSel ? EOS_WHITE : EOS_DIM);
 }
 
 static void netAddrRow(int row, const char* label, unsigned long a, int isStatic, const char* dhcpStr)
@@ -470,7 +551,7 @@ static void netAddrRow(int row, const char* label, unsigned long a, int isStatic
     int sel = (s_netRow == row);
     rowPill(y, sel, !isStatic, label, 0);
     if (isStatic) {
-        drawAddr(y, sel, a, sel && s_netEdit);
+        drawAddr(y, sel, a);
     }
     else {
         int vx = PILL_X + PILL_W - 22 - Font_TextWidth(dhcpStr);
@@ -484,18 +565,40 @@ static int networkFrame(WORD b, WORD prev)
     int isStatic = (s_netMode == DD_NET_STATIC);
     const char* dip; const char* dsub; const char* dgw; const char* ddns;
 
-    if (s_netEdit) {                          // ---- octet edit submode ----
-        unsigned long* a = netAddr(s_netRow);
-        if (Pressed(b, prev, BTN_DPAD_LEFT))  s_octet = (s_octet + 3) % 4;
-        if (Pressed(b, prev, BTN_DPAD_RIGHT)) s_octet = (s_octet + 1) % 4;
-        if (a && Pressed(b, prev, BTN_DPAD_UP))   setOctet(a, s_octet, (getOctet(*a, s_octet) + 1) & 0xFF);
-        if (a && Pressed(b, prev, BTN_DPAD_DOWN)) setOctet(a, s_octet, (getOctet(*a, s_octet) + 255) & 0xFF);
-        if (Pressed(b, prev, BTN_A) || Pressed(b, prev, BTN_B)) s_netEdit = 0;
+    // While open, the numeric OSK owns all controller input. Start accepts,
+    // Back cancels, and B is handled by the OSK as backspace.
+    if (s_netOskRow) {
+        WORD edges = (WORD)(b & ~prev);
+        int r = Osk_Update(edges);
+
+        if (r == 1) {
+            char entered[16];
+            unsigned long value;
+            unsigned long* a = netAddr(s_netOskRow);
+
+            Osk_GetText(entered, sizeof(entered));
+            if (a && parseIpStrict(entered, &value)) {
+                *a = value;
+                s_netOskRow = 0;
+                s_netMsg = 0;
+            }
+            else {
+                // Return to the Network page so the validation message is visible.
+                // A on the same row reopens the numeric OSK with the unchanged value.
+                s_netOskRow = 0;
+                s_netMsg = "Invalid IPv4 address - use four values from 0 to 255";
+            }
+        }
+        else if (r < 0) {
+            s_netOskRow = 0;
+            s_netMsg = 0;
+        }
     }
-    else {                                   // ---- row navigation ----
+    else {
         if (Pressed(b, prev, BTN_B)) { s_sub = SUB_HUB; return 0; }
         if (Pressed(b, prev, BTN_DPAD_UP))   s_netRow = (s_netRow + rows - 1) % rows;
         if (Pressed(b, prev, BTN_DPAD_DOWN)) s_netRow = (s_netRow + 1) % rows;
+
         if (s_netRow == 0) {
             if (Pressed(b, prev, BTN_A) || Pressed(b, prev, BTN_DPAD_LEFT) || Pressed(b, prev, BTN_DPAD_RIGHT)) {
                 s_netMode = (s_netMode == DD_NET_STATIC) ? DD_NET_DHCP : DD_NET_STATIC;
@@ -503,7 +606,17 @@ static int networkFrame(WORD b, WORD prev)
             }
         }
         else if (s_netRow >= 1 && s_netRow <= 4) {
-            if (isStatic && Pressed(b, prev, BTN_A)) { s_netEdit = 1; s_octet = 0; }
+            if (isStatic && Pressed(b, prev, BTN_A)) {
+                char initial[16];
+                unsigned long* a = netAddr(s_netRow);
+
+                if (a) {
+                    formatIp(*a, initial);
+                    s_netOskRow = s_netRow;
+                    s_netMsg = 0;
+                    Osk_Open(OSK_NUMERIC, initial, 15);
+                }
+            }
         }
         else if (s_netRow == 5) {
             if (Pressed(b, prev, BTN_A))
@@ -525,11 +638,11 @@ static int networkFrame(WORD b, WORD prev)
     netAddrRow(4, "DNS", s_dns, isStatic, ddns);
     rowPill(LIST_Y0 + 5 * LIST_DY, s_netRow == 5, 0, "Apply & Restart", 0);
 
-    if (s_netMsg) Font_DrawCentered(0, g_scrW, LIST_Y0 + 6 * LIST_DY + 6, s_netMsg, EOS_PURPLE);
+    if (s_netMsg)
+        Font_DrawCentered(0, g_scrW, LIST_Y0 + 6 * LIST_DY + 6, s_netMsg, EOS_PURPLE);
 
-    if (s_netEdit)        footer("D-PAD  L/R OCTET   UP/DN VALUE   A/B DONE");
-    else if (isStatic)    footer("D-PAD MOVE   A EDIT/APPLY   B BACK");
-    else                  footer("D-PAD MOVE   A CHANGE MODE   B BACK");
+    if (s_netOskRow) Osk_Draw();
+    else             footer("D-PAD  MOVE      A  SELECT      B  BACK");
     return 0;
 }
 
@@ -593,18 +706,19 @@ static int sAppendS(char* d, int p, const char* srcs)
 }
 
 // Enter the THEME picker: scan disk themes and point the picker at whatever is
-// currently active (a custom theme via set.dat, else the built-in index).
+// currently active (flash-backed custom selection, else the built-in index).
 static void themeEnter(void)
 {
-    char active[EOS_FILE_NAME_MAX];
-    int  nb = Theme_Count(), i;
+    int nb = Theme_Count(), i, src = Config_GetCustomThemeSource();
     s_ctCount = ThemeCustom_Scan(s_ctList, 32);
     s_bgmWork = Config_GetBgmOn();
     s_row = 0;
     s_themePreview = Theme_Index();
-    if (s_ctCount > 0 && SetDat_Read(active, sizeof(active)))
+    if (src != EOS_THEME_SOURCE_BUILTIN)
         for (i = 0; i < s_ctCount; ++i)
-            if (folderEq(s_ctList[i], active)) { s_themePreview = nb + i; break; }
+            if (s_ctList[i].source == src && Config_CustomThemeMatches(s_ctList[i].name)) {
+                s_themePreview = nb + i; break;
+            }
 }
 
 // One continuous theme list: built-ins [0..nb-1] then custom disk themes
@@ -639,7 +753,7 @@ static int themeFrame(WORD b, WORD prev)
         if (dir) {
             s_themePreview = (s_themePreview + dir + total) % total;
             if (s_themePreview < nb) Theme_Preview(s_themePreview);
-            else ThemeCustom_Apply(s_ctList[s_themePreview - nb]);
+            else ThemeCustom_Apply(s_ctList[s_themePreview - nb].name, s_ctList[s_themePreview - nb].source);
             isCustom = (s_themePreview >= nb);
             if (isCustom) s_row = 0;
         }
@@ -657,13 +771,12 @@ static int themeFrame(WORD b, WORD prev)
     // Commit + leave (B always; A unless on the built-in Track row).
     if (Pressed(b, prev, BTN_B) || (Pressed(b, prev, BTN_A) && !(!isCustom && s_row == 2))) {
         if (isCustom) {
-            SetDat_Write(s_ctList[s_themePreview - nb]);   // persist custom selection
+            Config_SetCustomTheme(s_ctList[s_themePreview - nb].source, s_ctList[s_themePreview - nb].name);
             // colors + background already applied; audio resyncs on Settings exit
         }
         else {
             Theme_Commit();                 // persist built-in index
             Config_SetBgmOn(s_bgmWork);
-            SetDat_Clear();                 // drop any custom selection
             ThemeCustom_Clear();            // -> audio falls back to global BGM
         }
         s_sub = SUB_HUB;
@@ -673,10 +786,12 @@ static int themeFrame(WORD b, WORD prev)
     // ---- draw ----
     titleBar("THEME");
 
-    nm = (s_themePreview < nb) ? Theme_Name(s_themePreview) : s_ctList[s_themePreview - nb];
+    nm = (s_themePreview < nb) ? Theme_Name(s_themePreview) : s_ctList[s_themePreview - nb].name;
     {
         DWORD col = (s_row == 0) ? EOS_WHITE : EOS_DIM;
-        p = sAppendS(line, 0, "Theme:            "); p = sAppendS(line, p, nm ? nm : "?"); line[p] = 0;
+        p = sAppendS(line, 0, "Theme:            "); p = sAppendS(line, p, nm ? nm : "?");
+        if (isCustom) p = sAppendS(line, p, s_ctList[s_themePreview - nb].source == EOS_THEME_SOURCE_SD ? " [SD]" : " [HDD]");
+        line[p] = 0;
         Font_DrawCentered(0, g_scrW, 150, line, col);
     }
 
@@ -820,16 +935,25 @@ static int lcdFrame(WORD b, WORD prev)
 }
 int Settings_Frame(WORD b, WORD prevBtn)
 {
+    int before = s_sub;
+    int result;
+
     switch (s_sub) {
-    case SUB_SYSINFO:  return sysinfoFrame(b, prevBtn);
-    case SUB_VIDEO:    return videoFrame(b, prevBtn);
-    case SUB_AUDIO:    return audioFrame(b, prevBtn);
-    case SUB_AUTOBOOT: return autoBootFrame(b, prevBtn);
-    case SUB_REGION:   return regionFrame(b, prevBtn);
-    case SUB_NETWORK:  return networkFrame(b, prevBtn);
-    case SUB_DATETIME: return datetimeFrame(b, prevBtn);
-    case SUB_THEME:    return themeFrame(b, prevBtn);
-    case SUB_LCD:      return lcdFrame(b, prevBtn);
+    case SUB_SYSINFO:  result = sysinfoFrame(b, prevBtn); break;
+    case SUB_VIDEO:    result = videoFrame(b, prevBtn); break;
+    case SUB_AUDIO:    result = audioFrame(b, prevBtn); break;
+    case SUB_AUTOBOOT: result = autoBootFrame(b, prevBtn); break;
+    case SUB_REGION:   result = regionFrame(b, prevBtn); break;
+    case SUB_NETWORK:  result = networkFrame(b, prevBtn); break;
+    case SUB_DATETIME: result = datetimeFrame(b, prevBtn); break;
+    case SUB_THEME:    result = themeFrame(b, prevBtn); break;
+    case SUB_LCD:      result = lcdFrame(b, prevBtn); break;
+    case SUB_EOS:      result = eosSettingsFrame(b, prevBtn); break;
+    default:           result = hubFrame(b, prevBtn); break;
     }
-    return hubFrame(b, prevBtn);
+
+    // Settings sub-pages share PH_SETTINGS, so explicitly give category changes
+    // the same lightweight transition used by top-level phase changes.
+    if (s_sub != before) Ui_TransitionStart();
+    return result;
 }

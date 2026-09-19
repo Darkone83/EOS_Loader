@@ -54,10 +54,12 @@ static int httpDescSlot(int idx)
 static char   s_json[HTTP_JSON_MAX];
 static char   s_resp[HTTP_RESP_MAX];
 static char   s_name[80];
-static char   s_tFolder[64], s_tName[64];       // theme route query params
+static char   s_tFolder[64], s_tName[64], s_tLoc[8]; // theme route query params
 static char   s_sdPath[160];                    // SD manager path (root-relative)
 static char   s_colorStr[10];                   // /api/setcolor ?c=RRGGBB
 static HANDLE s_upFile = INVALID_HANDLE_VALUE;  // streaming theme-file upload
+static FIL    s_sdUpFile;                       // SD theme-file streaming upload
+static int    s_sdUpOpen = 0;
 
 // send segments: headers then body
 static const char* s_txH; static int s_txHLen, s_txHOff;
@@ -143,8 +145,8 @@ static const char* k_page =
 ".modalcard{background:var(--card);border:1px solid var(--p);border-radius:10px;padding:20px;max-width:460px;width:100%;max-height:90vh;overflow:auto;}\n"
 ".modalcard h2{margin:0 0 12px;color:var(--p);font-size:18px;}\n"
 ".modalcard label{display:block;margin:9px 0;font-size:12px;color:var(--dim);}\n"
-".modalcard input{background:#0f0f16;border:1px solid #2c2c38;border-radius:6px;color:var(--txt);padding:6px;}\n"
-".modalcard input#mname,.modalcard input[type=file]{width:100%;display:block;margin-top:4px;}\n"
+".modalcard input,.modalcard select{background:#0f0f16;border:1px solid #2c2c38;border-radius:6px;color:var(--txt);padding:6px;}\n"
+".modalcard input#mname,.modalcard input[type=file],.modalcard select#mloc{width:100%;display:block;margin-top:4px;}\n"
 ".modalcard input[type=color]{width:46px;height:28px;padding:2px;vertical-align:middle;cursor:pointer;}\n"
 ".modalcard input[type=range]{width:70%;padding:0;vertical-align:middle;}\n"
 "#colors{display:grid;grid-template-columns:1fr 1fr;gap:2px 10px;}\n"
@@ -166,6 +168,7 @@ static const char* k_page =
 "<div id=modal class=modal><div class=modalcard>\n"
 " <h2 id=mtitle>Create Theme</h2>\n"
 " <label>Name<input id=mname></label>\n"
+" <label>Storage<select id=mloc><option value=hdd>HDD</option><option value=sd>SD Card</option></select></label>\n"
 " <div id=colors></div>\n"
 " <label>Background dim <input id=mdim type=range min=0 max=100 value=40> <span id=mdimv>40</span></label>\n"
 " <label>Background image (png or jpg)<input id=mbg type=file accept=image/png,image/jpeg></label>\n"
@@ -303,7 +306,7 @@ static const char* k_page =
 "}\n"
 "const CK=[['bg_top','BG Top'],['bg_bottom','BG Bottom'],['panel','Panel'],['accent','Accent'],['glow','Glow'],['text','Text'],['text_dim','Text Dim']];\n"
 "const CDEF={bg_top:'#0a0a0f',bg_bottom:'#05050a',panel:'#15151c',accent:'#a855f7',glow:'#c77dff',text:'#e8e8ef',text_dim:'#6a6a78'};\n"
-"let editFolder=null,curBg='',curMus='';\n"
+"let editFolder=null,editLoc='hdd',curBg='',curMus='';\n"
 "function showModal(on){document.getElementById('modal').style.display=on?'flex':'none';}\n"
 "function extOf(fn){let i=fn.lastIndexOf('.');return i>=0?fn.slice(i).toLowerCase():'';}\n"
 "function normColor(c){c=(c||'').trim().toLowerCase();if(c.length==7&&c[0]=='#'){let ok=true;for(let i=1;i<7;i++){let h=c[i];if(!((h>='0'&&h<='9')||(h>='a'&&h<='f')))ok=false;}if(ok)return c;}return '#888888';}\n"
@@ -314,25 +317,25 @@ static const char* k_page =
 " let c=document.createElement('div');c.className='card';c.id='themecard';let h=document.createElement('h2');h.textContent='Custom Themes';c.appendChild(h);\n"
 " let info=document.createElement('div');info.className='info';\n"
 " if(!t.themes||!t.themes.length){let e=document.createElement('div');e.className='kv';e.textContent='No custom themes yet';info.appendChild(e);}\n"
-" else{for(const nm of t.themes){let row=document.createElement('div');row.className='kv';let k=document.createElement('span');k.className='k';k.textContent=nm;row.appendChild(k);let v=document.createElement('span');v.appendChild(btn('Edit','',function(){openEdit(nm);}));v.appendChild(btn('Delete','danger',function(){delTheme(nm);}));row.appendChild(v);info.appendChild(row);}}\n"
+" else{for(const id of t.themes){let q=id.indexOf('|'),loc=(q>=0?id.slice(0,q):'HDD').toLowerCase(),nm=q>=0?id.slice(q+1):id;let row=document.createElement('div');row.className='kv';let k=document.createElement('span');k.className='k';k.textContent=nm+'  ['+loc.toUpperCase()+']';row.appendChild(k);let v=document.createElement('span');v.appendChild(btn('Edit','',function(){openEdit(nm,loc);}));v.appendChild(btn('Delete','danger',function(){delTheme(nm,loc);}));row.appendChild(v);info.appendChild(row);}}\n"
 " c.appendChild(info);let r2=document.createElement('div');r2.className='row';r2.appendChild(btn('Create Theme','go',openCreate));c.appendChild(r2);host.appendChild(c);}\n"
-"function openCreate(){editFolder=null;curBg='';curMus='';document.getElementById('mtitle').textContent='Create Theme';let mn=document.getElementById('mname');mn.value='';mn.disabled=false;document.getElementById('mdim').value=40;document.getElementById('mdimv').textContent='40';document.getElementById('mbg').value='';document.getElementById('mmus').value='';for(const kc of CK)document.getElementById('c_'+kc[0]).value=CDEF[kc[0]];document.getElementById('mprog').textContent='';showModal(true);}\n"
-"async function openEdit(folder){editFolder=folder;document.getElementById('mtitle').textContent='Edit Theme';let mn=document.getElementById('mname');mn.value=folder;mn.disabled=true;document.getElementById('mbg').value='';document.getElementById('mmus').value='';document.getElementById('mprog').textContent='';\n"
-" let txt='';try{let r=await fetch('/api/theme/ini?folder='+encodeURIComponent(folder));txt=await r.text();}catch(e){}let kv=parseIni(txt);curBg=kv.background||'';curMus=kv.music||'';\n"
+"function openCreate(){editFolder=null;editLoc='hdd';curBg='';curMus='';document.getElementById('mtitle').textContent='Create Theme';let mn=document.getElementById('mname');mn.value='';mn.disabled=false;let ml=document.getElementById('mloc');ml.value='hdd';ml.disabled=false;document.getElementById('mdim').value=40;document.getElementById('mdimv').textContent='40';document.getElementById('mbg').value='';document.getElementById('mmus').value='';for(const kc of CK)document.getElementById('c_'+kc[0]).value=CDEF[kc[0]];document.getElementById('mprog').textContent='';showModal(true);}\n"
+"async function openEdit(folder,loc){editFolder=folder;editLoc=loc||'hdd';document.getElementById('mtitle').textContent='Edit Theme';let mn=document.getElementById('mname');mn.value=folder;mn.disabled=true;let ml=document.getElementById('mloc');ml.value=editLoc;ml.disabled=true;document.getElementById('mbg').value='';document.getElementById('mmus').value='';document.getElementById('mprog').textContent='';\n"
+" let txt='';try{let r=await fetch('/api/theme/ini?folder='+encodeURIComponent(folder)+'&loc='+encodeURIComponent(editLoc));txt=await r.text();}catch(e){}let kv=parseIni(txt);curBg=kv.background||'';curMus=kv.music||'';\n"
 " let dim=kv.bg_dim||'0';document.getElementById('mdim').value=dim;document.getElementById('mdimv').textContent=dim;for(const kc of CK)document.getElementById('c_'+kc[0]).value=normColor(kv[kc[0]]);showModal(true);}\n"
 "function resizeImage(file){return new Promise(function(resolve){let img=new Image();img.onload=function(){let w=img.width,h=img.height,MX=1280,MY=720;if(w<=MX&&h<=MY){resolve(file);return;}let s=Math.min(MX/w,MY/h);let nw=Math.round(w*s),nh=Math.round(h*s);let cv=document.createElement('canvas');cv.width=nw;cv.height=nh;cv.getContext('2d').drawImage(img,0,0,nw,nh);let type=(file.type&&file.type.indexOf('png')>=0)?'image/png':'image/jpeg';cv.toBlob(function(b){resolve(b||file);},type,0.9);};img.onerror=function(){resolve(file);};img.src=URL.createObjectURL(file);});}\n"
-"async function saveTheme(){let name=editFolder||document.getElementById('mname').value.trim().replace(/[^A-Za-z0-9 _-]/g,'');if(!name){alert('Name required');return;}\n"
+"async function saveTheme(){let name=editFolder||document.getElementById('mname').value.trim().replace(/[^A-Za-z0-9 _-]/g,'');if(!name){alert('Name required');return;}let loc=editFolder?editLoc:document.getElementById('mloc').value;\n"
 " let bgFile=document.getElementById('mbg').files[0];let musFile=document.getElementById('mmus').files[0];let prog=document.getElementById('mprog');\n"
 " let bgName=bgFile?('background'+extOf(bgFile.name)):curBg;let musName=musFile?('music'+extOf(musFile.name)):curMus;\n"
 " let ini='version = 1\\nname = '+name+'\\n';if(bgName)ini+='background = '+bgName+'\\n';ini+='bg_dim = '+document.getElementById('mdim').value+'\\n';if(musName)ini+='music = '+musName+'\\n';\n"
 " for(const kc of CK)ini+=kc[0]+' = '+document.getElementById('c_'+kc[0]).value+'\\n';\n"
 " prog.textContent='Saving theme...';try{\n"
-"  await fetch('/api/theme/ini?folder='+encodeURIComponent(name),{method:'POST',body:ini});\n"
-"  if(bgFile){prog.textContent='Uploading background...';let blob=await resizeImage(bgFile);await fetch('/api/theme/file?folder='+encodeURIComponent(name)+'&name='+encodeURIComponent(bgName),{method:'POST',body:blob});}\n"
-"  if(musFile){prog.textContent='Uploading music...';await fetch('/api/theme/file?folder='+encodeURIComponent(name)+'&name='+encodeURIComponent(musName),{method:'POST',body:musFile});}\n"
+"  await fetch('/api/theme/ini?folder='+encodeURIComponent(name)+'&loc='+encodeURIComponent(loc),{method:'POST',body:ini});\n"
+"  if(bgFile){prog.textContent='Uploading background...';let blob=await resizeImage(bgFile);await fetch('/api/theme/file?folder='+encodeURIComponent(name)+'&name='+encodeURIComponent(bgName)+'&loc='+encodeURIComponent(loc),{method:'POST',body:blob});}\n"
+"  if(musFile){prog.textContent='Uploading music...';await fetch('/api/theme/file?folder='+encodeURIComponent(name)+'&name='+encodeURIComponent(musName)+'&loc='+encodeURIComponent(loc),{method:'POST',body:musFile});}\n"
 "  prog.textContent='';showModal(false);msg('Theme saved');renderThemes();\n"
 " }catch(e){prog.textContent='Save failed';}}\n"
-"async function delTheme(folder){if(!confirm('Delete theme \"'+folder+'\" ?'))return;try{await fetch('/api/theme/del?folder='+encodeURIComponent(folder),{method:'POST'});}catch(e){}msg('Theme deleted');renderThemes();}\n"
+"async function delTheme(folder,loc){if(!confirm('Delete theme \"'+folder+'\" from '+loc.toUpperCase()+'?'))return;try{await fetch('/api/theme/del?folder='+encodeURIComponent(folder)+'&loc='+encodeURIComponent(loc),{method:'POST'});}catch(e){}msg('Theme deleted');renderThemes();}\n"
 "let sdPath='/';let sdUpload=document.createElement('input');sdUpload.type='file';sdUpload.accept='.bin';\n"
 "function sdFmt(n){if(n==1048576)return '1 MB';if(n==524288)return '512 KB';if(n==262144)return '256 KB';return n+' B';}\n"
 "function sdParent(p){if(p==='/'||!p)return '/';let q=p.replace(/\\/$/,'');let i=q.lastIndexOf('/');return i<=0?'/':q.slice(0,i+1);}\n"
@@ -620,10 +623,15 @@ static int buildSdJson(char* o, const char* path)
     return p;
 }
 
-// Build "E:\Eos\Themes\<folder>" (+ "\<leaf>" when leaf != 0).
-static void themePath(char* out, int cap, const char* folder, const char* leaf)
+static int themeLocSd(void)
 {
-    const char* pre = "E:\\Eos\\Themes\\";
+    return s_tLoc[0] == 's' || s_tLoc[0] == 'S';
+}
+
+// Build HDD or virtual SD theme path. File_* understands the SD:\ prefix.
+static void themePath(char* out, int cap, const char* folder, const char* leaf, int sd)
+{
+    const char* pre = sd ? "SD:\\Eos\\Themes\\" : "E:\\Eos\\Themes\\";
     int p = 0, i = 0;
     while (pre[i] && p < cap - 1) out[p++] = pre[i++];
     for (i = 0; folder[i] && p < cap - 1; ++i) out[p++] = folder[i];
@@ -634,7 +642,33 @@ static void themePath(char* out, int cap, const char* folder, const char* leaf)
     out[p] = 0;
 }
 
-// {"themes":["Name",...]} -- folders under E:\Eos\Themes with a theme.ini.
+// Native FatFs path for SD theme writes/deletes.
+static void sdThemePath(char* out, int cap, const char* folder, const char* leaf)
+{
+    const char* pre = "/Eos/Themes/";
+    int p = 0, i = 0;
+    while (pre[i] && p < cap - 1) out[p++] = pre[i++];
+    for (i = 0; folder[i] && p < cap - 1; ++i) out[p++] = folder[i];
+    if (leaf) {
+        if (p < cap - 1) out[p++] = '/';
+        for (i = 0; leaf[i] && p < cap - 1; ++i) out[p++] = leaf[i];
+    }
+    out[p] = 0;
+}
+
+static int sdEnsureThemeDir(const char* folder)
+{
+    char dir[160];
+    FRESULT fr;
+    if (Sd_Mount() != EOS_SD_OK) return 0;
+    fr = f_mkdir("/Eos"); if (fr != FR_OK && fr != FR_EXIST) return 0;
+    fr = f_mkdir("/Eos/Themes"); if (fr != FR_OK && fr != FR_EXIST) return 0;
+    sdThemePath(dir, sizeof(dir), folder, 0);
+    fr = f_mkdir(dir); if (fr != FR_OK && fr != FR_EXIST) return 0;
+    return 1;
+}
+
+// {"themes":["HDD|Name","SD|Name",...]} -- both theme roots.
 static int buildThemesJson(char* o)
 {
     static EosFileEntry ents[64];
@@ -644,27 +678,53 @@ static int buildThemesJson(char* o)
     p += appS(o + p, "{\"themes\":[");
     for (i = 0; i < n; ++i) {
         if (!ents[i].is_dir) continue;
-        themePath(ini, sizeof(ini), ents[i].name, "theme.ini");
+        themePath(ini, sizeof(ini), ents[i].name, "theme.ini", 0);
         if (!File_Exists(ini)) continue;
         if (!first) o[p++] = ',';
         first = 0;
-        o[p++] = '"'; p += appJson(o + p, ents[i].name); o[p++] = '"';
+        p += appS(o + p, "\"HDD|"); p += appJson(o + p, ents[i].name); o[p++] = '"';
+    }
+    n = File_ListDir("SD:\\Eos\\Themes", ents, 64);
+    for (i = 0; i < n && p < HTTP_JSON_MAX - 128; ++i) {
+        if (!ents[i].is_dir) continue;
+        themePath(ini, sizeof(ini), ents[i].name, "theme.ini", 1);
+        if (!File_Exists(ini)) continue;
+        if (!first) o[p++] = ',';
+        first = 0;
+        p += appS(o + p, "\"SD|"); p += appJson(o + p, ents[i].name); o[p++] = '"';
     }
     p += appS(o + p, "]}");
     return p;
 }
 
-// Delete every file in a theme folder (flat), then the folder. 1 on rmdir ok.
-static int deleteThemeFolder(const char* folder)
+// Delete every file in a theme folder (flat), then the folder.
+static int deleteThemeFolder(const char* folder, int sd)
 {
     static EosFileEntry ents[64];
     char dir[256], fp[256];
     int  n, i;
-    themePath(dir, sizeof(dir), folder, 0);
+    if (sd) {
+        DIR d; FILINFO fno; FRESULT fr;
+        if (Sd_Mount() != EOS_SD_OK) return 0;
+        sdThemePath(dir, sizeof(dir), folder, 0);
+        fr = f_opendir(&d, dir);
+        if (fr == FR_OK) {
+            for (;;) {
+                fr = f_readdir(&d, &fno);
+                if (fr != FR_OK || fno.fname[0] == 0) break;
+                if (fno.fattrib & AM_DIR) continue;
+                sdThemePath(fp, sizeof(fp), folder, fno.fname);
+                f_unlink(fp);
+            }
+            f_closedir(&d);
+        }
+        return f_unlink(dir) == FR_OK;
+    }
+    themePath(dir, sizeof(dir), folder, 0, 0);
     n = File_ListDir(dir, ents, 64);
     for (i = 0; i < n; ++i) {
         if (ents[i].is_dir) continue;
-        themePath(fp, sizeof(fp), folder, ents[i].name);
+        themePath(fp, sizeof(fp), folder, ents[i].name, 0);
         DeleteFileA(fp);
     }
     return RemoveDirectoryA(dir) ? 1 : 0;
@@ -703,6 +763,7 @@ static void parseReq(void)
     if (s_route == R_THEMES || s_route == R_TINI || s_route == R_TFILE || s_route == R_TDEL) {
         qStr(path, "folder", s_tFolder, sizeof(s_tFolder));
         qStr(path, "name", s_tName, sizeof(s_tName));
+        qStr(path, "loc", s_tLoc, sizeof(s_tLoc));
     }
     if (s_route == R_SETCOLOR) {
         qStr(path, "c", s_colorStr, sizeof(s_colorStr));   // hex RRGGBB (no '#')
@@ -799,36 +860,53 @@ static void process(void)
         if (!safeName(s_tFolder)) { respondText("400 Bad Request", "bad folder"); return; }
         if (s_method == M_GET) {
             int rd;
-            themePath(fp, sizeof(fp), s_tFolder, "theme.ini");
+            themePath(fp, sizeof(fp), s_tFolder, "theme.ini", themeLocSd());
             rd = File_ReadInto(fp, s_rx, HTTP_RX_MAX - 1);
             if (rd < 0) { respondText("404 Not Found", "no theme.ini"); return; }
             respond("200 OK", "text/plain", (const char*)s_rx, rd);
             return;
         }
         {   // POST: write the body as theme.ini (folder auto-created)
-            char dir[256]; HANDLE h; DWORD wr;
-            themePath(dir, sizeof(dir), s_tFolder, 0);
-            CreateDirectoryA("E:\\Eos", NULL);
-            CreateDirectoryA("E:\\Eos\\Themes", NULL);
-            CreateDirectoryA(dir, NULL);
-            themePath(fp, sizeof(fp), s_tFolder, "theme.ini");
-            h = CreateFileA(fp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (h == INVALID_HANDLE_VALUE) { respondText("500 Error", "open failed"); return; }
-            WriteFile(h, s_rx, (DWORD)s_rxStore, &wr, NULL);
-            CloseHandle(h);
+            if (themeLocSd()) {
+                FIL f; FRESULT fr; UINT bw = 0; int opened = 0;
+                if (!sdEnsureThemeDir(s_tFolder)) { respondText("503 Unavailable", "SD card unavailable"); return; }
+                sdThemePath(fp, sizeof(fp), s_tFolder, "theme.ini");
+                fr = f_open(&f, fp, FA_WRITE | FA_CREATE_ALWAYS);
+                if (fr == FR_OK) opened = 1;
+                if (fr == FR_OK) fr = f_write(&f, s_rx, (UINT)s_rxStore, &bw);
+                if (fr == FR_OK) fr = f_sync(&f);
+                if (opened) f_close(&f);
+                if (fr != FR_OK || bw != (UINT)s_rxStore) { respondText("500 Error", "SD write failed"); return; }
+            }
+            else {
+                char dir[256]; HANDLE h; DWORD wr;
+                themePath(dir, sizeof(dir), s_tFolder, 0, 0);
+                CreateDirectoryA("E:\\Eos", NULL);
+                CreateDirectoryA("E:\\Eos\\Themes", NULL);
+                CreateDirectoryA(dir, NULL);
+                themePath(fp, sizeof(fp), s_tFolder, "theme.ini", 0);
+                h = CreateFileA(fp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (h == INVALID_HANDLE_VALUE) { respondText("500 Error", "open failed"); return; }
+                WriteFile(h, s_rx, (DWORD)s_rxStore, &wr, NULL);
+                CloseHandle(h);
+            }
             respondText("200 OK", "ini saved");
             return;
         }
     }
     if (s_route == R_TFILE) {
         if (s_upFile != INVALID_HANDLE_VALUE) { CloseHandle(s_upFile); s_upFile = INVALID_HANDLE_VALUE; }
+        if (s_sdUpOpen) {
+            if (f_sync(&s_sdUpFile) != FR_OK) s_err = 500;
+            f_close(&s_sdUpFile); s_sdUpOpen = 0;
+        }
         if (s_err) { respondText("500 Error", "upload failed"); return; }
         respondText("200 OK", "file saved");
         return;
     }
     if (s_route == R_TDEL) {
         if (!safeName(s_tFolder)) { respondText("400 Bad Request", "bad folder"); return; }
-        deleteThemeFolder(s_tFolder);
+        deleteThemeFolder(s_tFolder, themeLocSd());
         respondText("200 OK", "theme deleted");
         return;
     }
@@ -998,6 +1076,7 @@ static void process(void)
 static void closeConn(void)
 {
     if (s_upFile != INVALID_HANDLE_VALUE) { CloseHandle(s_upFile); s_upFile = INVALID_HANDLE_VALUE; }
+    if (s_sdUpOpen) { f_close(&s_sdUpFile); s_sdUpOpen = 0; }
     if (s_conn != INVALID_SOCKET) { closesocket(s_conn); s_conn = INVALID_SOCKET; }
     s_state = ST_IDLE; s_launch = -1;
 }
@@ -1023,14 +1102,25 @@ static void beginBody(void)
     else if (s_route == R_TFILE) {
         // stream the upload straight to disk (mp3 far exceeds s_rx)
         if (s_upFile != INVALID_HANDLE_VALUE) { CloseHandle(s_upFile); s_upFile = INVALID_HANDLE_VALUE; }
+        if (s_sdUpOpen) { f_close(&s_sdUpFile); s_sdUpOpen = 0; }
         if (!safeName(s_tFolder) || !safeName(s_tName)) { s_err = 400; s_store = 0; }
+        else if (themeLocSd()) {
+            char fp[256]; FRESULT fr;
+            if (!sdEnsureThemeDir(s_tFolder)) { s_err = 503; s_store = 0; }
+            else {
+                sdThemePath(fp, sizeof(fp), s_tFolder, s_tName);
+                fr = f_open(&s_sdUpFile, fp, FA_WRITE | FA_CREATE_ALWAYS);
+                if (fr != FR_OK) { s_err = 500; s_store = 0; }
+                else s_sdUpOpen = 1;
+            }
+        }
         else {
             char dir[256], fp[256];
-            themePath(dir, sizeof(dir), s_tFolder, 0);
+            themePath(dir, sizeof(dir), s_tFolder, 0, 0);
             CreateDirectoryA("E:\\Eos", NULL);
             CreateDirectoryA("E:\\Eos\\Themes", NULL);
             CreateDirectoryA(dir, NULL);
-            themePath(fp, sizeof(fp), s_tFolder, s_tName);
+            themePath(fp, sizeof(fp), s_tFolder, s_tName, 0);
             s_upFile = CreateFileA(fp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             if (s_upFile == INVALID_HANDLE_VALUE) { s_err = 500; s_store = 0; }
         }
@@ -1064,9 +1154,16 @@ static void stashBody(const char* src, int len)
         s_rxStore += room;
     }
     else if (s_route == R_TFILE) {
-        if (s_upFile != INVALID_HANDLE_VALUE) {
+        if (s_sdUpOpen) {
+            UINT wr = 0;
+            FRESULT fr = f_write(&s_sdUpFile, src, (UINT)len, &wr);
+            if (fr != FR_OK || wr != (UINT)len) { s_err = 500; s_store = 0; }
+            else s_rxStore += len;
+        }
+        else if (s_upFile != INVALID_HANDLE_VALUE) {
             DWORD wr; WriteFile(s_upFile, src, (DWORD)len, &wr, NULL);
-            s_rxStore += len;
+            if (wr != (DWORD)len) { s_err = 500; s_store = 0; }
+            else s_rxStore += len;
         }
     }
     s_rxRecv += len;

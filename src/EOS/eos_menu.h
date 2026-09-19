@@ -1,5 +1,5 @@
-// eos_menu.h -- EOS Loader main menu (Launch Bank / Bank Management / Settings).
-// Selectable stubs for the POC; themable later.
+// eos_menu.h -- EOS Loader main menu.
+// Main loader navigation and rendering.
 #pragma once
 #include "eos_gfx.h"
 
@@ -9,6 +9,7 @@ enum EosMenuId
     EOS_MENU_BANK_MGMT,
     EOS_MENU_TOOLS,
     EOS_MENU_SETTINGS,
+    EOS_MENU_POWER,
     EOS_MENU_ABOUT,
     EOS_MENU_COUNT
 };
@@ -28,4 +29,3 @@ void Menu_Draw();
 // splash -> menu hand-off so the two screens feel like one continuous motion.
 void Menu_DrawIntro(int progress);
 
-int  Menu_Selected();   // current highlighted index

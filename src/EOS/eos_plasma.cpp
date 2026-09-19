@@ -44,7 +44,8 @@ struct PVtx { float x, y, z, rhw; DWORD color; };
 static PVtx s_grid[PLZ_GY][PLZ_GX];        // base positions (design space) + live colour
 static PVtx s_strip[PLZ_GX * 2];           // one row-pair strip
 
-// scanline + vignette geometry (built once; positions/colours fixed)
+// Scanline + vignette geometry. Positions are refreshed each frame so the CRT
+// treatment follows the plasma camera window instead of remaining screen-fixed.
 #define PLZ_SCAN_MAX 260
 static PVtx s_scan[PLZ_SCAN_MAX * 6];      // triangle list, 2 tris per dark line
 static int  s_scanVerts = 0;
@@ -98,10 +99,8 @@ static float MapY(float dy) { return (float)g_oy + dy * g_sy; }
 // ---- init -----------------------------------------------------------------
 int Plasma_Init(void)
 {
-    int i, j, sy, n;
+    int i, j;
     float dx, dy;
-    DWORD scanCol, vigEdge, vigCtr;
-    float x0, x1, y0, y1;
 
     if (s_ready) return 1;
     if (s_tried) return 0;
@@ -121,43 +120,62 @@ int Plasma_Init(void)
         }
     }
 
-    // scanline batch: a dark quad on every other design row (2 tris each)
-    scanCol = D3DCOLOR_ARGB(PLZ_SCAN_A, 0, 0, 0);
-    n = 0;
-    for (sy = 1; sy < g_scrH; sy += 2) {
-        if (n + 6 > PLZ_SCAN_MAX * 6) break;
-        x0 = MapX(0.0f);             x1 = MapX((float)g_scrW);
-        y0 = MapY((float)sy - 0.5f); y1 = MapY((float)sy + 0.5f);
-        s_scan[n + 0].x = x0; s_scan[n + 0].y = y0;
-        s_scan[n + 1].x = x1; s_scan[n + 1].y = y0;
-        s_scan[n + 2].x = x0; s_scan[n + 2].y = y1;
-        s_scan[n + 3].x = x1; s_scan[n + 3].y = y0;
-        s_scan[n + 4].x = x1; s_scan[n + 4].y = y1;
-        s_scan[n + 5].x = x0; s_scan[n + 5].y = y1;
-        for (i = 0; i < 6; ++i) { s_scan[n + i].z = 0.0f; s_scan[n + i].rhw = 1.0f; s_scan[n + i].color = scanCol; }
-        n += 6;
-    }
-    s_scanVerts = n;
-
-    // vignette fan: transparent centre, dark corners
-    vigEdge = D3DCOLOR_ARGB(PLZ_VIG_A, 0, 0, 0);
-    vigCtr = D3DCOLOR_ARGB(0, 0, 0, 0);
-    x0 = MapX(0.0f); x1 = MapX((float)g_scrW);
-    y0 = MapY(0.0f); y1 = MapY((float)g_scrH);
-    s_vig[0].x = MapX((float)g_scrW * 0.5f); s_vig[0].y = MapY((float)g_scrH * 0.5f); s_vig[0].color = vigCtr;
-    s_vig[1].x = x0; s_vig[1].y = y0; s_vig[1].color = vigEdge;
-    s_vig[2].x = x1; s_vig[2].y = y0; s_vig[2].color = vigEdge;
-    s_vig[3].x = x1; s_vig[3].y = y1; s_vig[3].color = vigEdge;
-    s_vig[4].x = x0; s_vig[4].y = y1; s_vig[4].color = vigEdge;
-    s_vig[5].x = x0; s_vig[5].y = y0; s_vig[5].color = vigEdge;
-    for (i = 0; i < 6; ++i) { s_vig[i].z = 0.0f; s_vig[i].rhw = 1.0f; }
-
     s_ready = 1;
     return 1;
 }
 
 int  Plasma_Ready(void) { return s_ready; }
 void Plasma_Free(void) { s_ready = 0; }
+
+// Apply the same slow zoom/rotation used by the plasma grid to one overlay point.
+// The small per-grid wobble intentionally remains a plasma-surface deformation;
+// the CRT scanline/vignette frame follows the camera window as a single layer.
+static void OverlayPoint(PVtx* v, float x, float y, DWORD color,
+    float zoom, float ca, float sa, float cx, float cy)
+{
+    float tx = (x - cx) * zoom;
+    float ty = (y - cy) * zoom;
+    float rx = tx * ca - ty * sa;
+    float ry = tx * sa + ty * ca;
+
+    v->x = MapX(rx + cx);
+    v->y = MapY(ry + cy);
+    v->z = 0.0f;
+    v->rhw = 1.0f;
+    v->color = color;
+}
+
+static void UpdateOverlayGeometry(float zoom, float ca, float sa, float cx, float cy)
+{
+    int sy, n;
+    DWORD scanCol = D3DCOLOR_ARGB(PLZ_SCAN_A, 0, 0, 0);
+    DWORD vigEdge = D3DCOLOR_ARGB(PLZ_VIG_A, 0, 0, 0);
+    DWORD vigCtr = D3DCOLOR_ARGB(0, 0, 0, 0);
+    float x0 = 0.0f, x1 = (float)g_scrW;
+    float y0, y1;
+
+    n = 0;
+    for (sy = 1; sy < g_scrH; sy += 2) {
+        if (n + 6 > PLZ_SCAN_MAX * 6) break;
+        y0 = (float)sy - 0.5f;
+        y1 = (float)sy + 0.5f;
+        OverlayPoint(&s_scan[n + 0], x0, y0, scanCol, zoom, ca, sa, cx, cy);
+        OverlayPoint(&s_scan[n + 1], x1, y0, scanCol, zoom, ca, sa, cx, cy);
+        OverlayPoint(&s_scan[n + 2], x0, y1, scanCol, zoom, ca, sa, cx, cy);
+        OverlayPoint(&s_scan[n + 3], x1, y0, scanCol, zoom, ca, sa, cx, cy);
+        OverlayPoint(&s_scan[n + 4], x1, y1, scanCol, zoom, ca, sa, cx, cy);
+        OverlayPoint(&s_scan[n + 5], x0, y1, scanCol, zoom, ca, sa, cx, cy);
+        n += 6;
+    }
+    s_scanVerts = n;
+
+    OverlayPoint(&s_vig[0], cx, cy, vigCtr, zoom, ca, sa, cx, cy);
+    OverlayPoint(&s_vig[1], x0, 0.0f, vigEdge, zoom, ca, sa, cx, cy);
+    OverlayPoint(&s_vig[2], x1, 0.0f, vigEdge, zoom, ca, sa, cx, cy);
+    OverlayPoint(&s_vig[3], x1, (float)g_scrH, vigEdge, zoom, ca, sa, cx, cy);
+    OverlayPoint(&s_vig[4], x0, (float)g_scrH, vigEdge, zoom, ca, sa, cx, cy);
+    s_vig[5] = s_vig[1];
+}
 
 // ---- per-vertex colour field (the plasma proper) --------------------------
 static void UpdateColors(float t)
@@ -268,6 +286,7 @@ void Plasma_Draw(float tsec)
     cx = (float)g_scrW * 0.5f; cy = (float)g_scrH * 0.5f;
     ph = PSin(t * 0.5f);      // shared wobble phase pieces (per-frame)
     phY = PCos(t * 0.37f);
+    UpdateOverlayGeometry(zoom, ca, sa, cx, cy);
 
     // ---- render state: opaque, per-vertex diffuse, no depth ----
     g_dev->SetVertexShader(PLZ_FVF);

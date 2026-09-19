@@ -4,9 +4,10 @@
 // Gfx_Fill panels, Font_Draw/Font_DrawCentered labels, EOS_* colors, drawn in
 // the real g_scrW/g_scrH space (no virtual scaler).
 //
-// Two layouts:
+// Three layouts:
 //   OSK_TEXT     full QWERTY (lower / upper / symbols; X cycles the set)
-//   OSK_NUMERIC  10-key pad for numbers + '.'  (IP octets, etc.)
+//   OSK_NUMERIC  10-key pad for numbers + '.' (IP addresses; X clears)
+//   OSK_HEX      hexadecimal keypad for compact value entry
 //
 // Usage (overlay on top of whatever phase is active):
 //   Osk_Open(OSK_TEXT, Bank_Name(idx), maxLen);
@@ -14,8 +15,8 @@
 //   in the render pass (inside Gfx_Begin/End): Osk_Draw();
 //   on confirm: Osk_GetText(buf, sizeof buf);
 //
-// Controller: D-pad move, A/LTrigger select, B backspace, X cycle set (text),
-//   Y space (text), L3 caps (text), Start confirm, Back cancel.
+// Controller: D-pad move, A/LTrigger select, B backspace, X cycle set (text)
+//   or clear (numeric), Y space (text), L3 caps (text), Start confirm, Back cancel.
 #pragma once
 #include <xtl.h>
 

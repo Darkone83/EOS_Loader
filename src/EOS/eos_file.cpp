@@ -4,6 +4,7 @@
 #include <xtl.h>
 #include "eos_file.h"
 #include "dd_mount.h"   // Mount_HddPartitions
+#include "eos_sdcard.h" // SD:\ virtual path -> FatFs
 
 static int  fLen(const char* s) { int n = 0; while (s[n]) n++; return n; }
 
@@ -52,6 +53,28 @@ static void fCopy(char* d, int cap, const char* s)
     d[i] = 0;
 }
 
+// The loader keeps Xbox HDD paths in their native "E:\..." form.  For the
+// few features that can also consume files from the EOS SD volume, expose a
+// tiny virtual "SD:\..." prefix and translate only at this lowest file layer.
+// That lets image/audio/theme callers stay completely storage-agnostic.
+static int fIsSd(const char* p)
+{
+    return p && p[0] == 'S' && p[1] == 'D' && p[2] == ':';
+}
+
+static void fSdPath(char* d, int cap, const char* s)
+{
+    int i = 3, p = 0;
+    if (cap <= 0) return;
+    if (s[i] != '\\' && s[i] != '/') d[p++] = '/';
+    while (s[i] && p < cap - 1) {
+        char c = s[i++];
+        d[p++] = (c == '\\') ? '/' : c;
+    }
+    if (p == 0) d[p++] = '/';
+    d[p] = 0;
+}
+
 void File_MountDrives(void)
 {
     Mount_HddPartitions();
@@ -59,11 +82,23 @@ void File_MountDrives(void)
 
 int File_Exists(const char* path)
 {
+    if (fIsSd(path)) {
+        char sp[EOS_FILE_PATH_MAX]; FILINFO fi;
+        if (Sd_Mount() != EOS_SD_OK) return 0;
+        fSdPath(sp, sizeof(sp), path);
+        return f_stat(sp, &fi) == FR_OK;
+    }
     return GetFileAttributesA(path) != 0xFFFFFFFF;
 }
 
 int File_IsDir(const char* path)
 {
+    if (fIsSd(path)) {
+        char sp[EOS_FILE_PATH_MAX]; FILINFO fi;
+        if (Sd_Mount() != EOS_SD_OK) return 0;
+        fSdPath(sp, sizeof(sp), path);
+        return f_stat(sp, &fi) == FR_OK && (fi.fattrib & AM_DIR);
+    }
     DWORD a = GetFileAttributesA(path);
     return (a != 0xFFFFFFFF) && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
@@ -87,6 +122,28 @@ int File_ListDrives(EosFileEntry* out, int maxEntries)
 
 int File_ListDir(const char* path, EosFileEntry* out, int maxEntries)
 {
+    if (fIsSd(path)) {
+        char sp[EOS_FILE_PATH_MAX]; DIR dir; FILINFO fno; FRESULT fr;
+        int n = 0;
+        if (Sd_Mount() != EOS_SD_OK) return 0;
+        fSdPath(sp, sizeof(sp), path);
+        fr = f_opendir(&dir, sp);
+        if (fr != FR_OK) return 0;
+        for (;;) {
+            fr = f_readdir(&dir, &fno);
+            if (fr != FR_OK || fno.fname[0] == 0) break;
+            if (fno.fname[0] == '.' &&
+                (fno.fname[1] == 0 || (fno.fname[1] == '.' && fno.fname[2] == 0))) continue;
+            if (n >= maxEntries) break;
+            fCopy(out[n].name, EOS_FILE_NAME_MAX, fno.fname);
+            out[n].is_dir = (fno.fattrib & AM_DIR) ? 1 : 0;
+            ++n;
+        }
+        f_closedir(&dir);
+        fSortEntries(out, n);
+        return n;
+    }
+
     char            pat[EOS_FILE_PATH_MAX + 4];
     WIN32_FIND_DATA fd;
     HANDLE          h;
@@ -115,6 +172,19 @@ int File_ListDir(const char* path, EosFileEntry* out, int maxEntries)
 
 int File_ReadInto(const char* path, unsigned char* buf, int cap)
 {
+    if (fIsSd(path)) {
+        char sp[EOS_FILE_PATH_MAX]; FIL fp; FRESULT fr; UINT got = 0; FSIZE_t sz;
+        if (Sd_Mount() != EOS_SD_OK) return -1;
+        fSdPath(sp, sizeof(sp), path);
+        fr = f_open(&fp, sp, FA_READ);
+        if (fr != FR_OK) return -1;
+        sz = f_size(&fp);
+        if (sz > (FSIZE_t)cap) { f_close(&fp); return -1; }
+        fr = f_read(&fp, buf, (UINT)sz, &got);
+        f_close(&fp);
+        return (fr == FR_OK && got == (UINT)sz) ? (int)sz : -1;
+    }
+
     HANDLE h;
     DWORD  sz, got = 0;
 

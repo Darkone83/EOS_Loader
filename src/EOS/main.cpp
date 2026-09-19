@@ -1,8 +1,6 @@
-
-// Flow: goddess splash (fade-in, skippable) -> main menu loop.
-// Menu items are selectable stubs for the POC (Launch Bank / Bank Management /
-// Settings). The loader never exits; Launch Bank will later write the Eos 0xEF
-// bank register over LPC IO + warm-reset, and the FPGA serves the chosen bank.
+// Flow: branded splash -> persistent frame-driven loader UI. Main-menu phases
+// cover bank launch/management, tools, settings, power and About; BIOS handoff
+// remains separate from loader UI state and uses the EOS bank/reset path.
 #include "eos_gfx.h"
 #include "eos_font.h"
 #include "eos_console.h"   // Console_ReadLive for the persistent HUD
@@ -25,24 +23,16 @@
 #include "eos_flash.h"
 #include "eos_file.h"
 #include "eos_sdcard.h"    // onboard SD card: FAT32 browse + BIOS precache/launch
-#include "ff.h"            // FatFs types used directly in the SD browse UI
 #include "eos_osk.h"
 #include "eos_settings.h"
 #include "eos_theme.h"
-#include "eos_theme_custom.h"  // disk-loaded custom themes + set.dat
+#include "eos_theme_custom.h"  // disk-loaded custom themes + flash-backed selection
 #include "eos_cerbios.h"        // Cerbios .ini editor + overclock calculator
 #include "eos_ui.h"
 #include "dd_net.h"
 #include "eos_xboxrgb.h"  // optional XBOX-RGB LAN discovery + bank handoff effect
 #include "eos_http.h"
 #include "dd_ftp.h"
-
-// Experimental A/B control for the FPGA onboard HDMI HUD engine.
-// 1 = expose the Tools-row runtime toggle; 0 = compile it out completely.
-#ifndef EOS_TEST_ONBOARD_HDMI_TOGGLE
-#define EOS_TEST_ONBOARD_HDMI_TOGGLE 1
-#endif
-
 
 
 // ---------------------------------------------------------------------------
@@ -51,9 +41,9 @@
 // ---------------------------------------------------------------------------
 enum AppPhase {
     PH_SPLASH = 0, PH_AUTOBOOT, PH_MENU, PH_BANKSEL, PH_BANKMGMT, PH_CONFIRM, PH_BROWSE, PH_RENAME, PH_TOOLS, PH_EE_TOOLS, PH_FW_TOOLS, PH_FW_BACKUP, PH_FW_RPICK,
-    PH_FW_RTARGET, PH_FW_RCONFIRM, PH_HDD_TOOLS, PH_HDD_INFO, PH_EE_RESTORE, PH_EE_CONFIRM, PH_FORMAT, PH_FORMAT_CONFIRM, PH_SETTINGS, PH_ABOUT, PH_CLEARCFG,
+    PH_FW_RTARGET, PH_FW_RCONFIRM, PH_HDD_TOOLS, PH_HDD_INFO, PH_EE_RESTORE, PH_EE_CONFIRM, PH_FORMAT, PH_FORMAT_CONFIRM, PH_SETTINGS, PH_POWER, PH_ABOUT, PH_CLEARCFG,
     PH_CERB_MENU, PH_CERB_EDIT, PH_CERB_SAVED, PH_CERB_OC, PH_CERB_COMBO,
-    PH_LEDCOLOR, PH_SDBROWSE, PH_EOS_SCRIPTS, PH_FAN
+    PH_LEDCOLOR, PH_EOS_SCRIPTS, PH_FAN
 };
 
 static AppPhase s_phase = PH_SPLASH;
@@ -62,12 +52,14 @@ static int      s_menuIntro = 0;   // 1 = play the splash->menu settle ONCE
 static WORD     s_prevBtn = 0;
 static int      s_bankSel = 0;   // highlighted bank in PH_BANKSEL
 static int      s_mgmtSel = 0;   // highlighted bank in PH_BANKMGMT
+static int      s_powerSel = 0;  // 0 Shutdown, 1 Reboot
+static int      s_powerArm = 0;  // confirmation latch for destructive power actions
 static int      s_autoBank = -1; // table index selected by persisted auto-boot flag
 static ULONG    s_autoEjectBase = 0;
 static DWORD    s_autoEjectNext = 0;
 static EosLayout s_layout;        // dynamic bank layout (descriptor mirror)
 static int       s_layoutOk = 0;  // 1 = a valid descriptor is loaded
-static int       s_extReady = 0;  // DEBUG: STATUS bit5 after last large flash
+static int       s_extReady = 0;  // STATUS bit5 after last large flash (HTTP/diagnostic telemetry)
 
 // Map a bank TABLE index to a descriptor SLOT (0..3), or -1 if the bank is not
 // a user bank. Table: idx0=boot, idx1..4=user banks 1..4, idx5=recovery. So a
@@ -125,18 +117,10 @@ static int           s_browseSong = 0;           // 1 = browsing to pick a bg-mu
 static int           s_browseCerb = 0;           // 1 = browsing to pick a Cerbios path field
 static int           s_browseCerbField = -1;     // which Cerbios field the pick fills
 static int           s_browseScript = 0;         // 1 = browsing to pick an EOS .eos script to stage
+static int           s_browseSdLaunch = 0;       // 1 = SD BIOS launch mode inside shared browser
 static char          s_flashPath[EOS_FILE_PATH_MAX] = { 0 };
 static int           s_renameTarget = -1;         // bank idx being renamed
 static AppPhase      s_renameReturn = PH_BANKMGMT; // phase to return to after rename
-
-// SD card browser (PH_SDBROWSE) state -- separate from the HDD browser above:
-// sourced from our own FAT32 driver (FatFs) over the SD_BR_* LPC registers,
-// not File_ListDir/XTL. Root is "" (no drive prefix -- FF_VOLUMES=1).
-static char          s_sdPath[EOS_FILE_PATH_MAX] = { 0 };
-static EosFileEntry  s_sdEntries[EOS_FILE_MAX_ENTRIES];
-static int           s_sdEntCount = 0;
-static int           s_sdSel = 0;
-static int           s_sdScroll = 0;
 
 // forward decls (browser block is defined below, before main)
 static void DoFlash(int idx, const char* path);
@@ -176,85 +160,121 @@ static void hudPoll(void)
         s_eosMode16 = 0;
 }
 
-// Draw one right-aligned "Label: value" line at y; returns next y.
-#define HUD_K 0.72f   // HUD text scale (smaller than body text, no clipping)
+// Compact system-card helpers. The persistent HUD deliberately reuses the
+// existing rounded/glow primitives so it gains hierarchy without adding assets.
+#define HUD_K       0.72f
+#define HUD_HEAD_K  0.58f
 
-static int hudLine(int right, int y, const char* label, const char* val, DWORD col)
+static int hudLine(int left, int right, int y, const char* label, const char* val, DWORD col)
 {
     int wv = Font_TextWidthScaled(val, HUD_K);
-    int lx = right - 128;                          // label left-aligned in frame
-    Font_DrawScaled(lx, y, label, EOS_PURPLE, HUD_K);
+    Font_DrawScaled(left, y, label, EOS_PURPLE, HUD_K);
     Font_DrawScaled(right - wv, y, val, col, HUD_K);
-    return y + 17;                                 // tighter line pitch for scaled text
+    return y + 17;
 }
 
 static void hudDraw(void)
 {
-    int right = g_scrW - 20;
-    int y = 16;
+    int bx, by, bw, bh, left, right, y;
+    int warnY, warnH;
     char buf[16];
     int n;
+    DWORD panel, rowBg, edge, liveCol;
 
     if (s_phase == PH_SPLASH) return;   // keep the branded splash clean
 
     hudPoll();
 
-    // Thin frame (outline, not a solid fill) so labels/values stay legible over
-    // any theme. Grow by one line only while EOS 1.6_EN is asserted.
-    {
-        int bx = g_scrW - 150, by = 10, bw = 140, bh = s_eosMode16 ? 79 : 62;
-        DWORD fr = EOS_PURPLE;
-        Gfx_Fill((float)bx, (float)by, (float)bw, 1.0f, fr); // top
-        Gfx_Fill((float)bx, (float)(by + bh - 1), (float)bw, 1.0f, fr); // bottom
-        Gfx_Fill((float)bx, (float)by, 1.0f, (float)bh, fr); // left
-        Gfx_Fill((float)(bx + bw - 1), (float)by, 1.0f, (float)bh, fr); // right
+    if (Config_GetSystemCardOn()) {
+        bx = 10;
+        by = 10;
+        bw = 164;
+        // Compact three-row system card. The 1.6 strap still gets its own
+        // dedicated warning row without making the normal card unnecessarily wide.
+        bh = s_eosMode16 ? 112 : 84;
+        left = bx + 18;
+        right = bx + bw - 12;
+        y = by + 31;
+
+        panel = (EOS_PANEL & 0x00FFFFFF) | 0xC8000000;
+        rowBg = (EOS_BG & 0x00FFFFFF) | 0x54000000;
+        edge = (EOS_GLOW & 0x00FFFFFF) | 0x7C000000;
+        liveCol = (EOS_GLOW & 0x00FFFFFF) |
+            ((((GetTickCount() / 420) & 1) ? 0xE8UL : 0x78UL) << 24);
+
+        // Glass card + restrained halo. Keep the panel clean and symmetric so it
+        // feels like a compact dashboard card rather than a debug rail.
+        Gfx_GlowSoft(bx + bw / 2, by + bh / 2, bw + 26, bh + 22, EOS_GLOW, 24);
+        Gfx_FillRounded(bx, by, bw, bh, 12, panel);
+        Gfx_Fill((float)(bx + 14), (float)(by + 24), (float)(bw - 28), 1.0f, edge);
+
+        // Header + low-cost pulsing live indicator.
+        Font_DrawScaled(bx + 20, by + 8, "SYSTEM", EOS_WHITE, HUD_HEAD_K);
+        Font_DrawScaled(bx + bw - 53, by + 8, "LIVE", EOS_DIM, HUD_HEAD_K);
+        Gfx_FillRounded(bx + bw - 18, by + 9, 7, 7, 3, liveCol);
+
+        // Three subtle row wells make the values read as instrumentation rather
+        // than debug text while keeping the card visually light.
+        Gfx_FillRounded(bx + 13, y - 3, bw - 24, 15, 5, rowBg);
+        if (s_live.tempOK && s_live.cpuTempC >= 0) {
+            n = 0;
+            if (s_live.cpuTempC >= 100) buf[n++] = (char)('0' + s_live.cpuTempC / 100);
+            if (s_live.cpuTempC >= 10)  buf[n++] = (char)('0' + (s_live.cpuTempC / 10) % 10);
+            buf[n++] = (char)('0' + s_live.cpuTempC % 10);
+            buf[n++] = ' '; buf[n++] = 'C'; buf[n] = 0;
+            y = hudLine(left, right, y, "CPU", buf, EOS_WHITE);
+        }
+        else {
+            y = hudLine(left, right, y, "CPU", "-- C", EOS_DIM);
+        }
+
+        Gfx_FillRounded(bx + 13, y - 3, bw - 24, 15, 5, rowBg);
+        if (s_live.tempOK && s_live.mbTempC >= 0) {
+            n = 0;
+            if (s_live.mbTempC >= 100) buf[n++] = (char)('0' + s_live.mbTempC / 100);
+            if (s_live.mbTempC >= 10)  buf[n++] = (char)('0' + (s_live.mbTempC / 10) % 10);
+            buf[n++] = (char)('0' + s_live.mbTempC % 10);
+            buf[n++] = ' '; buf[n++] = 'C'; buf[n] = 0;
+            y = hudLine(left, right, y, "MB", buf, EOS_WHITE);
+        }
+        else {
+            y = hudLine(left, right, y, "MB", "-- C", EOS_DIM);
+        }
+
+        Gfx_FillRounded(bx + 13, y - 3, bw - 24, 15, 5, rowBg);
+        {
+            int u = s_live.ramUsedMB, t = s_live.ramTotalMB;
+            char* p = buf;
+            if (u >= 100) *p++ = (char)('0' + u / 100);
+            if (u >= 10)  *p++ = (char)('0' + (u / 10) % 10);
+            *p++ = (char)('0' + u % 10);
+            *p++ = '/';
+            if (t >= 100) *p++ = (char)('0' + t / 100);
+            if (t >= 10)  *p++ = (char)('0' + (t / 10) % 10);
+            *p++ = (char)('0' + t % 10);
+            *p++ = 'M'; *p++ = 'B'; *p = 0;
+            y = hudLine(left, right, y, "RAM", buf, EOS_WHITE);
+        }
+
+        // Configuration warning/status: this reflects the physical EOS 1.6_EN
+        // strap, not the detected Xbox revision. Give it a dedicated alert pill.
+        if (s_eosMode16) {
+            DWORD warn = (EOS_PURPLE & 0x00FFFFFF) | 0xD8000000;
+            warnY = by + 84;
+            warnH = 20;
+            Gfx_FillRounded(bx + 14, warnY, bw - 28, warnH, warnH / 2, warn);
+            Font_DrawCentered(bx + 14, bw - 28,
+                warnY + (warnH - FONT_CH) / 2, "1.6 MODE ENABLED", EOS_WHITE);
+        }
+
     }
 
-    // CPU temp
-    if (s_live.tempOK && s_live.cpuTempC >= 0) {
-        n = 0;
-        if (s_live.cpuTempC >= 100) buf[n++] = (char)('0' + s_live.cpuTempC / 100);
-        if (s_live.cpuTempC >= 10)  buf[n++] = (char)('0' + (s_live.cpuTempC / 10) % 10);
-        buf[n++] = (char)('0' + s_live.cpuTempC % 10);
-        buf[n++] = ' '; buf[n++] = 'C'; buf[n] = 0;
-        y = hudLine(right, y, "CPU", buf, EOS_WHITE);
-    }
-    else {
-        y = hudLine(right, y, "CPU", "-- C", EOS_DIM);
-    }
+    // Global transient feedback belongs to the overlay rather than individual
+    // screens, so browser/SD errors and tool results are visible everywhere.
+    if (s_status[0] && GetTickCount() < s_statusUntil) Ui_StatusToast(s_status);
 
-    // MB (ambient) temp
-    if (s_live.tempOK && s_live.mbTempC >= 0) {
-        n = 0;
-        if (s_live.mbTempC >= 100) buf[n++] = (char)('0' + s_live.mbTempC / 100);
-        if (s_live.mbTempC >= 10)  buf[n++] = (char)('0' + (s_live.mbTempC / 10) % 10);
-        buf[n++] = (char)('0' + s_live.mbTempC % 10);
-        buf[n++] = ' '; buf[n++] = 'C'; buf[n] = 0;
-        y = hudLine(right, y, "MB", buf, EOS_WHITE);
-    }
-    else {
-        y = hudLine(right, y, "MB", "-- C", EOS_DIM);
-    }
-
-    // RAM used / total (e.g. "12/128MB"). Total reads 64 or 128 on Xbox.
-    {
-        int u = s_live.ramUsedMB, t = s_live.ramTotalMB;
-        char* p = buf;
-        if (u >= 100) *p++ = (char)('0' + u / 100);
-        if (u >= 10)  *p++ = (char)('0' + (u / 10) % 10);
-        *p++ = (char)('0' + u % 10);
-        *p++ = '/';
-        if (t >= 100) *p++ = (char)('0' + t / 100);
-        if (t >= 10)  *p++ = (char)('0' + (t / 10) % 10);
-        *p++ = (char)('0' + t % 10);
-        *p++ = 'M'; *p++ = 'B'; *p = 0;
-        y = hudLine(right, y, "RAM", buf, EOS_WHITE);
-    }
-
-    // Configuration warning/status: show only when the physical EOS 1.6_EN
-    // strap is asserted. This is the gateware mode state, not Xbox revision.
-    if (s_eosMode16)
-        y = hudLine(right, y, "1.6 Mode", "Enabled", EOS_WHITE);
+    // Draw the phase veil last so the HUD and status participate in the handoff.
+    Ui_TransitionDraw();
 }
 
 
@@ -279,7 +299,6 @@ static const char* PhaseName(AppPhase p)
     case PH_BANKMGMT:    return "Bank Manager";
     case PH_LEDCOLOR:    return "LED Color";
     case PH_BROWSE:      return "Browse";
-    case PH_SDBROWSE:    return "SD Card";
     case PH_RENAME:      return "Rename";
     case PH_TOOLS:       return "Tools";
     case PH_EOS_SCRIPTS: return "EOS Scripts";
@@ -303,6 +322,7 @@ static const char* PhaseName(AppPhase p)
     case PH_CERB_OC:     return "Overclock Calc";
     case PH_CERB_COMBO:  return "Cerbios Editor";
     case PH_SETTINGS:    return "Settings";
+    case PH_POWER:       return "Power";
     case PH_ABOUT:       return "About";
     default:             return "Eos Loader";
     }
@@ -310,11 +330,16 @@ static const char* PhaseName(AppPhase p)
 
 static void GotoPhase(AppPhase p)
 {
+    AppPhase old = s_phase;
     s_phase = p;
     s_phaseT0 = GetTickCount();
+    // Splash already owns its bespoke logo settle. Every normal phase handoff
+    // uses the short procedural veil; no blocking sleeps or retained frames.
+    if (old != p && old != PH_SPLASH && p != PH_SPLASH) Ui_TransitionStart();
     s_menuIntro = 0;              // any phase change clears a pending settle;
     // the splash handoff re-arms it after this call
     if (p == PH_MENU)     Menu_Init();
+    if (p == PH_POWER) { s_powerSel = 0; s_powerArm = 0; }
     Lcd_SetContext(PhaseName(p), 0);   // LCD row-0 context follows the screen
     // Bank LED is OFF while in the loader (the onboard LED covers loader status).
     // Only the bank-select screen drives it (XbDiag purple / bank color).
@@ -387,7 +412,7 @@ static void Splash_Frame(WORD b)
 }
 
 // ---------------------------------------------------------------------------
-// MENU: navigate + select. Selections are stubs (status line) for the POC.
+// MENU: navigate + select. All entries dispatch to live loader phases.
 // ---------------------------------------------------------------------------
 static void HandleChoice(int id)
 {
@@ -396,9 +421,80 @@ static void HandleChoice(int id)
     case EOS_MENU_BANK_MGMT:   GotoPhase(PH_BANKMGMT);               break;
     case EOS_MENU_TOOLS:       GotoPhase(PH_TOOLS);                  break;
     case EOS_MENU_SETTINGS:    GotoPhase(PH_SETTINGS);                break;
+    case EOS_MENU_POWER:       GotoPhase(PH_POWER);                   break;
     case EOS_MENU_ABOUT:       GotoPhase(PH_ABOUT);                   break;
     default: break;
     }
+}
+
+// ---------------------------------------------------------------------------
+// POWER: deliberate two-step path from the main menu. BIOS launches use the
+// separate warm-reset handoff in eos_bank; this screen owns only full-console
+// power operations. POWER_SUBCMD_CYCLE is an SMC power cycle, so the FPGA also
+// traverses its cold-reset domain and EOS returns to the loader boot bank.
+// ---------------------------------------------------------------------------
+static void PowerCommand(DWORD subcmd)
+{
+    DWORD scratch = 0;
+
+    // Do not carry a stale "no animation" request into the next boot.
+    if (HalReadSMBusByte(SMBDEV_PIC16L, PIC16L_CMD_SCRATCH_REGISTER, &scratch) == 0) {
+        HalWriteSMBusByte(SMBDEV_PIC16L, PIC16L_CMD_SCRATCH_REGISTER,
+            scratch & ~((DWORD)SCRATCH_REGISTER_BITVALUE_NO_ANIMATION));
+    }
+
+    // Return front-panel ownership to the SMC before asking it to change power.
+    HalWriteSMBusByte(SMBDEV_PIC16L, PIC16L_CMD_LED_MODE, 0x00);
+    HalWriteSMBusByte(SMBDEV_PIC16L, PIC16L_CMD_POWER, subcmd);
+
+    // A valid power command never returns on hardware.
+    for (;;) {}
+}
+
+static void Power_Frame(WORD b)
+{
+    static const char* items[] = { "Shutdown", "Reboot" };
+    const int count = 2;
+
+    if (Pressed(b, s_prevBtn, BTN_B)) {
+        if (s_powerArm) { s_powerArm = 0; return; }
+        GotoPhase(PH_MENU);
+        return;
+    }
+    if (Pressed(b, s_prevBtn, BTN_DPAD_UP)) {
+        s_powerSel = (s_powerSel + count - 1) % count;
+        s_powerArm = 0;
+    }
+    if (Pressed(b, s_prevBtn, BTN_DPAD_DOWN)) {
+        s_powerSel = (s_powerSel + 1) % count;
+        s_powerArm = 0;
+    }
+
+    if (Pressed(b, s_prevBtn, BTN_A)) {
+        if (!s_powerArm) { s_powerArm = 1; }
+        else if (s_powerSel == 0) {
+            PowerCommand(POWER_SUBCMD_POWER_OFF);
+            return;
+        }
+        else {
+            // Make the boot-bank selection explicit before the SMC power cycle.
+            // The FPGA cold reset also returns to this bank, but resting first keeps
+            // the handoff safe even during the transition into the power cycle.
+            Bank_SetResting();
+            PowerCommand(POWER_SUBCMD_CYCLE);
+            return;
+        }
+    }
+
+    Gfx_Begin(EOS_BG); Ui_Backdrop();
+    Ui_TitleBar("POWER");
+    Ui_Menu3D(items, count, s_powerSel);
+    if (s_powerArm)
+        Font_DrawCentered(0, g_scrW, g_scrH - 112,
+            s_powerSel == 0 ? "Press A again to shut down" : "Press A again to reboot",
+            EOS_PURPLE);
+    Ui_Footer(s_powerArm ? "A  CONFIRM      B  CANCEL" : "D-PAD  MOVE      A  SELECT      B  BACK");
+    Gfx_End();
 }
 
 static void Menu_Frame(WORD b)
@@ -427,8 +523,6 @@ static void Menu_Frame(WORD b)
         s_menuIntro = 0;
         Menu_Draw();
     }
-    if (s_status[0] && GetTickCount() < s_statusUntil)
-        Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
 
     // network status / web-UI address, lower-left (inside the TV-safe margin so
     // it never clips on overscan). Bare IP for now -- a scheme/port prefix waits
@@ -606,7 +700,7 @@ static void BankSel_Frame(WORD b)
         Font_DrawCentered(0, g_scrW, g_scrH - 94,
             "No BIOS banks flashed -- flash from Bank Management", EOS_DIM);
 
-    Ui_Footer("A = LAUNCH   B = BACK");
+    Ui_Footer("A  LAUNCH      B  BACK");
     Gfx_End();
 }
 
@@ -771,10 +865,10 @@ static void Confirm_Frame(WORD b)
         return;
     }
     Gfx_Begin(EOS_BG); Ui_Backdrop();
-    Font_DrawCentered(0, g_scrW, 150, "CONFIRM", EOS_PURPLE);
-    Font_DrawCentered(0, g_scrW, 210, s_confirmMsg, EOS_WHITE);
-    Font_DrawCentered(0, g_scrW, 250, "This cannot be undone.", EOS_DIM);
-    Font_DrawCentered(0, g_scrW, g_scrH - 66, "A = YES    B = NO", EOS_DIM);
+    Ui_TitleBar("Confirm Action");
+    Font_DrawCentered(0, g_scrW, 190, s_confirmMsg, EOS_WHITE);
+    Font_DrawCentered(0, g_scrW, 230, "This cannot be undone.", EOS_PURPLE);
+    Ui_Footer("A  CONFIRM      B  CANCEL");
     Gfx_End();
 }
 
@@ -801,9 +895,9 @@ static void About_Frame(WORD b)
     Font_DrawCentered(0, g_scrW, 368, "Tang Nano 20K   /   GW2AR-18C", EOS_DIM);
 
     if (Net_IsUp())
-        Font_DrawCentered(0, g_scrW, 404, "Web UI at the address on the menu", EOS_DIM);
+        Font_DrawCentered(0, g_scrW, 382, "Web UI at the address on the menu", EOS_DIM);
 
-    Font_DrawCentered(0, g_scrW, 444, "B  BACK", EOS_DIM);
+    Ui_Footer("B  BACK");
     Gfx_End();
 }
 
@@ -831,8 +925,6 @@ static void listScreen(const char* title, const char** items, int count, int sel
         Font_DrawCentered(0, g_scrW, 220, "(nothing here yet)", EOS_DIM);
     else
         Ui_Menu3D(items, count, sel);             // shared 3D perspective list
-    if (s_status[0] && GetTickCount() < s_statusUntil)
-        Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
     Ui_Footer("D-PAD  MOVE      A  SELECT      B  BACK");
     Gfx_End();
 }
@@ -1317,6 +1409,7 @@ static void CerbEdit_Frame(WORD b)
                 File_MountDrives();
                 s_browseCerb = 1;
                 s_browseCerbField = s_cerbSel;
+                s_browseSdLaunch = 0;
                 s_browsePath[0] = 0;       // start at the drive list
                 browseRefresh();
                 GotoPhase(PH_BROWSE);
@@ -1447,7 +1540,7 @@ static void CerbSaved_Frame(WORD b)
         Font_DrawCentered(0, g_scrW, 178, s_cerb.path, EOS_DIM);
         Font_DrawCentered(0, g_scrW, 220, "Check the drive is present + writable.", EOS_DIM);
     }
-    Font_DrawCentered(0, g_scrW, 300, "A / B = BACK", EOS_WHITE);
+    Ui_Footer("A / B  BACK");
     Gfx_End();
 }
 
@@ -1635,32 +1728,10 @@ static void CerbOc_Frame(WORD b)
 }
 
 
-#if EOS_TEST_ONBOARD_HDMI_TOGGLE
-#define EOS_CMD_HUDMODE 0x3D
-static int s_onboardHudEnabled = 1;
-
-static int OnboardHud_SetEnabled(int enabled)
-{
-    unsigned char rb = 0;
-    Con_SmbReset();
-    if (!Con_SmbWrite8(0xDC, 0x11, enabled ? 1 : 0)) return 0;  // ARG0
-    if (!Con_SmbWrite8(0xDC, 0x10, EOS_CMD_HUDMODE)) return 0;  // CMD
-    if (!Con_SmbRead8(0xDC, 0x10, &rb) || rb != EOS_CMD_HUDMODE) return 0;
-    s_onboardHudEnabled = enabled ? 1 : 0;
-    return 1;
-}
-#endif
-
 static void Tools_Frame(WORD b)             // top level: tool categories
 {
-#if EOS_TEST_ONBOARD_HDMI_TOGGLE
-    const char* cats[9] = { "EEPROM", "Firmware", "HDD", "Fan Control", "Cerbios Config Editor", "EOS Scripts", "Format",
-                            s_onboardHudEnabled ? "Onboard HDMI HUD: ON" : "Onboard HDMI HUD: OFF", "Clear Settings" };
-    const int catCount = 9;
-#else
     static const char* cats[8] = { "EEPROM", "Firmware", "HDD", "Fan Control", "Cerbios Config Editor", "EOS Scripts", "Format", "Clear Settings" };
     const int catCount = 8;
-#endif
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_MENU); return; }
     s_toolSel = navSel(b, s_toolSel, catCount);
     if (Pressed(b, s_prevBtn, BTN_A)) {
@@ -1671,15 +1742,6 @@ static void Tools_Frame(WORD b)             // top level: tool categories
         else if (s_toolSel == 4) { s_cerbMenuSel = 0; GotoPhase(PH_CERB_MENU); }
         else if (s_toolSel == 5) { EnterEosScripts(); }
         else if (s_toolSel == 6) { Format_Enter(); }
-#if EOS_TEST_ONBOARD_HDMI_TOGGLE
-        else if (s_toolSel == 7) {
-            int want = !s_onboardHudEnabled;
-            if (OnboardHud_SetEnabled(want))
-                SetStatus(want ? "Onboard HDMI HUD enabled" : "Onboard HDMI HUD disabled");
-            else
-                SetStatus("Onboard HDMI HUD command FAILED");
-        }
-#endif
         else { GotoPhase(PH_CLEARCFG); }
     }
     listScreen("Tools", cats, catCount, s_toolSel);
@@ -1793,8 +1855,6 @@ static void FanControl_Frame(WORD b)
     Font_DrawCentered(0, g_scrW, 296, readback, EOS_WHITE);
     Font_DrawCentered(0, g_scrW, 326, "Auto = Xbox SMC thermal control", EOS_DIM);
     Font_DrawCentered(0, g_scrW, 350, "Manual range 20-100%; UI step 5% (SMC resolution 2%)", EOS_DIM);
-    if (s_status[0] && GetTickCount() < s_statusUntil)
-        Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
     Ui_Footer("UP/DN MOVE   L/R CHANGE   A APPLY   B SAVE/BACK");
     Gfx_End();
 }
@@ -1810,6 +1870,7 @@ static void ClearCfg_Frame(WORD b)
         Flash_EraseBank(EOS_BANK_NEWREGION);  // clear the oversized-bank region too
         Theme_Init();                    // re-apply the default theme now
         Fan_SetAuto();                    // settings reset also releases manual override
+        if (rc == EOS_FLASH_OK) Settings_ApplyEosRuntime();
         SetStatus(rc == EOS_FLASH_OK ? "Settings + descriptor cleared" : "Clear FAILED -- flash error");
         GotoPhase(PH_TOOLS);
         return;
@@ -1820,7 +1881,7 @@ static void ClearCfg_Frame(WORD b)
     Font_DrawCentered(0, g_scrW, 148, "(config banks 0xB + 0xC) to factory.", EOS_DIM);
     Font_DrawCentered(0, g_scrW, 196, "Bank names + saved settings are wiped.", EOS_PURPLE);
     Font_DrawCentered(0, g_scrW, 224, "Flashed BIOS images are NOT touched.", EOS_DIM);
-    Font_DrawCentered(0, g_scrW, 300, "A = CLEAR      B = CANCEL", EOS_WHITE);
+    Ui_Footer("A  CLEAR      B  CANCEL");
     Gfx_End();
 }
 
@@ -1857,6 +1918,7 @@ static void FwTools_Frame(WORD b)           // Firmware: Backup / Restore
 static char          s_eeNames[EE_RESTORE_MAX][64];
 static int           s_eeCount = 0;
 static int           s_eeSel = 0;
+static int           s_eeScroll = 0;
 static unsigned char s_eeImg[EOS_EEPROM_SIZE];
 static char          s_eeSerial[16];
 static char          s_eeSafetyName[64];   // basename of the pre-restore backup
@@ -1872,19 +1934,24 @@ static void RestoreEeprom_Enter(void)
 {
     s_eeCount = Eeprom_ListBackups(s_eeNames, EE_RESTORE_MAX);
     s_eeSel = 0;
+    s_eeScroll = 0;
     if (s_eeCount == 0) { SetStatus("No backups in E:\\Eos\\Backups"); return; }
     GotoPhase(PH_EE_RESTORE);
 }
 
 static void EeRestore_Frame(WORD b)
 {
-    int i, y, x, w, rc, p; char full[128]; char path[96];
+    const int vis = 6;
+    int i, ei, y, x, w, rc, p; char full[128]; char path[96];
 
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_TOOLS); return; }
     if (Pressed(b, s_prevBtn, BTN_DPAD_UP))
         s_eeSel = (s_eeSel + s_eeCount - 1) % s_eeCount;
     if (Pressed(b, s_prevBtn, BTN_DPAD_DOWN))
         s_eeSel = (s_eeSel + 1) % s_eeCount;
+
+    if (s_eeSel < s_eeScroll) s_eeScroll = s_eeSel;
+    if (s_eeSel >= s_eeScroll + vis) s_eeScroll = s_eeSel - vis + 1;
 
     if (Pressed(b, s_prevBtn, BTN_A)) {
         p = 0;
@@ -1908,12 +1975,13 @@ static void EeRestore_Frame(WORD b)
     Gfx_Begin(EOS_BG); Ui_Backdrop();
     Ui_TitleBar("Restore EEPROM");
     w = 460; x = (g_scrW - w) / 2;
-    for (i = 0; i < s_eeCount; ++i) {
+    for (i = 0; i < vis; ++i) {
+        ei = s_eeScroll + i;
+        if (ei >= s_eeCount) break;
         y = 96 + i * UI_ROW_DY;
-        Ui_PillCentered(x, y, w, UI_PILL_H, UI_PILL_R, i == s_eeSel, s_eeNames[i]);
+        Ui_PillCentered(x, y, w, UI_PILL_H, UI_PILL_R, ei == s_eeSel, s_eeNames[ei]);
     }
-    if (s_status[0] && GetTickCount() < s_statusUntil)
-        Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
+    Ui_ScrollBar(x + w + 12, 96, vis * UI_ROW_DY - 8, s_eeScroll, vis, s_eeCount);
     Ui_Footer("D-PAD  MOVE      A  SELECT      B  BACK");
     Gfx_End();
 }
@@ -1951,7 +2019,7 @@ static void EeConfirm_Frame(WORD b)
     Font_DrawCentered(0, g_scrW, 248, s_eeSafetyName, EOS_PURPLE);
 
     Font_DrawCentered(0, g_scrW, 300, "A bad EEPROM can stop the console booting.", EOS_DIM);
-    Font_DrawCentered(0, g_scrW, 350, "A = WRITE      B = CANCEL", EOS_WHITE);
+    Ui_Footer("A  WRITE      B  CANCEL");
     Gfx_End();
 }
 
@@ -2099,7 +2167,7 @@ static void FwRestConfirm_Frame(WORD b)
     Font_DrawCentered(0, g_scrW, 222, match ? "Image size matches the bank."
         : "SIZE MISMATCH -- cannot restore",
         match ? EOS_DIM : EOS_PURPLE);
-    Font_DrawCentered(0, g_scrW, 300, "A = WRITE      B = CANCEL", EOS_WHITE);
+    Ui_Footer("A  WRITE      B  CANCEL");
     Gfx_End();
 }
 
@@ -2114,6 +2182,7 @@ static int              s_hddPartCount = 0;
 static int              s_hddOk = 0;
 static int              s_hddToolSel = 0;
 static int              s_hddArm = 0;
+static DWORD            s_hddUsageNext = 0;
 
 static int appendUInt(char* out, int p, unsigned long v)
 {
@@ -2159,15 +2228,20 @@ static void hddPartLine(const EosPartitionInfo* pi, char* out)
     out[p] = 0;
 }
 
-// Drive Info queries filesystem usage once on entry, not every rendered frame.
+static void HddUsage_Refresh(void)
+{
+    File_MountDrives();
+    s_hddPartCount = Hdd_GetPartitions(s_hddParts, HDD_PART_MAX);
+}
+
+// Identify on entry/action, then keep the inexpensive filesystem usage values
+// live while Drive Info is open. This is especially useful during FTP copies.
 static void HddInfo_Refresh(void)
 {
     s_hddPartCount = 0;
     s_hddOk = (Hdd_Identify(&s_hddInfo) == HDD_OK);
-    if (s_hddOk) {
-        File_MountDrives();
-        s_hddPartCount = Hdd_GetPartitions(s_hddParts, HDD_PART_MAX);
-    }
+    if (s_hddOk) HddUsage_Refresh();
+    s_hddUsageNext = GetTickCount() + 1000;
 }
 
 static void hddSecLine(unsigned short s, char* out)
@@ -2238,9 +2312,17 @@ static void HddTools_Frame(WORD b)
 
 static void HddInfo_Frame(WORD b)
 {
-    char line[80]; int p, y, i;
+    char line[80]; int p, y, i; DWORD now;
 
     if (Pressed(b, s_prevBtn, BTN_B) || Pressed(b, s_prevBtn, BTN_A)) { GotoPhase(PH_HDD_TOOLS); return; }
+
+    // Refresh only free/used partition figures once a second. Avoid repeatedly
+    // issuing ATA IDENTIFY while FTP traffic is active.
+    now = GetTickCount();
+    if (s_hddOk && (LONG)(now - s_hddUsageNext) >= 0) {
+        HddUsage_Refresh();
+        s_hddUsageNext = now + 1000;
+    }
 
     Gfx_Begin(EOS_BG); Ui_Backdrop();
     Ui_TitleBar("Drive Info");
@@ -2423,6 +2505,7 @@ static void BankMgmt_Frame(WORD b)
         }
         else {
             s_flashTarget = s_mgmtSel;
+            s_browseSdLaunch = 0;
             s_browsePath[0] = 0;        // start at the drive list
             browseRefresh();
             GotoPhase(PH_BROWSE);
@@ -2519,10 +2602,7 @@ static void BankMgmt_Frame(WORD b)
         Ui_Menu3D(ptrs, cap, s_mgmtSel);
     }
 
-    Font_DrawCentered(0, g_scrW, g_scrH - 66,
-        "A=FLASH  X=DELETE  Y=RENAME  Wht=AUTO BOOT  Blk=LED", EOS_DIM);
-    if (s_status[0] && GetTickCount() < s_statusUntil)
-        Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
+    Ui_Footer("A FLASH   X DELETE   Y RENAME   WHITE AUTO BOOT   BLACK LED");
     Gfx_End();
 }
 
@@ -2534,8 +2614,19 @@ static int mLen(const char* s) { int n = 0; while (s[n]) ++n; return n; }
 
 static void browseRefresh(void)
 {
-    if (s_browsePath[0] == 0)
+    if (s_browsePath[0] == 0) {
         s_entCount = File_ListDrives(s_entries, EOS_FILE_MAX_ENTRIES);
+        // Music is storage-agnostic. Add the SD volume as one extra root only
+        // for the track picker; the BIOS/script HDD browser stays unchanged.
+        if (s_browseSong && s_entCount < EOS_FILE_MAX_ENTRIES && Sd_Mount() == EOS_SD_OK) {
+            s_entries[s_entCount].name[0] = 'S';
+            s_entries[s_entCount].name[1] = 'D';
+            s_entries[s_entCount].name[2] = ':';
+            s_entries[s_entCount].name[3] = 0;
+            s_entries[s_entCount].is_dir = 1;
+            ++s_entCount;
+        }
+    }
     else
         s_entCount = File_ListDir(s_browsePath, s_entries, EOS_FILE_MAX_ENTRIES);
     s_browseSel = 0;
@@ -2545,10 +2636,11 @@ static void browseRefresh(void)
 static void browseUp(void)
 {
     int n = mLen(s_browsePath), i;
-    if (n <= 3) { s_browsePath[0] = 0; browseRefresh(); return; }  // -> drive list
+    int rootLen = (s_browsePath[0] == 'S' && s_browsePath[1] == 'D' && s_browsePath[2] == ':') ? 4 : 3;
+    if (n <= rootLen) { s_browsePath[0] = 0; browseRefresh(); return; }  // -> drive list
     i = n - 1;
     while (i > 0 && s_browsePath[i] != '\\') --i;
-    if (i <= 2) s_browsePath[3] = 0;        // back to "X:\"
+    if (i < rootLen) s_browsePath[rootLen] = 0; // back to "X:\" / "SD:\"
     else        s_browsePath[i] = 0;
     browseRefresh();
 }
@@ -2557,9 +2649,15 @@ static void browseInto(const char* name)
 {
     int n, i;
     if (s_browsePath[0] == 0) {
-        // drive list: name is "C:" -> "C:\"
-        s_browsePath[0] = name[0]; s_browsePath[1] = ':';
-        s_browsePath[2] = '\\';    s_browsePath[3] = 0;
+        if (name[0] == 'S' && name[1] == 'D' && name[2] == ':') {
+            s_browsePath[0] = 'S'; s_browsePath[1] = 'D'; s_browsePath[2] = ':';
+            s_browsePath[3] = '\\'; s_browsePath[4] = 0;
+        }
+        else {
+            // drive list: name is "C:" -> "C:\"
+            s_browsePath[0] = name[0]; s_browsePath[1] = ':';
+            s_browsePath[2] = '\\';    s_browsePath[3] = 0;
+        }
     }
     else {
         n = mLen(s_browsePath);
@@ -2605,6 +2703,7 @@ static void EosScripts_Frame(WORD b)
     if (Pressed(b, s_prevBtn, BTN_A)) {
         if (s_scriptSel == 0 && !present) {          // Flash Script -> pick a .eos
             s_browseScript = 1;
+            s_browseSdLaunch = 0;
             s_browsePath[0] = 0;                     // start at the drive list
             browseRefresh();
             GotoPhase(PH_BROWSE);
@@ -2621,8 +2720,6 @@ static void EosScripts_Frame(WORD b)
         "Flash Script", present ? "" : "Select .eos");
     Ui_PillRow(PILL_X, y + 48, PILL_W, PILL_H, PILL_R, s_scriptSel == 1, present ? 0 : 1,
         "Clear Script", present ? "Staged" : "");
-    if (s_status[0] && GetTickCount() < s_statusUntil)
-        Font_DrawCentered(0, g_scrW, g_scrH - 94, s_status, EOS_PURPLE);
     Ui_Footer("D-PAD  MOVE      A  SELECT      B  BACK");
     Gfx_End();
 }
@@ -2748,7 +2845,7 @@ static void DoFlash(int idx, const char* path)
         // Page the freshly-written new region into its SDRAM home so the bank is
         // launchable now, without needing a cold power-cycle to re-run preload.
         Flash_SyncNewRegion();
-        s_extReady = Flash_NewRegionReady();   // DEBUG: did the ext region go resident?
+        s_extReady = Flash_NewRegionReady();   // retained for HTTP/diagnostic telemetry
 
         SetStatus("Writing descriptor...");
         s_layout.slot[slot].state = EOS_SLOT_ANCHOR;
@@ -2773,8 +2870,7 @@ static void DoFlash(int idx, const char* path)
             }
         }
         Config_Save();
-        SetStatus(s_extReady ? "Flashed OK (large) - ext RESIDENT"
-            : "Flashed (large) - ext NOT resident!");
+        SetStatus("Flashed OK");
         // Option B: flash committed -> optional LED color picker (B = no change).
         // A large BIOS auto-places into an anchor slot that may differ from the
         // originally-selected bank, so color the ACTUAL anchor, not s_flashTarget.
@@ -2787,6 +2883,59 @@ static void DoFlash(int idx, const char* path)
         }
         return;
     }
+}
+
+// Tail-preserving breadcrumb for deep paths. Keep the volume/root visible and
+// collapse only middle directories so the selected location never clips.
+static void drawBrowsePathLine(const char* path)
+{
+    char out[EOS_FILE_PATH_MAX];
+    char cand[EOS_FILE_PATH_MAX];
+    const char* src;
+    int len, root, pos, best, p, j, start;
+    const int maxW = 520;
+
+    src = (path && path[0]) ? path : "(drives)";
+    if (Font_TextWidth(src) <= maxW) {
+        Font_DrawCentered(0, g_scrW, 76, src, EOS_DIM);
+        return;
+    }
+
+    len = mLen(src);
+    root = 0;
+    for (j = 0; j < len; ++j) {
+        if (src[j] == '\\') { root = j + 1; break; }
+    }
+    if (root <= 0) root = (len > 3) ? 3 : len;
+    best = len;
+    pos = len;
+
+    while (pos > root) {
+        start = pos;
+        while (start > root && src[start - 1] != '\\') --start;
+        p = 0;
+        for (j = 0; j < root && p < EOS_FILE_PATH_MAX - 1; ++j) cand[p++] = src[j];
+        if (p < EOS_FILE_PATH_MAX - 1) cand[p++] = '.';
+        if (p < EOS_FILE_PATH_MAX - 1) cand[p++] = '.';
+        if (p < EOS_FILE_PATH_MAX - 1) cand[p++] = '.';
+        if (p < EOS_FILE_PATH_MAX - 1) cand[p++] = '\\';
+        for (j = start; src[j] && p < EOS_FILE_PATH_MAX - 1; ++j) cand[p++] = src[j];
+        cand[p] = 0;
+        if (Font_TextWidth(cand) > maxW) break;
+        best = start;
+        if (start <= root) break;
+        pos = start - 1;
+    }
+
+    p = 0;
+    for (j = 0; j < root && p < EOS_FILE_PATH_MAX - 1; ++j) out[p++] = src[j];
+    if (p < EOS_FILE_PATH_MAX - 1) out[p++] = '.';
+    if (p < EOS_FILE_PATH_MAX - 1) out[p++] = '.';
+    if (p < EOS_FILE_PATH_MAX - 1) out[p++] = '.';
+    if (p < EOS_FILE_PATH_MAX - 1) out[p++] = '\\';
+    for (j = best; src[j] && p < EOS_FILE_PATH_MAX - 1; ++j) out[p++] = src[j];
+    out[p] = 0;
+    Font_DrawCentered(0, g_scrW, 76, out, EOS_DIM);
 }
 
 static void Browse_Frame(WORD b)
@@ -2802,6 +2951,13 @@ static void Browse_Frame(WORD b)
             s_browseSel = (s_browseSel + 1) % s_entCount;
     }
     if (Pressed(b, s_prevBtn, BTN_B)) {
+        if (s_browseSdLaunch &&
+            s_browsePath[0] == 'S' && s_browsePath[1] == 'D' && s_browsePath[2] == ':' &&
+            s_browsePath[3] == '\\' && s_browsePath[4] == 0) {
+            s_browseSdLaunch = 0;
+            GotoPhase(PH_BANKSEL);
+            return;
+        }
         if (s_browsePath[0] == 0) {
             if (s_browseCerb) { s_browseCerb = 0; GotoPhase(PH_CERB_EDIT); return; }
             if (s_browseSong) { s_browseSong = 0; GotoPhase(PH_SETTINGS); return; }
@@ -2816,6 +2972,30 @@ static void Browse_Frame(WORD b)
             browseInto(e->name);
         }
         else {
+            if (s_browseSdLaunch) {
+                unsigned long lba;
+                unsigned int sectors;
+                int szc;
+                int rc;
+
+                buildFullPath(s_flashPath, e->name);
+                rc = Sd_ResolvePath(s_flashPath, &lba, &sectors, &szc);
+                if (rc == EOS_SD_FRAGMENTED)
+                    SetStatus("File is fragmented -- copy it fresh to the card");
+                else if (rc == EOS_SD_TOOBIG)
+                    SetStatus("Not a 256K/512K/1MB BIOS image");
+                else if (rc != EOS_SD_OK)
+                    SetStatus("Could not open file");
+                else {
+                    // Distinct SD staging feedback while the hardware precaches
+                    // the selected BIOS into NRGN_SD before launching bank 0x0.
+                    Led_Show(EOS_LED_MAGENTA, 0);
+                    Lcd_HandOff(e->name);
+                    Sd_PrecacheAndLaunch(lba, sectors, szc);   // no return on success
+                    SetStatus("SD card error during staging"); // only reached on failure
+                }
+                return;
+            }
             if (s_browseCerb) {
                 // Cerbios paths use the "HDD0-" device prefix (e.g.
                 // HDD0-E:\\Dashboard\\default.xbe). The browser gives a plain
@@ -2912,8 +3092,9 @@ static void Browse_Frame(WORD b)
     if (s_browseSel >= s_browseScroll + vis) s_browseScroll = s_browseSel - vis + 1;
 
     Gfx_Begin(EOS_BG); Ui_Backdrop();
-    Ui_TitleBar(s_browseCerb ? "SELECT FILE" : (s_browseSong ? "SELECT MUSIC" : (s_browseScript ? "SELECT SCRIPT" : "SELECT BIOS IMAGE")));
-    Font_DrawCentered(0, g_scrW, 76, (s_browsePath[0] ? s_browsePath : "(drives)"), EOS_DIM);
+    Ui_TitleBar(s_browseSdLaunch ? "SELECT BIOS (SD CARD)" :
+        (s_browseCerb ? "SELECT FILE" : (s_browseSong ? "SELECT MUSIC" : (s_browseScript ? "SELECT SCRIPT" : "SELECT BIOS IMAGE"))));
+    drawBrowsePathLine(s_browsePath);
 
     top = 104;
     if (s_entCount == 0)
@@ -2932,111 +3113,19 @@ static void Browse_Frame(WORD b)
             if (s_entries[ei].is_dir) appendStr(row, p, "/");
             Ui_PillLeft(x, y, w, 26, 13, ei == s_browseSel, row);
         }
+        Ui_ScrollBar(x + w + 12, top, vis * 30 - 4, s_browseScroll, vis, s_entCount);
     }
 
-    Ui_Footer("A = OPEN/SELECT    B = UP/BACK");
+    Ui_Footer("A  OPEN / SELECT      B  UP / BACK");
     Gfx_End();
 }
 
 // ---------------------------------------------------------------------------
-// SD CARD BROWSER: FAT32, our own driver (eos_sdcard.cpp / FatFs) over the
-// SD_BR_* LPC registers -- NOT File_ListDir/XTL (that's the HDD path above).
-// This on-console browser remains read/launch only; the WebUI BIOS Manager may
-// additionally use the SD_BW_* path to upload/delete BIOS files. Selecting a
-// file here resolves it to a raw contiguous LBA run, precaches it into NRGN_SD
-// in hardware, and launches bank 0x0 without touching on-board flash.
+// SD BIOS launch mode. Navigation/rendering is shared with PH_BROWSE because
+// eos_file already exposes the FatFs card as the virtual "SD:\\" filesystem.
+// Only the selected-file action differs: resolve a contiguous BIOS run, precache
+// it into NRGN_SD, then launch bank 0x0 without touching onboard flash.
 // ---------------------------------------------------------------------------
-static void sdSortEntries(void)
-{
-    int i, j;
-    for (i = 0; i < s_sdEntCount - 1; ++i) {
-        for (j = 0; j < s_sdEntCount - 1 - i; ++j) {
-            EosFileEntry* a = &s_sdEntries[j];
-            EosFileEntry* c = &s_sdEntries[j + 1];
-            int swap;
-            if (a->is_dir != c->is_dir) {
-                swap = c->is_dir && !a->is_dir;
-            }
-            else {
-                int k = 0;
-                while (a->name[k] && c->name[k]) {
-                    char ca = a->name[k], cb = c->name[k];
-                    if (ca >= 'a' && ca <= 'z') ca = (char)(ca - 32);
-                    if (cb >= 'a' && cb <= 'z') cb = (char)(cb - 32);
-                    if (ca != cb) break;
-                    ++k;
-                }
-                swap = (unsigned char)a->name[k] > (unsigned char)c->name[k];
-            }
-            if (swap) { EosFileEntry t = *a; *a = *c; *c = t; }
-        }
-    }
-}
-
-static void sdBrowseRefresh(void)
-{
-    DIR    dir;
-    FILINFO fno;
-    FRESULT fr;
-    int    n = 0;
-
-    fr = f_opendir(&dir, (s_sdPath[0] == 0) ? "/" : s_sdPath);
-    if (fr == FR_OK) {
-        for (;;) {
-            fr = f_readdir(&dir, &fno);
-            if (fr != FR_OK || fno.fname[0] == 0) break;
-            if (fno.fname[0] == '.') continue;       // skip dotfiles / "." / ".."
-            if (n >= EOS_FILE_MAX_ENTRIES) break;
-            {
-                int k = 0;
-                while (fno.fname[k] && k < EOS_FILE_NAME_MAX - 1) {
-                    s_sdEntries[n].name[k] = fno.fname[k]; ++k;
-                }
-                s_sdEntries[n].name[k] = 0;
-            }
-            s_sdEntries[n].is_dir = (fno.fattrib & AM_DIR) ? 1 : 0;
-            ++n;
-        }
-        f_closedir(&dir);
-    }
-    s_sdEntCount = n;
-    s_sdSel = 0;
-    s_sdScroll = 0;
-    sdSortEntries();
-}
-
-static void sdBrowseUp(void)
-{
-    int n = mLen(s_sdPath), i;
-    if (n == 0) return;                        // already at root
-    i = n - 1;
-    while (i > 0 && s_sdPath[i] != '/') --i;
-    s_sdPath[i] = 0;
-    sdBrowseRefresh();
-}
-
-static void sdBrowseInto(const char* name)
-{
-    int n = mLen(s_sdPath), i;
-    if (n > 0 && s_sdPath[n - 1] != '/' && n < EOS_FILE_PATH_MAX - 1) s_sdPath[n++] = '/';
-    for (i = 0; name[i] && n < EOS_FILE_PATH_MAX - 1; ++i) s_sdPath[n++] = name[i];
-    s_sdPath[n] = 0;
-    sdBrowseRefresh();
-}
-
-static void sdBuildFullPath(char* out, const char* name)
-{
-    int p = 0, i = 0;
-    while (s_sdPath[p] && p < EOS_FILE_PATH_MAX - 1) { out[p] = s_sdPath[p]; ++p; }
-    if (p > 0 && out[p - 1] != '/' && p < EOS_FILE_PATH_MAX - 1) out[p++] = '/';
-    while (name[i] && p < EOS_FILE_PATH_MAX - 1) out[p++] = name[i++];
-    out[p] = 0;
-}
-
-// Called from BankSel_Frame when "SD Card" is chosen. Mounts the volume (cheap,
-// idempotent-ish -- f_mount just (re)binds the FATFS object) and lists the
-// root; only switches to PH_SDBROWSE on success, so a missing/bad card just
-// shows a status line and leaves the user on the bank-select screen.
 static void EnterSdBrowse(void)
 {
     int rc = Sd_Mount();
@@ -3044,93 +3133,18 @@ static void EnterSdBrowse(void)
         SetStatus(Sd_CardReady() ? "SD card: not a valid FAT32 volume" : "No SD card detected");
         return;
     }
-    s_sdPath[0] = 0;
-    sdBrowseRefresh();
-    GotoPhase(PH_SDBROWSE);
-}
 
-static void SdBrowse_Frame(WORD b)
-{
-    int vis = 10, i, top;
-
-    if (s_sdSel >= s_sdEntCount) s_sdSel = (s_sdEntCount > 0) ? s_sdEntCount - 1 : 0;
-
-    if (s_sdEntCount > 0) {
-        if (Pressed(b, s_prevBtn, BTN_DPAD_UP))
-            s_sdSel = (s_sdSel + s_sdEntCount - 1) % s_sdEntCount;
-        if (Pressed(b, s_prevBtn, BTN_DPAD_DOWN))
-            s_sdSel = (s_sdSel + 1) % s_sdEntCount;
-    }
-    if (Pressed(b, s_prevBtn, BTN_B)) {
-        if (s_sdPath[0] == 0) { GotoPhase(PH_BANKSEL); return; }
-        sdBrowseUp();
-    }
-    if (s_sdEntCount > 0 && Pressed(b, s_prevBtn, BTN_A)) {
-        EosFileEntry* e = &s_sdEntries[s_sdSel];
-        if (e->is_dir) {
-            sdBrowseInto(e->name);
-        }
-        else {
-            char    path[EOS_FILE_PATH_MAX];
-            FIL     fp;
-            FRESULT fr;
-            sdBuildFullPath(path, e->name);
-            fr = f_open(&fp, path, FA_READ);
-            if (fr != FR_OK) {
-                SetStatus("Could not open file");
-            }
-            else {
-                unsigned long lba; unsigned int sectors; int szc;
-                int rc = Sd_ResolveFile(&fp, &lba, &sectors, &szc);
-                f_close(&fp);
-                if (rc == EOS_SD_FRAGMENTED)
-                    SetStatus("File is fragmented -- copy it fresh to the card");
-                else if (rc == EOS_SD_TOOBIG)
-                    SetStatus("Not a 256K/512K/1MB BIOS image");
-                else if (rc == EOS_SD_OK) {
-                    // Staging feedback: SD Card gets its own distinct color
-                    // (magenta/neon pink) -- not a reuse of XbDiag's purple,
-                    // even though both are "paging into SDRAM before boot".
-                    Led_Show(EOS_LED_MAGENTA, 0);
-                    Lcd_HandOff(e->name);
-                    Sd_PrecacheAndLaunch(lba, sectors, szc);   // no return on success
-                    SetStatus("SD card error during staging");  // only reached on failure
-                }
-            }
-        }
-    }
-
-    if (s_sdSel < s_sdScroll) s_sdScroll = s_sdSel;
-    if (s_sdSel >= s_sdScroll + vis) s_sdScroll = s_sdSel - vis + 1;
-
-    Gfx_Begin(EOS_BG); Ui_Backdrop();
-    Ui_TitleBar("SELECT BIOS (SD CARD)");
-    Font_DrawCentered(0, g_scrW, 76, (s_sdPath[0] ? s_sdPath : "(root)"), EOS_DIM);
-
-    top = 104;
-    if (s_sdEntCount == 0)
-        Font_DrawCentered(0, g_scrW, 200, "(empty)", EOS_DIM);
-
-    {
-        int w = 500, x = (g_scrW - w) / 2;
-        for (i = 0; i < vis; ++i) {
-            int  ei = s_sdScroll + i;
-            int  y = top + i * 30;
-            char row[EOS_FILE_NAME_MAX + 4];
-            int  p = 0;
-            if (ei >= s_sdEntCount) break;
-            {
-                int k = 0;
-                while (s_sdEntries[ei].name[k] && p < (int)sizeof(row) - 2) { row[p++] = s_sdEntries[ei].name[k]; ++k; }
-            }
-            if (s_sdEntries[ei].is_dir) row[p++] = '/';
-            row[p] = 0;
-            Ui_PillLeft(x, y, w, 26, 13, ei == s_sdSel, row);
-        }
-    }
-
-    Ui_Footer("A = OPEN/SELECT    B = UP/BACK");
-    Gfx_End();
+    s_browseCerb = 0;
+    s_browseSong = 0;
+    s_browseScript = 0;
+    s_browseSdLaunch = 1;
+    s_browsePath[0] = 'S';
+    s_browsePath[1] = 'D';
+    s_browsePath[2] = ':';
+    s_browsePath[3] = '\\';
+    s_browsePath[4] = 0;
+    browseRefresh();
+    GotoPhase(PH_BROWSE);
 }
 
 // ---------------------------------------------------------------------------
@@ -3202,6 +3216,7 @@ void __cdecl main() {
     Bank_SetResting();   // boot bank = safe resting selection
     File_MountDrives();  // bind HDD partitions so E:/F:/... resolve for browsing
     Config_Load();       // pull persisted bank table from the Eos config bank
+    Settings_ApplyEosRuntime(); // restore sticky EOS hardware controls (HDMI HUD)
     // Re-assert the saved fan policy on every Loader start. This makes manual
     // control deterministic across warm/cold reboot instead of relying on SMC
     // register retention or on whatever the previously-running BIOS requested.
@@ -3210,15 +3225,10 @@ void __cdecl main() {
     Bank_XbDiagPresent(); // prime the XbDiag probe cache at boot: the one-time
     // flash read happens here, never in the web request path
     Theme_Init();        // built-in theme (fallback base)
-    ThemeCustom_EnsureDir();               // create E:\Eos\Themes if missing
-    {   // If a custom theme is selected (E:\Eos\set.dat), apply it over the
-        // built-in: colors + background + resolve its music. A stale/broken
-        // selection falls back to the built-in and clears set.dat.
-        char folder[EOS_FILE_NAME_MAX];
-        if (SetDat_Read(folder, sizeof(folder))) {
-            if (!ThemeCustom_Apply(folder)) SetDat_Clear();
-        }
-    }
+    // Active custom selection is owned by EOS flash config. The selected media
+    // only supplies assets; missing media falls back for this boot without
+    // clearing the saved selection.
+    ThemeCustom_ApplySaved();
     audioSync();         // start background music if enabled in settings
     // (exercises the real read path; graceful on fresh chip)
     Net_Start();         // bring the network up; DHCP resolves over the next frames
@@ -3228,7 +3238,7 @@ void __cdecl main() {
     if (!Font_Init()) { Gfx_Shutdown(); return; }
     if (!Splash_Init()) { Font_Shutdown(); Gfx_Shutdown(); return; }
 
-    // Persistent top-right HUD (CPU/MB temp, RAM). Detect a 1.6 board once so
+    // Optional persistent system card (CPU/MB temp, RAM). Detect a 1.6 board once so
     // the temp read uses the PIC path (no ADM1032 on 1.6), then draw it on top
     // of every frame via the Gfx overlay hook.
     {
@@ -3244,8 +3254,13 @@ void __cdecl main() {
 
     // single frame-driven loop: pump input ONCE, dispatch by phase.
     for (;;) {
+        WORD b, uiB;
         PumpInput();
-        WORD b = GetButtons();
+        b = GetButtons();
+        // During the short veil, keep rendering/services live but swallow UI
+        // actions. s_prevBtn still tracks the physical state, so holding A/B
+        // cannot become a fresh edge when the transition finishes.
+        uiB = Ui_TransitionActive() ? 0 : b;
 
         // network + web server, serviced every frame regardless of phase.
         // The HTTP listener follows the link: bound while up, dropped on loss.
@@ -3258,54 +3273,54 @@ void __cdecl main() {
         Audio_Update();   // service the DirectSound mixer (required every frame)
         Lcd_Tick(&s_live);   // optional status LCD (throttled + shadow-diffed; no-op if none)
 
-        if (s_phase == PH_SPLASH)   Splash_Frame(b);
-        else if (s_phase == PH_AUTOBOOT) AutoBoot_Frame(b);
-        else if (s_phase == PH_BANKSEL)  BankSel_Frame(b);
-        else if (s_phase == PH_BANKMGMT) BankMgmt_Frame(b);
+        if (s_phase == PH_SPLASH)   Splash_Frame(uiB);
+        else if (s_phase == PH_AUTOBOOT) AutoBoot_Frame(uiB);
+        else if (s_phase == PH_BANKSEL)  BankSel_Frame(uiB);
+        else if (s_phase == PH_BANKMGMT) BankMgmt_Frame(uiB);
         else if (s_phase == PH_LEDCOLOR) {
-            int nx = LedPick_Frame(b, s_prevBtn);
+            int nx = LedPick_Frame(uiB, s_prevBtn);
             if (nx >= 0) GotoPhase((AppPhase)nx);
         }
-        else if (s_phase == PH_CONFIRM)  Confirm_Frame(b);
-        else if (s_phase == PH_BROWSE)   Browse_Frame(b);
-        else if (s_phase == PH_SDBROWSE) SdBrowse_Frame(b);
-        else if (s_phase == PH_RENAME)   Rename_Frame(b);
-        else if (s_phase == PH_TOOLS)    Tools_Frame(b);
-        else if (s_phase == PH_EOS_SCRIPTS) EosScripts_Frame(b);
-        else if (s_phase == PH_FAN)       FanControl_Frame(b);
-        else if (s_phase == PH_EE_TOOLS) EeTools_Frame(b);
-        else if (s_phase == PH_FW_TOOLS) FwTools_Frame(b);
-        else if (s_phase == PH_FW_BACKUP)   FwBackup_Frame(b);
-        else if (s_phase == PH_FW_RPICK)    FwRestPick_Frame(b);
-        else if (s_phase == PH_FW_RTARGET)  FwRestTarget_Frame(b);
-        else if (s_phase == PH_FW_RCONFIRM) FwRestConfirm_Frame(b);
-        else if (s_phase == PH_HDD_TOOLS)   HddTools_Frame(b);
-        else if (s_phase == PH_HDD_INFO)    HddInfo_Frame(b);
-        else if (s_phase == PH_FORMAT)         Format_Frame(b);
-        else if (s_phase == PH_FORMAT_CONFIRM) FormatConfirm_Frame(b);
-        else if (s_phase == PH_CLEARCFG)       ClearCfg_Frame(b);
-        else if (s_phase == PH_CERB_MENU)  CerbMenu_Frame(b);
-        else if (s_phase == PH_CERB_EDIT)  CerbEdit_Frame(b);
-        else if (s_phase == PH_CERB_SAVED) CerbSaved_Frame(b);
-        else if (s_phase == PH_CERB_OC)    CerbOc_Frame(b);
-        else if (s_phase == PH_CERB_COMBO) CerbCombo_Frame(b);
-        else if (s_phase == PH_EE_RESTORE) EeRestore_Frame(b);
-        else if (s_phase == PH_EE_CONFIRM) EeConfirm_Frame(b);
-        else if (s_phase == PH_ABOUT)    About_Frame(b);
+        else if (s_phase == PH_CONFIRM)  Confirm_Frame(uiB);
+        else if (s_phase == PH_BROWSE)   Browse_Frame(uiB);
+        else if (s_phase == PH_RENAME)   Rename_Frame(uiB);
+        else if (s_phase == PH_TOOLS)    Tools_Frame(uiB);
+        else if (s_phase == PH_EOS_SCRIPTS) EosScripts_Frame(uiB);
+        else if (s_phase == PH_FAN)       FanControl_Frame(uiB);
+        else if (s_phase == PH_EE_TOOLS) EeTools_Frame(uiB);
+        else if (s_phase == PH_FW_TOOLS) FwTools_Frame(uiB);
+        else if (s_phase == PH_FW_BACKUP)   FwBackup_Frame(uiB);
+        else if (s_phase == PH_FW_RPICK)    FwRestPick_Frame(uiB);
+        else if (s_phase == PH_FW_RTARGET)  FwRestTarget_Frame(uiB);
+        else if (s_phase == PH_FW_RCONFIRM) FwRestConfirm_Frame(uiB);
+        else if (s_phase == PH_HDD_TOOLS)   HddTools_Frame(uiB);
+        else if (s_phase == PH_HDD_INFO)    HddInfo_Frame(uiB);
+        else if (s_phase == PH_FORMAT)         Format_Frame(uiB);
+        else if (s_phase == PH_FORMAT_CONFIRM) FormatConfirm_Frame(uiB);
+        else if (s_phase == PH_CLEARCFG)       ClearCfg_Frame(uiB);
+        else if (s_phase == PH_CERB_MENU)  CerbMenu_Frame(uiB);
+        else if (s_phase == PH_CERB_EDIT)  CerbEdit_Frame(uiB);
+        else if (s_phase == PH_CERB_SAVED) CerbSaved_Frame(uiB);
+        else if (s_phase == PH_CERB_OC)    CerbOc_Frame(uiB);
+        else if (s_phase == PH_CERB_COMBO) CerbCombo_Frame(uiB);
+        else if (s_phase == PH_EE_RESTORE) EeRestore_Frame(uiB);
+        else if (s_phase == PH_EE_CONFIRM) EeConfirm_Frame(uiB);
+        else if (s_phase == PH_POWER)    Power_Frame(uiB);
+        else if (s_phase == PH_ABOUT)    About_Frame(uiB);
         else if (s_phase == PH_SETTINGS) {
             Gfx_Begin(EOS_BG); Ui_Backdrop();
             Gfx_SetFilter(FALSE);                 // POINT sampling for text/menu
             {
-                int sr = Settings_Frame(b, s_prevBtn);
+                int sr = Settings_Frame(uiB, s_prevBtn);
                 if (sr == 1) { GotoPhase(PH_MENU); audioSync(); }
                 else if (sr == 2) {   // THEME -> pick a background-music track
-                    s_browseSong = 1; s_browsePath[0] = 0; browseRefresh();
+                    s_browseSong = 1; s_browseSdLaunch = 0; s_browsePath[0] = 0; browseRefresh();
                     GotoPhase(PH_BROWSE);
                 }
             }
             Gfx_End();
         }
-        else                             Menu_Frame(b);
+        else                             Menu_Frame(uiB);
 
         s_prevBtn = b;   // shared edge-detect baseline across phases
     }

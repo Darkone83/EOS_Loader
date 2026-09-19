@@ -73,7 +73,7 @@ void Theme_Init(void)
 // Colors-only reset to the Eos default (index 0). Does NOT persist and does
 // NOT touch the backdrop -- used as the base for a custom theme so any color
 // key the theme.ini omits inherits the default purple.
-void Theme_ApplyDefaultPalette(void) { g_theme = k_themes[0]; }
+void Theme_ApplyDefaultPalette(void) { s_idx = 0; g_theme = k_themes[0]; }
 
 int Theme_Count(void) { return THEME_COUNT; }
 
@@ -98,8 +98,8 @@ void Theme_Set(int idx)
 void Theme_Preview(int idx) { apply(idx); }      // live recolor, no flash write
 void Theme_Commit(void)
 {
-    if (Config_GetThemeIdx() != s_idx)           // only touch flash on a real change
-        Config_SetThemeIdx(s_idx);
+    if (Config_GetThemeIdx() != s_idx || Config_GetCustomThemeSource() != EOS_THEME_SOURCE_BUILTIN)
+        Config_SetThemeIdx(s_idx);               // also clears any custom selection
 }
 
 void Theme_Next(void) { Theme_Preview((s_idx + 1) % THEME_COUNT); }

@@ -1,246 +1,276 @@
-# Eos — Loader
+# EOS — Loader
 
-<div align=center>
+<div align="center">
 
-<img src="https://github.com/Darkone83/EOS_Loader/blob/main/images/EOS.png" width=400><img src="https://github.com/Darkone83/EOS_Loader/blob/main/images/Darkone83.png" width=500>
+<img src="https://github.com/Darkone83/EOS_Loader/blob/main/images/EOS.png" width="400"><img src="https://github.com/Darkone83/EOS_Loader/blob/main/images/Darkone83.png" width="500">
 
 </div>
 
-The on-console app for your Eos-modded Original Xbox. Power on and you land in the Eos
-loader: pick which BIOS runs, flash new BIOS images over the network, back up and manage the
-EEPROM, run firmware and hard-drive tools, watch live console telemetry, and personalise the
-UI — all from the couch with a controller, or from a browser on your PC.
-
-> Team Resurgent · Darkone83
->
-> **Current release: 1.0.5-1**
+The on-console control environment for an **EOS-modded Original Xbox**. Power on and EOS gives you a controller-driven loader for launching and managing BIOS banks, booting BIOS images from SD, maintaining the console, managing EEPROM and HDD functions, controlling optional EOS hardware, and accessing the same system from a browser or FTP client.
 
 ---
 
-## What you can do
+## Highlights
 
-- **Choose your BIOS** — switch between BIOS banks on the Eos board, boot the console's
-  original **TSOP** BIOS, launch **XbDiag Lite** when it's installed, or boot a BIOS image
-  straight off a **FAT32 SD card** without flashing that BIOS to the Eos board.
-- **Auto Boot a user BIOS** — mark one of Banks 1–4 as the automatic boot target and choose a
-  **2–30 second** countdown. Press **B** or the console **EJECT** button to cancel and remain in
-  the loader.
-- **Flash BIOS images** — push a new BIOS to a bank over FTP or the web control panel, then
-  commit it. Supports **256K, 512K, and 1MB** images; oversized banks are auto-placed into
-  the dynamic new-region layout.
-- **Flash .eos scripts** - Upload your own custom expansion scripts.
-- **Firmware backup / restore** — dump any bank to a file and restore it, per bank.
-- **Web control panel** — a browser page for bank management, **SD BIOS upload / delete / browse**,
-  **EEPROM backup / restore**, system info, XbDiag management, and a settings reset.
-- **FTP server** — move banks and files to and from the console over your network.
-- **EEPROM tools** — read, decode, edit, repair, back up, and restore the Xbox EEPROM,
-  including **video standard** (NTSC-M/J, PAL-I/M) and **game / DVD region** editing.
-- **HDD tools** — drive info, including full LBA48 capacity reporting and mounted-partition
-  usage, plus **ATA security lock / unlock** (bind a drive to this console or remove security).
-- **Fan control** — leave cooling on the Xbox SMC's automatic thermal control, or use a persistent
-  manual setting from **20–100%** in **5%** steps with live SMC readback.
-- **Hard-drive setup** — stage a fresh drive with the standard Xbox partitions and use the full
-  available capacity on large drives.
-- **Cerbios tools** — a Cerbios config editor and CPU/GPU overclock calculator,
-  on-console and in the web panel.
-- **Live telemetry HUD** — a top-right overlay shows **CPU / motherboard temperature** and
-  **RAM** while you use the loader.
-- **Personalise it** — recolour the UI with built-in themes, or build your own **custom themes**
-  (a background image and a music track) right in the browser and pick them on the console. Plus
-  an on-screen keyboard and network / clock / NVRAM settings.
-- **Keep the time** — set the console clock by hand; with an optional **X-RTC** clock module
-  installed, the time is saved to the battery-backed chip and survives a full power-off.
-- **Status LCD** — drive an optional **character LCD** on the Xbox SMBus (US2066 OLED or an
-  HD44780 via a PCF8574 backpack) showing a live status screen: current screen, IP, temps,
-  and free RAM.
-- **Optional XBOX-RGB handoff effects** — the loader can discover XBOX-RGB on the local network
-  and send a short bank-colour effect when a BIOS is launched. No device present simply means
-  the launch continues normally.
+- **Launch and manage BIOS banks** — boot Banks 1–4, the stock **TSOP**, **XbDiag Lite**, or a compatible BIOS directly from a **FAT32 SD card**.
+- **256K / 512K / 1MB BIOS support** — EOS manages the dynamic bank layout and oversized-bank placement automatically.
+- **Auto Boot** — mark one user bank as the automatic target and choose a **2–30 second** countdown. Press **B** or physical **EJECT** to cancel.
+- **Web control panel** — bank management, SD BIOS management, EEPROM backup/restore, system information, XbDiag controls, theme editing, and loader settings from a browser.
+- **FTP server** — move BIOS images and files over the network without a PC-side Xbox-specific utility.
+- **EEPROM tools** — inspect, back up, restore, repair, and edit supported EEPROM fields.
+- **HDD tools** — drive information, full LBA48 capacity reporting, ATA security lock/unlock, and full-drive setup/formatting.
+- **Fan control** — Xbox SMC automatic control or a persistent manual setting from **20–100%** in **5%** UI steps.
+- **Power controls** — dedicated **Shutdown** and **Reboot** menu with confirmation before executing either command.
+- **EOS Scripts** — load expansion scripts for programmable GPIO / peripheral control.
+- **Themes and music** — built-in themes plus custom themes stored on the **HDD or SD card**, including custom background images and music.
+- **Compact live system card** — optional top-left CPU / motherboard temperature and RAM readout, including EOS 1.6-mode status when asserted.
+- **Optional character LCD** — US2066 or HD44780/PCF8574 status display on the Xbox SMBus.
+- **Optional XBOX-RGB handoff effects** — EOS can discover XBOX-RGB and send a short bank-colour effect before BIOS launch.
+- **Optional EOS HDMI HUD control** — compatible EOS HDMI hardware can have its onboard HUD enabled or disabled, with the choice persisted in flash.
 
 ---
 
-## First boot
+## First boot and navigation
 
-The console cold-boots straight into the Eos loader UI. Navigate with the **D-pad**, **A**
-selects, **B** goes back. The main menu gets you to **Banks**, **Tools**, and **Settings**,
-and a top-right HUD shows live console telemetry (CPU / motherboard temperature and RAM). If an
-Auto Boot target is configured, a countdown appears after the splash; **B** or the console
-**EJECT** button cancels it and returns control to the loader.
+The console cold-boots into EOS. The main menu is:
+
+1. **Launch Bank**
+2. **Bank Management**
+3. **Tools**
+4. **Settings**
+5. **Power**
+6. **About**
+
+Use the **D-pad** to move, **A** to select, and **B** to return. Menu items are presented on the EOS 3D carousel; receding items fade before they can overlap the fixed EOS logo, title capsule, or bottom helper pill.
+
+The optional **System Info Card** appears at the upper-left and shows live CPU temperature, motherboard temperature, and RAM information. It can be disabled under **Settings → EOS Settings** without stopping the telemetry used by other features such as the LCD.
+
+If an Auto Boot target is configured, EOS displays a countdown after startup. Press **B** or the console **EJECT** button to cancel and remain in the Loader.
 
 ---
 
-## Using it
+## BIOS banks
 
-### Banks — choosing and flashing a BIOS
+### Launch Bank
 
-The **Banks** screen lists the BIOS banks on your Eos board. Select one to make it active and
-launch it — a warm reset boots into the chosen BIOS. Protected banks (the boot loader and
-recovery) are marked **[LOCKED]** and can't be deleted or overwritten by accident. When
-**XbDiag Lite** is installed on the board, it also appears here as a launchable entry.
+The launch screen exposes the active EOS BIOS layout and supported launch targets. User BIOS banks can contain **256K, 512K, or 1MB** images. EOS handles the physical placement and shadow-slot rules required by larger BIOS images.
 
-To configure **Auto Boot**, open **Bank Management** and press **WHITE** on an occupied user BIOS
-in Banks 1–4. Only one bank can be the target at a time. Set the countdown length under
-**Settings → Auto Boot**. SD Card, Recovery, XbDiag Lite, TSOP, empty banks, and shadow slots are
-not eligible.
+Protected Loader and recovery regions are not exposed as ordinary writable user banks.
 
-To **flash a new BIOS**: get the image onto the console (FTP or the web panel), pick a target
-bank, and commit — the loader writes it to the Eos flash and can serve it live. **256K, 512K,
-and 1MB** images are supported; larger images are automatically placed into the board's
-dynamic new-region layout and the bank management screen shows the free-slot budget.
+When **XbDiag Lite** is installed, it appears as a launchable diagnostic target. The stock onboard BIOS is available through the **TSOP** entry.
 
-To **boot the stock BIOS**: choose the **TSOP** entry in the bank list. Eos steps aside and
-the Xbox boots its original onboard BIOS; a normal power cycle returns you to Eos.
+### Auto Boot
 
-To **boot from an SD card**: choose the **SD Card** entry in the bank list, browse the card's
-FAT32 filesystem, and pick a BIOS image (**256K, 512K, or 1MB**). It's staged into SDRAM and
-booted directly, so that BIOS is not written to the Eos flash. The on-console boot path is a
-reader; SD-card file writes are exposed separately through the WebUI's **SD BIOS Manager**.
+Open **Bank Management** and press **WHITE** on an occupied user BIOS in Banks 1–4 to mark it as the Auto Boot target. Only one user bank can be marked at once.
 
-### Web control panel
+Set the countdown under **Settings → Auto Boot**. SD Card, Recovery, XbDiag Lite, TSOP, empty banks, and shadow slots are not valid Auto Boot targets.
 
-Point a browser at the console's IP address for a control panel with:
+### Flashing BIOS images
 
-- **Bank management** — rename, delete, flash, and launch banks from your desktop.
-- **SD BIOS Manager** — browse the FAT32 SD card and upload or delete 256K, 512K, and 1MB BIOS
-  images from the browser.
-- **System info** — console revision, CPU speed, RAM, encoder, serial, MAC, video standard,
-  region, language, and bank/slot usage.
-- **Backup EEPROM** — download your console's EEPROM as a file. **Do this once and keep it
-  safe** — it's your console's identity.
-- **Restore EEPROM** — upload a saved EEPROM image back (validated before it's written).
-- **XbDiag** — when XbDiag Lite is installed, the panel shows it and can clear it from its bank.
-- **Reset Settings** — return the loader's own settings to defaults; your banks are left
-  untouched.
-- **Theme editor** — create, edit, and delete **custom themes** (colours, a background image, and
-  a music track) from your browser. Saved themes appear on the console's theme picker straight away.
+Move a BIOS image to the console through FTP or the WebUI, select a target bank, and commit the write. EOS erases, programs, and verifies the target flash region.
 
-### FTP
+Supported image sizes:
 
-Connect an FTP client to the console's IP — default user **`xbox`**, password **`xbox`**,
-port **21** (all changeable in Settings). Up to two sessions at once; a third gets
-"all sessions in use." Use it to upload BIOS images and move files.
+- **256 KB**
+- **512 KB**
+- **1 MB**
 
-### Tools
+The bank manager accounts for the space consumed by oversized BIOS images and prevents incompatible placement.
 
-**Tools** groups the maintenance functions: **EEPROM**, **Firmware**, **HDD**, **Fan Control**,
-**Cerbios**, **EOS Scripts**, **Format**, and **Clear Settings**.
+### Booting from SD
 
-### EEPROM tools
+Choose **SD Card** from the launch list and browse a FAT32 card for a compatible BIOS image. EOS resolves and stages the selected file into SDRAM, then launches it without writing that BIOS to EOS flash.
 
-Read, decode, edit, repair, back up, and restore the Xbox EEPROM — the crypto is handled for
-you (HMAC-validated). Editable fields include the **video standard** (NTSC-M, NTSC-J, PAL-I,
-PAL-M) and the **game / DVD region**. **Back up before you edit.** A bad EEPROM write can stop
-the console booting, and the backup is how you recover.
+The shared file-browser path is used for both HDD and SD browsing, so path display, selection behaviour, and scrolling remain consistent between storage sources.
 
-### Firmware tools
+---
 
-**Backup** dumps a chosen bank's flash to a file on the drive, and **Restore** writes a saved
-firmware image back to a size-matched bank (erased, programmed, and verified page-by-page).
+## Web control panel
 
-### Cerbios tools
+Point a browser at the Xbox IP address. The WebUI provides:
 
-A **Cerbios config editor** — for reading and writing a bank's Cerbios configuration block
-without a PC — and a **CPU/GPU overclock calculator**, on-console and mirrored in the web
-control panel.
+- **Bank management** — rename, delete, flash, and launch BIOS banks.
+- **SD BIOS Manager** — browse the FAT32 SD card and upload or delete supported BIOS images.
+- **System information** — console revision, CPU speed, RAM, video encoder, serial, MAC, video standard, region, language, and EOS bank/slot usage.
+- **EEPROM backup** — download the console EEPROM. Keep a known-good copy somewhere safe.
+- **EEPROM restore** — validate and restore a saved EEPROM image.
+- **XbDiag controls** — detect and clear the XbDiag bank when present.
+- **Reset Settings** — restore Loader settings without intentionally erasing user BIOS images.
+- **Custom Theme editor** — create and edit HDD-hosted custom themes from a browser.
 
-### EOS Scripts
+---
 
-Upload your custom expansion scripts to take full control of the programmable GPIO pins (EXP 1-8)
+## FTP
+
+Connect an FTP client to the Xbox IP address.
+
+Default credentials:
+
+- **User:** `xbox`
+- **Password:** `xbox`
+- **Port:** `21`
+
+The credentials can be changed in Settings. EOS supports up to two simultaneous FTP sessions.
+
+---
+
+## Tools
+
+The Tools menu groups the maintenance functions:
+
+- **EEPROM**
+- **Firmware**
+- **HDD**
+- **Fan Control**
+- **Cerbios Config Editor**
+- **EOS Scripts**
+- **Format**
+- **Clear Settings**
+
+### EEPROM
+
+EOS can read and decode the 256-byte Xbox EEPROM, verify the security block, create backups, restore validated images, and edit supported fields such as video standard and region data.
+
+Back up the EEPROM before modifying it. The EEPROM contains console-specific identity and security information.
+
+### Firmware backup / restore
+
+Firmware tools can dump supported EOS flash regions to files and restore matching images. Writes are erased, programmed, and verified before completion.
 
 ### HDD tools
 
-**Drive Info** shows the model, serial, size, and ATA security state. **Lock** binds the drive
-to this console's key; **Unlock** removes security. Both are armed (press twice) to prevent an
-accidental change.
+Drive Info reports model, serial, capacity, and ATA security state. EOS reports the full LBA48 device capacity and mounted FATX partition usage.
+
+**Lock** binds a compatible drive to the current Xbox HDD key. **Unlock** removes ATA security where supported. Destructive or security-sensitive operations require deliberate confirmation.
 
 ### Fan Control
 
-**Tools → Fan Control** offers **Auto** and **Manual** cooling modes. Auto returns fan control to
-the Xbox SMC thermal algorithm. Manual accepts **20–100%** in **5%** UI steps and shows the live
-SMC readback; the SMC's own hardware resolution is 2%, so an odd 5% request can read back 1%
-higher. The selected policy persists across loader restarts.
+**Tools → Fan Control** provides:
 
-### Hard-drive setup (Format)
+- **Auto** — return control to the Xbox SMC thermal policy.
+- **Manual** — persistent **20–100%** selection in **5%** UI increments.
 
-**Tools → Format** stages a fresh Xbox drive: it lays down the standard partitions
-(E, C, X, Y, Z, and F spanning the rest). The large-drive path uses the disk's full reported
-geometry, selects FATX cluster sizes as capacity grows, and writes the backup partition table at
-the physical end of Partition0.
+The SMC hardware works at its own duty resolution, so a requested value can read back slightly differently. EOS reapplies the selected fan policy when the Loader starts.
 
-> ⚠️ **This wipes the entire drive.** Only run it on a drive you intend to erase, and test on
-> a scratch disk first.
+### Hard-drive setup / Format
 
-### Clear Settings
+The Format tool stages a fresh Xbox drive with the standard partitions and assigns the remaining capacity to the large data partition. The large-drive path uses full reported disk geometry and selects FATX cluster sizing appropriate to capacity.
 
-Resets the loader's config banks (bank table + settings) to factory. Bank names and saved
-settings are wiped; flashed BIOS images are not touched.
+> **Warning:** Format is destructive and wipes the selected drive.
 
-### Themes
+### Cerbios tools
 
-The loader ships with several **built-in colour themes**. Open **Settings -> Themes** and scroll
-the theme list left/right to preview them live; keep scrolling **past the built-ins** and any
-**custom themes** on your drive appear in the same list.
+EOS includes a Cerbios configuration editor and CPU/GPU overclock calculator, allowing common Cerbios configuration work directly on-console.
 
-A **custom theme** is its own look: a full-screen **background image**, a **music track**, and a
-colour palette. Selecting one applies its colours and background and plays its music in place of
-the global background music; switching back to a built-in theme restores the normal look.
+### EOS Scripts
 
-The easy way to make one is the **web theme editor** (browser -> *Custom Themes* card -> *Create
-Theme*): pick your colours, upload a background (PNG or JPG) and an optional MP3, and save. It
-writes the theme to the drive under `E:\Eos\Themes\<name>\` and it shows up on the console's
-theme picker with no reflash. **Edit** and **Delete** live there too. Oversized background images
-are resized in the browser before upload, so uploads stay small.
-
-### Status LCD
-
-The loader can drive an optional **20x4 character LCD** wired to the Xbox **SMBus** (the same
-bus as the X-RTC and the temperature sensors). Two controller families are supported:
-
-- **US2066 / SSD1311** OLED modules (native I2C, addresses 0x3C / 0x3D) -- brightness
-  adjustable in software.
-- **HD44780** character LCDs on a **PCF8574 I2C backpack** (the common "I2C 1602/2004",
-  addresses 0x27 / 0x3F) -- brightness set by the pot on the module.
-
-It shows a fixed status screen -- current menu / selected item, IP address, CPU and
-motherboard temperatures, and free RAM -- and freezes on a "Booting <bank>" message when you
-launch. The screen only redraws the parts that change, so an idle loader barely touches the
-bus. Configure it under **Settings -> LCD** (below); with no panel connected the feature is
-simply inert.
-
-### Settings
-
-- **Auto Boot** — set the **2–30 second** countdown for the user BIOS marked in Bank Management.
-  During the countdown, **B** or the physical **EJECT** button cancels it.
-- **Network** — IP / DHCP and the FTP credentials.
-- **Video / Audio / Region** — EEPROM-backed video standard, and game / DVD region editing.
-- **Clock / NVRAM** — console time and NVRAM values. With an optional **X-RTC** clock module
-  fitted, the Date & Time screen saves changes to it and restores the time from it on boot.
-- **Themes** — recolour the loader UI with a built-in palette, or select a **custom theme**
-  (its own background image and music). Scroll past the built-in themes to reach any on the drive.
-- **Background music** — turn it on and pick a track for the loader. (A custom theme with its own
-  music plays that instead while it's active.)
-- **LCD** — set the **Driver** (Disabled / HD44780 / US2066), the I2C **Address**, and
-  **Brightness** (US2066 only); a live **Detected** line confirms the panel is answering.
-- **About** — version and build info.
+EOS Scripts provide access to the expansion engine and programmable EXP pins for custom hardware and peripheral projects.
 
 ---
 
-## 1.0.5-1 notes
+## Settings
 
-This release adds Auto Boot and fan control, improves large-drive formatting and capacity
-reporting, adds optional XBOX-RGB bank-handoff effects, and improves font readability at 480p.
-See `CHANGELOG.md` for the release-level summary.
+The Settings hub contains the normal console and Loader configuration pages.
+
+### Audio
+
+Configure supported Xbox audio/NVRAM options.
+
+### Auto Boot
+
+Set the Auto Boot delay from **2–30 seconds**. The target BIOS itself is chosen in Bank Management.
+
+### Date & Time
+
+Set the Xbox clock manually. With an optional **X-RTC** installed, EOS can seed the console clock from the battery-backed RTC at boot and mirror changes back to it.
+
+### LCD
+
+Configure the optional 20x4 SMBus status display:
+
+- **Disabled**
+- **HD44780** through a PCF8574 I2C backpack
+- **US2066 / SSD1311** native I2C OLED
+
+Address and brightness options are exposed where supported, and EOS reports whether the configured display responds.
+
+The live LCD layout shows:
+
+- `EOS <spinner> <current screen>`
+- `NET <IP address>`
+- `CPU <temp> | MB <temp>`
+- `RAM <free>/<total>  <loader version>`
+
+During a BIOS launch the display changes to an ** EOS ** screen so the handoff state remains obvious.
+
+### Network
+
+Configure DHCP/static addressing and FTP credentials. Numeric entry uses the EOS on-screen keyboard with validation before values are committed.
+
+### Region / Video
+
+Inspect and edit the supported EEPROM/NVRAM region and video fields exposed by EOS.
+
+### System Info
+
+Displays decoded console and EEPROM information on-console.
+
+### Theme
+
+EOS supports built-in palettes plus custom themes.
+
+Custom themes can be discovered from:
+
+```text
+E:\Eos\Themes\<theme>\
+SD:\Eos\Themes\<theme>\
+```
+
+A custom theme can supply its own palette, background image, and music. EOS persists both the selected custom-theme identity and whether it came from HDD or SD, so selecting an SD theme does not depend on an HDD copy of that theme.
+
+### EOS Settings
+
+Loader-specific hardware/UI controls live in their own page:
+
+- **HDMI HUD** — enable or disable the optional onboard EOS HDMI overlay. The setting is persisted in EOS flash and reapplied at Loader boot.
+- **System Info Card** — show or hide the compact upper-left live telemetry card. This preference is also persisted.
+
+Both options default to **On** when no saved 1.0.6 setting exists.
+
+---
+
+## Power
+
+The main-menu **Power** page provides:
+
+- **Shutdown**
+- **Reboot**
+
+Both require a second **A** press before EOS sends the command to the Xbox SMC. Reboot uses a full power-cycle path and explicitly returns EOS to the Loader boot bank before the cycle begins.
+
+---
+
+## UI and themes
+
+EOS 1.0.6 keeps the 3D carousel presentation while tightening the visual rules around it:
+
+- selected and receding capsules share consistent geometry;
+- pill text is visually centred;
+- title/header capsules use a single-draw shape to avoid visible body/end-cap seams;
+- receding carousel items fade before entering the top logo/title area or bottom helper area;
+- fixed helper/status pills use the same visual language throughout the Loader;
+- the compact System Info Card avoids consuming unnecessary screen space over image/model themes.
+
+The built-in **Darkone83** presentation uses the EOS plasma/model background path. Other built-in and custom themes continue to use the same shared colour tokens and UI geometry.
 
 ---
 
 ## Safety
 
-- **Format is destructive** — it wipes and re-partitions the whole drive. Validate on a
-  scratch disk.
-- **Back up your EEPROM** before editing it or restoring another image — it's your console's
-  identity and boot health.
-- **Locked banks** (boot loader, recovery) are protected from routine bank management, so you
-  can't delete your way into an unbootable state by accident.
+- **Format wipes the entire selected drive.**
+- **Back up the EEPROM** before changing or restoring EEPROM data.
+- EOS keeps Loader/recovery areas protected from routine bank-management operations.
+- BIOS and firmware writes are verified; do not intentionally interrupt power during a flash operation.
 
 ---
 
@@ -248,116 +278,80 @@ See `CHANGELOG.md` for the release-level summary.
 
 ### Requirements
 
-- An Original Xbox (any revision) with an installed **Eos** board.
-- **RXDK / MSVC 2003** toolchain to build the XBE.
-- **`eos_pack.py`** — the BIOS packer, shipped in the **Eos firmware repo's `Tools/`
-  folder** (not part of the loader source). Required to turn your built XBE into a bootable
-  BIOS image. Needs **Python 3 + `lz4`** (`pip install lz4`).
+- Original Xbox with an EOS board.
+- **RXDK / MSVC 2003** toolchain for the Loader XBE.
+- **Python 3 + `lz4`** for `eos_pack.py`.
 
-> The codebase targets RXDK / MSVC 2003 (C89-era constraints, no CRT/heap, `/GL` on all
-> units). It is not expected to build under a modern toolchain unchanged.
+The codebase targets the RXDK / MSVC 2003 environment and retains C89-era/compiler constraints. It is not expected to compile unchanged under a modern desktop compiler.
 
 ### Building
 
-Build with the RXDK / MSVC 2003 toolchain to produce the loader `default.xbe`.
+Build the Loader project to produce `default.xbe`.
 
-### Packing the BIOS image
+### Packing a bootable EOS image
 
-Packing is done with **`eos_pack.py`, which lives in the Eos firmware repo's `Tools/`
-folder** — it is a required, separate tool, not part of this loader source. Building the
-loader produces `default.xbe`; `eos_pack.py` is what turns that into a flashable image.
-
-The Eos board boots a **2 MB Xenium-style BIOS image** with the loader XBE embedded
-(LZ4-compressed) in the XeniumOS bank while keeping the bank geometry
-
-byte-for-byte. `eos_pack.py` swaps **only** the embedded XBE into a known-good template, so
-the kernel's XBE-location expectations stay satisfied.
+`eos_pack.py` lives with the EOS firmware/tooling rather than in this Loader repository. It replaces the embedded XeniumOS XBE inside a known-good 2 MB Xenium/PrometheOS-style template while preserving the rest of the flash geometry.
 
 ```bash
-python3 eos_pack.py pack <template.bin> default.xbe eos.bin   # build the image
-python3 eos_pack.py verify eos.bin                             # round-trip check
-python3 eos_pack.py unpack eos.bin out.xbe                     # pull an XBE back out
+python3 eos_pack.py pack <template.bin> default.xbe eos.bin
+python3 eos_pack.py verify eos.bin
+python3 eos_pack.py unpack eos.bin out.xbe
 ```
 
-- `<template.bin>` must be the **2 MB Xenium image** (e.g. `Xenium_Prometheos_V1_5_0.bin`) —
-  not the 256 K BIOS `.bin` or the 1 MB RP2040 image.
+The embedded XBE region begins at `0x100000`; the kernel region begins at `0x180000`. The XBE descriptor plus raw LZ4 block must fit the 512 KB XeniumOS region.
 
-- The XBE is placed at the XeniumOS bank (`0x100000`); descriptor is `u32 decompressed_size,
-  u32 compressed_size` then the raw LZ4 block. Kernel sits at `0x180000`.
-- Budget: descriptor + compressed XBE must fit **0x80000 (512 KB)** — `pack` errors on
-  overflow and self-verifies the round-trip before writing.
-
-> **Flashing the packed image to the board is chip prep, not loader software** — see the
-> firmware README ("Flashing / chip prep"). The loader's job ends at producing `eos.bin`.
-> Stock BIOS images flash directly; packing is only for embedding a custom loader XBE.
+Packing prepares a flash image. Actual chip programming/firmware preparation belongs to the EOS firmware project.
 
 ### Source layout
 
-```
-main.cpp                  entry point + frame loop + telemetry HUD overlay
-eos_menu / eos_ui         menu system + UI
-eos_gfx / eos_font        rendering + fonts (eos_font_data.h, eos_logo_data.h)
-eos_splash / eos_theme    splash + themeable styling (built-in palettes + custom-theme backdrop)
-eos_image                 image-file -> swizzled texture loader (custom-theme backgrounds; stb_image)
-eos_theme_custom          disk-loaded custom themes (theme.ini parser, folder scan, set.dat select)
-eos_audio                 background-music engine (minimp3 -> DirectSound)
-eos_osk                   on-screen keyboard
-eos_console               console read (revision, CPU MHz, temps, RAM) + SMBus access for other modules
-input                     controller input
+```text
+main.cpp                  phase/frame loop, system card, tools and power UI
+eos_menu                  main-menu logic and EOS logo/menu presentation
+eos_ui                    shared title/footer/status pills + 3D carousel
+eos_gfx / eos_font        rendering, capsule geometry and fonts
+eos_splash                EOS logo/splash
+eos_theme                  built-in palettes
+eos_theme_custom          HDD/SD custom-theme discovery and loading
+eos_image                 image -> swizzled Xbox texture loader
+eos_model / eos_plasma    Darkone83 embedded model/plasma background
+eos_audio                 background-music engine
+input                      controller input
+eos_osk                    on-screen keyboard
 
-dd_ftp                    FTP server (2-session)
-eos_http                  HTTP server + OTA + web EEPROM backup/restore + sysinfo + reset + theme editor
-dd_net                    networking
-eos_firmware_io           firmware/loader image I/O + per-bank backup/restore
+dd_net / dd_ftp           network and FTP services
+eos_http                  WebUI / HTTP services
+dd_mount / eos_file       mounted filesystem and shared file-browser I/O
+eos_sdcard / eos_sddiskio onboard SD + FatFs integration
+ff / ffunicode / diskio   vendored FatFs
 
-eos_bank                  bank register control + locked-bank flag + TSOP boot + XbDiag detect
-eos_sdcard                SD card driver: register I/O, FatFs file -> raw LBA resolve, precache + launch
-eos_sddiskio              FatFs disk I/O glue (single-sector reads over the onboard SD slot)
-ff / ffunicode / diskio   vendored FatFs (read-only, LFN, fast-seek) -- see bundled-library note below
-eos_descriptor            dynamic bank geometry descriptor (256K/512K/1MB slot layout)
+eos_bank                  bank selection / launch / TSOP / XbDiag control
+eos_descriptor            dynamic bank geometry
 eos_flash                 flash engine bridge
-eos_hdd / eos_format      drive info + full LBA48 capacity + ATA security + HDD staging/format
-eos_fan                   Xbox SMC fan control (Auto / persistent Manual)
-dd_mount / eos_file       mount lifecycle + file ops
+eos_firmware_io           firmware image backup/restore
 
-eos_eeprom                EEPROM read/decode/edit/repair/restore
+eos_hdd / eos_format      HDD information, security and formatting
+eos_fan                   SMC fan control
+eos_cerbios               Cerbios configuration tools
+
+eos_eeprom                EEPROM UI/operations
 eos_eeprom_io             EEPROM transport
-eos_ee_crypto             EEPROM SHA-1 / HMAC / RC4 / CRC (ported crypto core)
-eos_ee_data               EEPROM raw-image decode/encode (video std, region, serial, MAC)
+eos_ee_crypto             active EEPROM SHA-1/HMAC/RC4/CRC implementation
+eos_ee_data               raw EEPROM decode/encode helpers
 
-eos_config / eos_settings config + settings hub (auto boot, video/region, theme, music, persisted fan policy)
-eos_clock / eos_nvram     clock + NVRAM
-eos_rtc                   optional X-RTC (DS1307-class SMBus clock): read/write + boot seed & mirror
-eos_lcd                   optional SMBus status LCD (US2066 + HD44780/PCF8574 drivers, lcd.dat)
-eos_xboxrgb               optional LAN discovery + transient XBOX-RGB bank-handoff effects
-eos_ftoi                  float->int helper (MSVC2003 /GL: __ftol2_sse)
-
-minimp3.h                 bundled MP3 decoder (background music)
-stb_image.h               bundled image decoder
-xboxinternals.h           kernel export declarations
-Media/                    runtime media assets (background-music tracks, etc.)
+eos_config                persistent EOS bank/settings storage
+eos_settings              Settings hub including EOS Settings
+eos_nvram                  Xbox OS-section settings
+eos_clock / eos_rtc       console clock and optional X-RTC
+eos_lcd                    optional SMBus status LCD
+eos_xboxrgb               optional XBOX-RGB launch effects
 ```
-
-> **minimp3.h and stb_image.h are bundled** — link `dsound.lib` for the audio engine.
->
-> **FatFs (`ff.c`/`ff.h`/`ffconf.h`/`ffunicode.c`/`diskio.h`) is vendored** — R0.16 with the
-> 2026 CVE patch set applied, configured read-only (LFN on, fast-seek on, fixed 512B sectors).
-> `eos_sddiskio.cpp` is the disk I/O glue over the onboard SD slot. A handful of local, clearly
-> commented deltas in `ff.h`/`ffconf.h` handle porting quirks specific to this toolchain (Xbox/
-> RXDK integer types, an alignment-attribute syntax MSVC doesn't understand) — see the comments
-> in those files; nothing else in the vendored FatFs source is modified from upstream.
->
-> `eos_image.cpp`, `eos_theme_custom.cpp`, `eos_rtc.cpp`, and `eos_lcd.cpp` are separate
-> translation units — make sure they're in the project's compile list.
->
-> The EEPROM crypto lives in `eos_ee_crypto` + `eos_ee_data` (raw 256-byte image decode with
-> HMAC-validated security block). An older `eos_eeprom_crypto.cpp` remains on disk but is **not
-> part of the build** (excluded from the project) — it has been superseded.
 
 ---
 
 ## Credits
 
-Eos loader © Team Resurgent / Darkone83. FTP engine adapted from the DarkDash codebase.
+EOS Loader © Team Resurgent / Darkone83.
 
-VSC HDD unlock support is based on the PrometheOS implementation by Team Resurgent and its contributors. The Western Digital and Seagate vendor-specific recovery flows were adapted for EOS while preserving the original PrometheOS behavior.
+FTP functionality is adapted from the DarkDash codebase.
+
+VSC HDD unlock support is based on the PrometheOS implementation by Team Resurgent and its contributors. Western Digital and Seagate vendor-specific recovery flows were adapted for EOS while preserving the original PrometheOS behaviour.

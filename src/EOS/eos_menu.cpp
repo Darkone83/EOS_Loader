@@ -12,24 +12,16 @@ static const char* s_items[EOS_MENU_COUNT] =
     "Bank Management",
     "Tools",
     "Settings",
+    "Power",
     "About"
 };
 
 static int   s_sel = 0;
 
-// Layout (design space; height tracks g_scrH for PAL).
-#define ROW_Y0     160     // first item y (fits 5 rows above the footer)
-#define ROW_DY     40      // item spacing
-#define ROW_H      32
-#define ROW_W      300
-#define ROW_X      ((g_scrW - ROW_W) / 2)
-
 void Menu_Init()
 {
     s_sel = 0;
 }
-
-int Menu_Selected() { return s_sel; }
 
 // rising-edge helper
 static bool Pressed(WORD now, WORD prev, WORD mask)
@@ -98,7 +90,10 @@ void Menu_DrawIntro(int progress)
     // so the logo leads and the options arrive just after it lands. Below the
     // threshold we draw nothing for them; Ui_Menu3D already eases its own motion.
     if (p >= 128) {
-        Ui_Menu3D(s_items, EOS_MENU_COUNT, s_sel);
+        // Reserve the EOS logo above and the helper pill below. Receding
+        // carousel items fade out before entering either piece of fixed chrome.
+        Ui_Menu3DBounded(s_items, EOS_MENU_COUNT, s_sel,
+            MENU_LOGO_HDR_Y + MENU_LOGO_HDR_SZ / 2 + 8, g_scrH - 82);
         Ui_Footer("D-PAD  MOVE      A  SELECT");
     }
 }

@@ -25,8 +25,18 @@ int Config_ClearAll(void);   // factory-reset both config banks
 int Config_ResetSettings(void);   // reset settings block (0xC) only; banks untouched
 
 // --- persisted loader settings (stored in the settings block, bank 0xC) ------
+// Active custom theme state lives here too so SD themes never depend on HDD.
+#define EOS_THEME_SOURCE_BUILTIN 0
+#define EOS_THEME_SOURCE_HDD     1
+#define EOS_THEME_SOURCE_SD      2
 int  Config_GetThemeIdx(void);
-void Config_SetThemeIdx(int idx);   // clamps, persists settings only
+void Config_SetThemeIdx(int idx);   // clamps, selects built-in, persists settings only
+
+// Custom theme selection. The settings page stores source + a compact,
+// case-insensitive identity of the folder name; the media stores the assets.
+int  Config_GetCustomThemeSource(void);
+int  Config_CustomThemeMatches(const char* folder);
+int  Config_SetCustomTheme(int source, const char* folder);
 
 // Background music (persisted in the settings block). Enable flag + one selected
 // track path. Setters persist immediately (settings bank only).
@@ -47,3 +57,9 @@ int  Config_SetFan(int manualMode, int percent);
 // table; only this timeout lives in the settings block. Range: 2..30 seconds.
 int  Config_GetAutoBootTimeout(void);
 int  Config_SetAutoBootTimeout(int seconds);
+
+// EOS-specific UI/runtime options. Both flags share one persisted settings byte.
+int  Config_GetHdmiHudOn(void);
+int  Config_SetHdmiHudOn(int on);
+int  Config_GetSystemCardOn(void);
+int  Config_SetSystemCardOn(int on);

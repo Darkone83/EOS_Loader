@@ -48,11 +48,6 @@ typedef struct {
 // if the console key wasn't matched -- plaintext fields are still valid).
 int EeData_Read(EeData* d);
 
-// Human-readable strings.
-const char* EeData_VideoStdStr(const EeData* d);
-const char* EeData_GameRegionStr(const EeData* d);
-const char* EeData_DvdRegionStr(const EeData* d);
-
 // --- Writers (persist to the live EEPROM) -----------------------------------
 // Each re-reads, applies the change with correct checksums, and writes back.
 // Return 1 on success. Video standard / DVD region are plaintext + CRC; game

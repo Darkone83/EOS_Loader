@@ -6,8 +6,7 @@
     as comments ONLY when they lead a line (so "#RRGGBB" color values survive).
     Unknown keys are ignored, so hand-authored themes with extra keys still load.
 
-    RXDK / MSVC2003 / C89-ish. Win32 file APIs (CreateFileA/WriteFile/
-    CreateDirectoryA/DeleteFileA) are available on the Xbox, same as eos_file.cpp.
+    RXDK / MSVC2003 / C89-ish.
 ---------------------------------------------------------------------------*/
 #include <xtl.h>
 #include "eos_theme_custom.h"
@@ -61,11 +60,11 @@ static int appendStr(char* dst, int cap, int pos, const char* s)
     return i;
 }
 
-/* "E:\Eos\Themes\" + folder + "\" + leaf */
-static void buildThemePath(char* dst, int cap, const char* folder, const char* leaf)
+/* "E:\Eos\Themes\" or virtual "SD:\Eos\Themes\" + folder + leaf. */
+static void buildThemePath(char* dst, int cap, const char* folder, const char* leaf, int sd)
 {
     int p = 0;
-    p = appendStr(dst, cap, p, "E:\\Eos\\Themes\\");
+    p = appendStr(dst, cap, p, sd ? "SD:\\Eos\\Themes\\" : "E:\\Eos\\Themes\\");
     p = appendStr(dst, cap, p, folder);
     p = appendStr(dst, cap, p, "\\");
     p = appendStr(dst, cap, p, leaf);
@@ -100,23 +99,19 @@ static int parseIntv(const char* v)
 }
 
 /* --------------------------------------------------------------------------- */
-void ThemeCustom_EnsureDir(void)
-{
-    CreateDirectoryA("E:\\Eos", NULL);
-    CreateDirectoryA("E:\\Eos\\Themes", NULL);
-}
-
-int ThemeCustom_Apply(const char* folder)
+int ThemeCustom_Apply(const char* folder, int source)
 {
     static char buf[8192];
     char iniPath[256];
     char bgFile[EOS_FILE_NAME_MAX];
     char musFile[EOS_FILE_NAME_MAX];
-    int  n, off, dim;
+    int  n, off, dim, useSd;
 
     if (!folder || !folder[0]) return 0;
+    if (source != EOS_THEME_SOURCE_HDD && source != EOS_THEME_SOURCE_SD) return 0;
+    useSd = (source == EOS_THEME_SOURCE_SD);
 
-    buildThemePath(iniPath, sizeof(iniPath), folder, "theme.ini");
+    buildThemePath(iniPath, sizeof(iniPath), folder, "theme.ini", useSd);
     n = File_ReadInto(iniPath, (unsigned char*)buf, sizeof(buf) - 1);
     if (n <= 0) return 0;                 /* no readable theme.ini -> invalid */
     buf[n] = 0;
@@ -175,7 +170,7 @@ int ThemeCustom_Apply(const char* folder)
     /* background: presence of a filename => image mode, else gradient/fill */
     if (bgFile[0]) {
         char bgPath[256];
-        buildThemePath(bgPath, sizeof(bgPath), folder, bgFile);
+        buildThemePath(bgPath, sizeof(bgPath), folder, bgFile, useSd);
         if (!Theme_SetBgImage(bgPath, dim)) Theme_ClearBg();  /* colors still applied */
     }
     else {
@@ -188,7 +183,7 @@ int ThemeCustom_Apply(const char* folder)
     s_musicPath[0] = 0;
     if (musFile[0]) {
         char mp[256];
-        buildThemePath(mp, sizeof(mp), folder, musFile);
+        buildThemePath(mp, sizeof(mp), folder, musFile, useSd);
         if (File_Exists(mp)) { cpstr(s_musicPath, sizeof(s_musicPath), mp); s_hasMusic = 1; }
     }
 
@@ -197,19 +192,55 @@ int ThemeCustom_Apply(const char* folder)
 }
 
 /* ---- scan / clear --------------------------------------------------------- */
-int ThemeCustom_Scan(char out[][EOS_FILE_NAME_MAX], int maxN)
+int ThemeCustom_Scan(EosThemeEntry out[], int maxN)
 {
     static EosFileEntry ents[64];
     int n, i, count = 0;
     char ini[256];
+
     n = File_ListDir("E:\\Eos\\Themes", ents, 64);
     for (i = 0; i < n && count < maxN; ++i) {
-        if (!ents[i].is_dir) continue;
-        if (ents[i].name[0] == '.') continue;          /* skip . and .. */
-        buildThemePath(ini, sizeof(ini), ents[i].name, "theme.ini");
-        if (File_Exists(ini)) { cpstr(out[count], EOS_FILE_NAME_MAX, ents[i].name); ++count; }
+        if (!ents[i].is_dir || ents[i].name[0] == '.') continue;
+        buildThemePath(ini, sizeof(ini), ents[i].name, "theme.ini", 0);
+        if (!File_Exists(ini)) continue;
+        cpstr(out[count].name, EOS_FILE_NAME_MAX, ents[i].name);
+        out[count].source = EOS_THEME_SOURCE_HDD;
+        ++count;
+    }
+
+    n = File_ListDir("SD:\\Eos\\Themes", ents, 64);
+    for (i = 0; i < n && count < maxN; ++i) {
+        if (!ents[i].is_dir || ents[i].name[0] == '.') continue;
+        buildThemePath(ini, sizeof(ini), ents[i].name, "theme.ini", 1);
+        if (!File_Exists(ini)) continue;
+        cpstr(out[count].name, EOS_FILE_NAME_MAX, ents[i].name);
+        out[count].source = EOS_THEME_SOURCE_SD;
+        ++count;
     }
     return count;
+}
+
+int ThemeCustom_ApplySaved(void)
+{
+    static EosFileEntry ents[64];
+    const char* root;
+    int source = Config_GetCustomThemeSource();
+    int n, i;
+    char ini[256];
+
+    if (source == EOS_THEME_SOURCE_HDD) root = "E:\\Eos\\Themes";
+    else if (source == EOS_THEME_SOURCE_SD) root = "SD:\\Eos\\Themes";
+    else return 0;
+
+    n = File_ListDir(root, ents, 64);
+    for (i = 0; i < n; ++i) {
+        if (!ents[i].is_dir || ents[i].name[0] == '.') continue;
+        if (!Config_CustomThemeMatches(ents[i].name)) continue;
+        buildThemePath(ini, sizeof(ini), ents[i].name, "theme.ini", source == EOS_THEME_SOURCE_SD);
+        if (!File_Exists(ini)) return 0;
+        return ThemeCustom_Apply(ents[i].name, source);
+    }
+    return 0;
 }
 
 void ThemeCustom_Clear(void)
@@ -217,47 +248,4 @@ void ThemeCustom_Clear(void)
     s_hasMusic = 0;
     s_musicPath[0] = 0;
     s_active[0] = 0;
-}
-
-/* ---- set.dat -------------------------------------------------------------- */
-int SetDat_Read(char* outFolder, int cap)
-{
-    unsigned char buf[128];
-    int n, i, vs, ve;
-
-    if (cap > 0) outFolder[0] = 0;
-    n = File_ReadInto("E:\\Eos\\set.dat", buf, sizeof(buf) - 1);
-    if (n <= 0) return 0;
-    buf[n] = 0;
-
-    for (i = 0; i < n && buf[i] != '='; ++i) {}
-    if (i >= n) return 0;
-    vs = i + 1; ve = vs;
-    while (ve < n && buf[ve] != '\r' && buf[ve] != '\n') ++ve;
-    while (vs < ve && (buf[vs] == ' ' || buf[vs] == '\t')) ++vs;
-    while (ve > vs && (buf[ve - 1] == ' ' || buf[ve - 1] == '\t')) --ve;
-    copyRange(outFolder, cap, (const char*)buf, vs, ve);
-    return outFolder[0] ? 1 : 0;
-}
-
-void SetDat_Write(const char* folder)
-{
-    HANDLE h;
-    DWORD  wr;
-    char   line[96];
-    int    p;
-
-    h = CreateFileA("E:\\Eos\\set.dat", GENERIC_WRITE, 0, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    p = appendStr(line, sizeof(line), 0, "theme=");
-    p = appendStr(line, sizeof(line), p, folder ? folder : "");
-    p = appendStr(line, sizeof(line), p, "\r\n");
-    WriteFile(h, line, (DWORD)p, &wr, NULL);
-    CloseHandle(h);
-}
-
-void SetDat_Clear(void)
-{
-    DeleteFileA("E:\\Eos\\set.dat");
 }

@@ -202,6 +202,7 @@ int Osk_Update(WORD pressed)
         TypeKey(s_row, s_col);
     }
     if (pressed & BTN_B) { if (s_len > 0) { s_len--; s_text[s_len] = 0; } }
+    if ((pressed & BTN_X) && s_mode == OSK_NUMERIC) { s_text[0] = 0; s_len = 0; }
     if ((pressed & BTN_X) && s_mode == OSK_TEXT) s_keyset = (s_keyset + 1) % 3;
     if ((pressed & BTN_LTHUMB) && s_mode == OSK_TEXT) s_keyset = (s_keyset == 1) ? 0 : 1; // L3 caps
     if ((pressed & BTN_Y) && s_mode == OSK_TEXT) { if (s_len < s_maxLen) { s_text[s_len++] = ' '; s_text[s_len] = 0; } }
@@ -292,7 +293,9 @@ void Osk_Draw(void)
     }
 
     Font_DrawCentered(0, g_scrW, KB_PANEL_Y + ROWS * (KB_KEY_H + KB_ROW_GAP) + 8,
-        (s_mode == OSK_NUMERIC || s_mode == OSK_HEX)
+        (s_mode == OSK_NUMERIC)
+        ? "A Type   B Del   X Clear   Start OK   Back Cancel"
+        : (s_mode == OSK_HEX)
         ? "A Type   B Del   Start OK   Back Cancel"
         : "A Type  B Del  X Case  L3 Caps  Y Space  Start OK  Back Cancel",
         dim);

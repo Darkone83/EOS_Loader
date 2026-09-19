@@ -29,12 +29,6 @@ static int cstrEqI(const char* a, const char* b)   // case-insensitive equals
     }
 }
 
-static void cstrUpper(char* s)
-{
-    int i = 0;
-    while (s[i]) { if (s[i] >= 'a' && s[i] <= 'z') s[i] = (char)(s[i] - 32); i++; }
-}
-
 // integer -> decimal string. Returns length.
 static int intToStr(int v, char* buf)
 {

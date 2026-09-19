@@ -231,6 +231,32 @@ int Sd_ResolveFile(FIL* fp, unsigned long* outLba, unsigned int* outSectors, int
     return EOS_SD_OK;
 }
 
+// Loader-facing wrapper for its virtual "SD:\\..." namespace. Keep the
+// translation here beside FatFs so the shared browser remains storage-agnostic.
+int Sd_ResolvePath(const char* path, unsigned long* outLba, unsigned int* outSectors, int* outSzc)
+{
+    char sp[256];
+    FIL fp;
+    FRESULT fr;
+    int i = 0, p = 0, rc;
+
+    if (!path || !outLba || !outSectors || !outSzc) return EOS_SD_MOUNTFAIL;
+    if (path[0] == 'S' && path[1] == 'D' && path[2] == ':') i = 3;
+    if (path[i] != '\\' && path[i] != '/' && p < (int)sizeof(sp) - 1) sp[p++] = '/';
+    while (path[i] && p < (int)sizeof(sp) - 1) {
+        char ch = path[i++];
+        sp[p++] = (ch == '\\') ? '/' : ch;
+    }
+    if (p == 0) sp[p++] = '/';
+    sp[p] = 0;
+
+    fr = f_open(&fp, sp, FA_READ);
+    if (fr != FR_OK) return EOS_SD_MOUNTFAIL;
+    rc = Sd_ResolveFile(&fp, outLba, outSectors, outSzc);
+    f_close(&fp);
+    return rc;
+}
+
 // ---- bulk precache + launch -------------------------------------------------
 int Sd_PrecacheAndLaunch(unsigned long lba, unsigned int sectors, int szc)
 {

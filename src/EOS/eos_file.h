@@ -1,10 +1,9 @@
 #pragma once
 // eos_file.h -- slim, heap-free file access for the Eos loader.
 //
-// Just what flashing-from-disk needs: mount the HDD partitions (so E:/F:/...
-// resolve in the BIOS-launched loader context), enumerate drives + directories,
-// and read a file into a caller-provided buffer. No MU, no tree copy/delete --
-// those live in the DarkDash file manager; the loader doesn't need them yet.
+// Just what flashing/theme/audio needs: mount HDD partitions, enumerate + read,
+// and expose the EOS FAT32 card through a tiny virtual "SD:\\..." path. No MU,
+// no tree copy/delete -- those live in the DarkDash file manager.
 #pragma once
 #include <xtl.h>
 
@@ -24,7 +23,8 @@ void File_MountDrives(void);
 // partitions (F:/G: on a stock drive) are skipped. Returns count in out[].
 int  File_ListDrives(EosFileEntry* out, int maxEntries);
 
-// Directory entries (dotfiles skipped). path like "E:\\eos". Returns count.
+// Directory entries (dotfiles skipped). path like "E:\\eos" or
+// "SD:\\Eos\\Themes". Returns count.
 int  File_ListDir(const char* path, EosFileEntry* out, int maxEntries);
 
 int  File_IsDir(const char* path);

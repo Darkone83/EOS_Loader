@@ -69,6 +69,13 @@ void Sd_Unmount(void);
 // edge case that's cheap to just tell the user to fix (copy fresh).
 int Sd_ResolveFile(FIL* fp, unsigned long* outLba, unsigned int* outSectors, int* outSzc);
 
+// Resolve a loader virtual path ("SD:\\...") directly. This is the browser-facing
+// wrapper: it translates to FatFs syntax, opens/closes the file, then delegates
+// to Sd_ResolveFile() so main.cpp does not need its own FatFs path/open logic.
+// Returns the same resolve errors plus EOS_SD_MOUNTFAIL when the path cannot be
+// opened.
+int Sd_ResolvePath(const char* path, unsigned long* outLba, unsigned int* outSectors, int* outSzc);
+
 // --- precache + launch -------------------------------------------------------
 // Copies 'sectors' 512-byte blocks starting at 'lba' into NRGN_SD (bulk
 // hardware precache -- see eos_sd_precache.v), sets NR_SZC to 'szc' first,

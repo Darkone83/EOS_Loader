@@ -13,3 +13,7 @@ void Settings_Enter(void);                  // reset to the list + (re)read EEPR
 // Step one frame: handle input and draw. Returns 1 when the user leaves Settings
 // (back to the main menu), else 0. Caller supplies current + previous buttons.
 int  Settings_Frame(WORD b, WORD prevBtn);
+
+// Re-apply persisted EOS runtime controls (currently the FPGA HDMI HUD) after
+// Config_Load() on Loader startup. Safe/no-op if the command is unavailable.
+void Settings_ApplyEosRuntime(void);
