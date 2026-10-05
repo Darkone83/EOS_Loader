@@ -176,7 +176,6 @@ static int hudLine(int left, int right, int y, const char* label, const char* va
 static void hudDraw(void)
 {
     int bx, by, bw, bh, left, right, y;
-    int warnY, warnH;
     char buf[16];
     int n;
     DWORD panel, rowBg, edge, liveCol;
@@ -189,9 +188,9 @@ static void hudDraw(void)
         bx = 10;
         by = 10;
         bw = 164;
-        // Compact three-row system card. The 1.6 strap still gets its own
-        // dedicated warning row without making the normal card unnecessarily wide.
-        bh = s_eosMode16 ? 112 : 84;
+        // Compact system card. When the physical 1.6_EN strap is active, add
+        // a fourth instrumentation row using the same visual language as CPU/MB/RAM.
+        bh = s_eosMode16 ? 101 : 84;
         left = bx + 18;
         right = bx + bw - 12;
         y = by + 31;
@@ -213,7 +212,7 @@ static void hudDraw(void)
         Font_DrawScaled(bx + bw - 53, by + 8, "LIVE", EOS_DIM, HUD_HEAD_K);
         Gfx_FillRounded(bx + bw - 18, by + 9, 7, 7, 3, liveCol);
 
-        // Three subtle row wells make the values read as instrumentation rather
+        // Subtle row wells make the values read as instrumentation rather
         // than debug text while keeping the card visually light.
         Gfx_FillRounded(bx + 13, y - 3, bw - 24, 15, 5, rowBg);
         if (s_live.tempOK && s_live.cpuTempC >= 0) {
@@ -256,15 +255,11 @@ static void hudDraw(void)
             y = hudLine(left, right, y, "RAM", buf, EOS_WHITE);
         }
 
-        // Configuration warning/status: this reflects the physical EOS 1.6_EN
-        // strap, not the detected Xbox revision. Give it a dedicated alert pill.
+        // Physical EOS 1.6_EN status, not the detected Xbox revision. Keep it
+        // inside the system card as a normal row so it cannot read as detached UI.
         if (s_eosMode16) {
-            DWORD warn = (EOS_PURPLE & 0x00FFFFFF) | 0xD8000000;
-            warnY = by + 84;
-            warnH = 20;
-            Gfx_FillRounded(bx + 14, warnY, bw - 28, warnH, warnH / 2, warn);
-            Font_DrawCentered(bx + 14, bw - 28,
-                warnY + (warnH - FONT_CH) / 2, "1.6 MODE ENABLED", EOS_WHITE);
+            Gfx_FillRounded(bx + 13, y - 3, bw - 24, 15, 5, rowBg);
+            hudLine(left, right, y, "1.6 MODE", "ENABLED", EOS_GLOW);
         }
 
     }
