@@ -63,3 +63,10 @@ int  Config_GetHdmiHudOn(void);
 int  Config_SetHdmiHudOn(int on);
 int  Config_GetSystemCardOn(void);
 int  Config_SetSystemCardOn(int on);
+// HD Fix preference (default On to preserve existing gateware behavior).
+// Stored bit is an opt-out so existing v6 records continue to enable the fix.
+int  Config_GetHdFixOn(void);
+int  Config_SetHdFixOn(int on);
+// Reserved theme layout preference: 0 Classic, 1 Grid, 2 Bubbles 3D, 3 Orbit 3D.
+int  Config_GetMenuLayout(void);
+int  Config_SetMenuLayout(int layout);

@@ -33,10 +33,7 @@ int Menu_Step(WORD now, WORD prev)
 {
     int chosen = -1;
 
-    if (Pressed(now, prev, BTN_DPAD_UP))
-        s_sel = (s_sel + EOS_MENU_COUNT - 1) % EOS_MENU_COUNT;
-    if (Pressed(now, prev, BTN_DPAD_DOWN))
-        s_sel = (s_sel + 1) % EOS_MENU_COUNT;
+    s_sel = Ui_MenuNavigate(s_items, EOS_MENU_COUNT, s_sel, now, prev);
 
     if (Pressed(now, prev, BTN_A))
         chosen = s_sel;

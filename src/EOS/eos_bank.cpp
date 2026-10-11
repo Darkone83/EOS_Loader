@@ -14,6 +14,7 @@
 // statics, no CRT string funcs.
 #include "eos_bank.h"
 #include "eos_flash.h"
+#include "eos_config.h"
 #include "xboxinternals.h"   // PIC scratch/LED/power registers
 
 struct EosBank {
@@ -253,6 +254,20 @@ static unsigned char io_in8(unsigned short port)
     return v;
 }
 
+// --- Conexant / pre-1.6 Xcode pad-control fix preference ----------------------
+// Current EOS gateware serves a user BIOS from the LOW NIBBLE of port 0xEF,
+// but arms the Xcode PADCTL substitution only if the FULL bank byte is 0x03..09.
+// Preserve the original selection byte when enabled (factory default). When
+// disabled, bit 7 prevents the gateware's Xcode matcher from arming, while the
+// backend continues to select exactly the same user bank from bits [3:0].
+// Deliberately do not change loader, recovery, XbDiag or SD-boot selections.
+static unsigned char launchEfWithHdFixPreference(unsigned char ef)
+{
+    if (ef >= 0x03 && ef <= 0x09 && !Config_GetHdFixOn())
+        return (unsigned char)(ef | 0x80);
+    return ef;
+}
+
 // --- clean BIOS reboot handoff -------------------------------------------------
 // The PIC scratch register survives a warm reset. Bit 0x04 explicitly suppresses
 // the boot animation, so preserve every other scratch flag but clear that one.
@@ -289,7 +304,7 @@ void Bank_SetResting(void)
 void Bank_LaunchEf(unsigned char ef)
 {
     volatile int s;
-    io_out8(0x00EF, ef);
+    io_out8(0x00EF, launchEfWithHdFixPreference(ef));
     for (s = 0; s < 200000; ++s) {}
 
     reboot_to_firmware();
@@ -312,7 +327,7 @@ void Bank_Launch(int idx)
     if (ef == 0x0A) Flash_Sync(0x0A);
 
     // 1) select the bank in the FPGA (persists across the warm reset)
-    io_out8(0x00EF, ef);
+    io_out8(0x00EF, launchEfWithHdFixPreference(ef));
 
     // 2) small settle so the 0xEF write completes on the LPC bus before reset
     for (s = 0; s < 200000; ++s) {}

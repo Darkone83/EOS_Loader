@@ -1,9 +1,9 @@
 /*---------------------------------------------------------------------------
     eos_format.cpp -- HDD staging (partition + format a fresh drive).
 
-    Ported from the PrometheOS harddrive formatDrive path. Staging a new drive
-    does NOT need the LBA48 patch-table read (that only recovers an existing
-    table); we build the standard layout from disk geometry and write it:
+    Ported from the PrometheOS harddrive formatDrive path. Supports the
+    explicitly selected Xbox kernel Harddisk0 or Harddisk1 device. Staging
+    does not read the LBA48 patch table; it builds a fresh standard layout:
 
         geometry   : IOCTL_DISK_GET_DRIVE_GEOMETRY  -> total sectors
         table      : build standard Xbox layout (E,C,X,Y,Z,[F])
@@ -99,7 +99,19 @@ static int  fmtMemCmp(const void* a, const void* b, int n) { const unsigned char
 static int  fmtFirstSetBit(unsigned long v) { int s = 0; if (!v) return 0; while (((v >> s) & 1UL) == 0 && s < 31) ++s; return s; }
 
 /* "\Device\Harddisk0\PartitionN" -> dst(>=32) */
-static void fmtDevicePath(int partNum, char* dst) { const char* b = "\\Device\\Harddisk0\\Partition"; int i = 0; while (b[i]) { dst[i] = b[i]; ++i; } dst[i++] = (char)('0' + partNum); dst[i] = 0; }
+/* These paths must NEVER alias disk 1 to disk 0. The Xbox kernel exposes
+   distinct Partition0 devices when a dual-drive BIOS is active. */
+static void fmtDevicePath(int disk, int partNum, char* dst)
+{
+    const char* a = "\\Device\\Harddisk";
+    const char* b = "\\Partition";
+    int i = 0, j = 0;
+    while (a[j]) dst[i++] = a[j++];
+    dst[i++] = (char)('0' + disk);
+    j = 0; while (b[j]) dst[i++] = b[j++];
+    dst[i++] = (char)('0' + partNum);
+    dst[i] = 0;
+}
 /* "\??\X:" -> dst(>=8) */
 static void fmtMountPath(char c, char* dst) { if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A'); dst[0] = '\\'; dst[1] = '?'; dst[2] = '?'; dst[3] = '\\'; dst[4] = c; dst[5] = ':'; dst[6] = 0; }
 
@@ -125,13 +137,13 @@ static unsigned long fmtCalcClusterKB(unsigned long long lbaSizeSectors)
 
 /* Build the standard Xbox table for a disk of totalSectors. F: takes the
    remainder past DATA_F_START, minus one sector reserved for the backup table. */
-static void fmtBuildTable(unsigned long long totalSectors, EosPartTable* t)
+static void fmtBuildTable(unsigned long long totalSectors, int disk, EosPartTable* t)
 {
     long long fSize = (long long)totalSectors - (long long)DATA_F_START;
     int i;
     fmtMemSet(t, 0, sizeof(EosPartTable));
     for (i = 0; i < 16; ++i) t->Magic[i] = (unsigned char)"****PARTINFO****"[i];
-    t->FatxMode = 1;                                 /* Harddisk0 */
+    t->FatxMode = (unsigned char)(disk == 1 ? 2 : 1); /* Xbox primary / secondary */
 
     fmtSetName("XBOX DATA E", &t->TableEntries[0]);  fmtSetStart(DATA_E_START, &t->TableEntries[0]); fmtSetSize(DATA_E_SIZE, &t->TableEntries[0]);
     fmtSetName("XBOX SHELL C", &t->TableEntries[1]);  fmtSetStart(SHELL_C_START, &t->TableEntries[1]); fmtSetSize(SHELL_C_SIZE, &t->TableEntries[1]);
@@ -154,17 +166,18 @@ const char* Format_ErrStr(int code)
     case FMT_ERR_TABLE: return "Partition table write failed";
     case FMT_ERR_FORMAT:return "Partition format failed";
     case FMT_ERR_FIXUP: return "Cluster fixup failed";
+    case FMT_ERR_TARGET:return "Drive target changed / unsupported sector size";
     default:            return "Unknown error";
     }
 }
 
 #ifndef EOS_HOST_TEST
 /* ---- device-side primitives -------------------------------------------- */
-static int fmtReadGeometry(unsigned long long* totalSectors, unsigned long* bytesPerSector)
+static int fmtReadGeometry(int disk, unsigned long long* totalSectors, unsigned long* bytesPerSector)
 {
     STRING dev; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK iosb; HANDLE h; NTSTATUS st;
     EOS_DISK_GEOMETRY g; unsigned int geomIn[100]; char path[40];
-    fmtDevicePath(0, path); RtlInitAnsiString(&dev, path);
+    fmtDevicePath(disk, 0, path); RtlInitAnsiString(&dev, path);
     oa.RootDirectory = 0; oa.ObjectName = &dev; oa.Attributes = OBJ_CASE_INSENSITIVE;
     st = NtOpenFile(&h, (GENERIC_READ | 0x00100000), &oa, &iosb, (FILE_SHARE_READ | FILE_SHARE_WRITE), 0x10);
     if (st != STATUS_SUCCESS) return 0;
@@ -187,12 +200,12 @@ static int fmtReadGeometry(unsigned long long* totalSectors, unsigned long* byte
 /* Write the table to sector 0 and a backup at the physical end of Partition0.
    PrometheOS deliberately asks the device for its allocation size here instead
    of deriving the backup offset from the earlier geometry result. */
-static int fmtWriteTable(const EosPartTable* t)
+static int fmtWriteTable(int disk, const EosPartTable* t)
 {
     STRING dev; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK iosb; HANDLE h; NTSTATUS st;
     LARGE_INTEGER off; FILE_FS_SIZE_INFORMATION fsi; char path[40];
 
-    fmtDevicePath(0, path); RtlInitAnsiString(&dev, path);
+    fmtDevicePath(disk, 0, path); RtlInitAnsiString(&dev, path);
     InitializeObjectAttributes(&oa, &dev, OBJ_CASE_INSENSITIVE, 0);
     st = NtOpenFile(&h, (SYNCHRONIZE | GENERIC_READ | GENERIC_WRITE), &oa, &iosb,
         (FILE_SHARE_READ | FILE_SHARE_WRITE), FILE_SYNCHRONOUS_IO_ALERT);
@@ -216,7 +229,7 @@ static int fmtWriteTable(const EosPartTable* t)
 }
 
 /* prom largePartitionFixup: correct on-disk SectorsPerCluster (0) for big F:. */
-static int fmtLargeFixup(unsigned long long lbaStart, unsigned long clusterBytes)
+static int fmtLargeFixup(int disk, unsigned long long lbaStart, unsigned long clusterBytes)
 {
     STRING dev; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK iosb; HANDLE h; NTSTATUS st;
     EOS_DISK_GEOMETRY g; LARGE_INTEGER off; int sh;
@@ -225,7 +238,7 @@ static int fmtLargeFixup(unsigned long long lbaStart, unsigned long clusterBytes
     static unsigned char s_buf[0x2000];
     { unsigned long a = (unsigned long)(&s_buf[0]); a = (a + (PAGE_SIZE - 1)) & ~((unsigned long)(PAGE_SIZE - 1)); meta = (FAT_VOLUME_METADATA*)a; }
 
-    fmtDevicePath(0, path); RtlInitAnsiString(&dev, path);
+    fmtDevicePath(disk, 0, path); RtlInitAnsiString(&dev, path);
     InitializeObjectAttributes(&oa, &dev, OBJ_CASE_INSENSITIVE, 0);
     st = NtOpenFile(&h, (SYNCHRONIZE | GENERIC_READ | GENERIC_WRITE), &oa, &iosb,
         (FILE_SHARE_READ | FILE_SHARE_WRITE), (FILE_SYNCHRONOUS_IO_ALERT | FILE_NO_INTERMEDIATE_BUFFERING));
@@ -252,89 +265,114 @@ static int fmtLargeFixup(unsigned long long lbaStart, unsigned long clusterBytes
     return ok;
 }
 
-static void fmtUnmount(char letter, int partNum)
+static void fmtUnmount(int disk, char letter, int partNum)
 {
     STRING dev, mnt; char dp[40], mp[8];
-    fmtDevicePath(partNum, dp); fmtMountPath(letter, mp);
+    fmtDevicePath(disk, partNum, dp); fmtMountPath(letter, mp);
     RtlInitAnsiString(&dev, dp); RtlInitAnsiString(&mnt, mp);
-    IoDeleteSymbolicLink(&mnt);          /* best effort */
+    if (disk == 0) IoDeleteSymbolicLink(&mnt);          /* best effort */
     IoDismountVolumeByName(&dev);        /* best effort */
 }
-static void fmtMount(char letter, int partNum)
+static void fmtMount(int disk, char letter, int partNum)
 {
     STRING dev, mnt; char dp[40], mp[8];
-    fmtDevicePath(partNum, dp); fmtMountPath(letter, mp);
+    fmtDevicePath(disk, partNum, dp); fmtMountPath(letter, mp);
     RtlInitAnsiString(&dev, dp); RtlInitAnsiString(&mnt, mp);
-    IoCreateSymbolicLink(&mnt, &dev);
+    if (disk == 0) IoCreateSymbolicLink(&mnt, &dev);
 }
 #endif /* !EOS_HOST_TEST */
 
-int Format_PlanInfo(unsigned long* totalMB, unsigned long* dataEMB, unsigned long* driveFMB)
+int Format_PlanInfoForDisk(int disk, unsigned long* totalMB,
+    unsigned long* dataEMB, unsigned long* driveFMB, unsigned long long* sectors)
 {
 #ifdef EOS_HOST_TEST
-    if (totalMB)  *totalMB = 0;
-    if (dataEMB)  *dataEMB = (unsigned long)(DATA_E_SIZE / 2048);
+    (void)disk;
+    if (totalMB) *totalMB = 0;
+    if (dataEMB) *dataEMB = (unsigned long)(DATA_E_SIZE / 2048);
     if (driveFMB) *driveFMB = 0;
+    if (sectors) *sectors = 0;
     return 0;
 #else
-    unsigned long long total = 0; unsigned long bps = 512;
-    if (!fmtReadGeometry(&total, &bps) || total == 0) return 0;
-    if (totalMB)  *totalMB = (unsigned long)(total / 2048ULL);   /* sectors*512/1MB */
-    if (dataEMB)  *dataEMB = (unsigned long)(DATA_E_SIZE / 2048);
-    if (driveFMB) *driveFMB = (total > DATA_F_START)
-        ? (unsigned long)(((total - DATA_F_START) - 1ULL) / 2048ULL) : 0;
+    unsigned long long total = 0;
+    unsigned long bps = 0;
+    if (disk != 0 && disk != 1) return 0;
+    if (!fmtReadGeometry(disk, &total, &bps)) return 0;
+    /* The table and backup occupy 512-byte sectors; don't accept a geometry
+       that cannot hold the fixed C/E/cache regions, or a non-512 sector disk. */
+    if (bps != 512 || total <= DATA_E_START + DATA_E_SIZE + 1ULL) return 0;
+    if (totalMB) *totalMB = (unsigned long)(total / 2048ULL);
+    if (dataEMB) *dataEMB = (unsigned long)(DATA_E_SIZE / 2048);
+    if (driveFMB) *driveFMB = (total > DATA_F_START + 1ULL)
+        ? (unsigned long)((total - DATA_F_START - 1ULL) / 2048ULL) : 0;
+    if (sectors) *sectors = total;
     return 1;
 #endif
 }
 
-int Format_StageDrive(void)
+int Format_PlanInfo(unsigned long* totalMB, unsigned long* dataEMB, unsigned long* driveFMB)
+{
+    return Format_PlanInfoForDisk(0, totalMB, dataEMB, driveFMB, 0);
+}
+
+int Format_StageDriveChecked(int disk, unsigned long long expectedSectors)
 {
 #ifdef EOS_HOST_TEST
-    return FMT_OK;
+    (void)disk; (void)expectedSectors;
+    return FMT_ERR_GEOM; /* never simulate success for destructive operations */
 #else
     EosPartTable table;
     unsigned long long total = 0;
+    unsigned long bps = 0;
     int i, rc = FMT_OK;
 
-    if (!fmtReadGeometry(&total, 0) || total == 0) return FMT_ERR_GEOM;
+    if (disk != 0 && disk != 1) return FMT_ERR_TARGET;
+    if (!expectedSectors || !fmtReadGeometry(disk, &total, &bps)) return FMT_ERR_GEOM;
+    /* Revalidate the same disk/size on the final confirm. No implicit fallback
+       to Harddisk0 if Harddisk1 disappears between the plan and the write. */
+    if (total != expectedSectors || bps != 512 ||
+        total <= DATA_E_START + DATA_E_SIZE + 1ULL) return FMT_ERR_TARGET;
 
-    fmtBuildTable(total, &table);
+    fmtBuildTable(total, disk, &table);
+    /* Disk 1 has no E:/C:/F: mapping in the EOS loader. Dismount native
+       partitions only; do not tear down disk 0 symlinks or data access. */
+    for (i = 0; i < 6; ++i) fmtUnmount(disk, s_lyrLetter[i], s_lyrPartNum[i]);
 
-    /* drop every drive letter so the table write + formats have the disk. */
-    for (i = 0; i < 6; ++i) fmtUnmount(s_lyrLetter[i], s_lyrPartNum[i]);
-
-    if (!fmtWriteTable(&table)) { rc = FMT_ERR_TABLE; goto remount; }
+    if (!fmtWriteTable(disk, &table)) { rc = FMT_ERR_TABLE; goto remount; }
 
     for (i = 0; i < 14; ++i) {
         EosPartEntry* e = &table.TableEntries[i];
         unsigned long long lbaSize;
         unsigned long clusterBytes;
         char dp[40]; STRING devStr; BOOL ok;
-
         if (e->Flags == EOS_PART_NOTINUSE) continue;
 
         lbaSize = fmtGetSize(e);
         clusterBytes = fmtCalcClusterKB(lbaSize) << 10;
-
-        fmtDevicePath(i + 1, dp);
+        fmtDevicePath(disk, i + 1, dp);
         RtlInitAnsiString(&devStr, dp);
         ok = XapiFormatFATVolumeEx(&devStr, clusterBytes);
         if (ok == FALSE) { rc = FMT_ERR_FORMAT; goto remount; }
-
-        /* prom: entries at index >= 5 (F: and beyond) get the cluster fixup. */
-        if (i >= 5) {
-            if (!fmtLargeFixup(fmtGetStart(e), clusterBytes)) { rc = FMT_ERR_FIXUP; goto remount; }
+        if (i >= 5 && !fmtLargeFixup(disk, fmtGetStart(e), clusterBytes)) {
+            rc = FMT_ERR_FIXUP; goto remount;
         }
     }
-
 remount:
-    for (i = 0; i < 6; ++i) {
-        EosPartEntry* e = &table.TableEntries[i];      /* only remount in-use letters */
-        if (e->Flags != EOS_PART_NOTINUSE)
-            fmtMount(s_lyrLetter[i], s_lyrPartNum[i]);
+    if (disk == 0) {  /* preserve original primary drive mount behavior */
+        for (i = 0; i < 6; ++i) {
+            EosPartEntry* e = &table.TableEntries[i];
+            if (e->Flags != EOS_PART_NOTINUSE)
+                fmtMount(0, s_lyrLetter[i], s_lyrPartNum[i]);
+        }
     }
     return rc;
 #endif
+}
+
+int Format_StageDrive(void)
+{
+    unsigned long long sectors = 0;
+    if (!Format_PlanInfoForDisk(0, 0, 0, 0, &sectors)) return FMT_ERR_GEOM;
+    return Format_StageDriveChecked(0, sectors);
 }
 
 /* ---- host self-test ----------------------------------------------------- */
@@ -369,9 +407,12 @@ int main(void)
     {
         unsigned long long total = 976562500ULL;
         unsigned long long fSize = total - DATA_F_START - 1ULL;
-        fmtBuildTable(total, &t);
+        fmtBuildTable(total, 0, &t);
         if (fmtMemCmp(t.Magic, "****PARTINFO****", 16) != 0) { printf("FAIL magic\n"); ++fails; }
         if (t.FatxMode != 1) { printf("FAIL fatxmode\n"); ++fails; }
+        fmtBuildTable(total, 1, &t);
+        if (t.FatxMode != 2) { printf("FAIL secondary fatxmode\n"); ++fails; }
+        fmtBuildTable(total, 0, &t);
         fails += chkEntry(&t, 0, "XBOX DATA E", DATA_E_START, DATA_E_SIZE);
         fails += chkEntry(&t, 1, "XBOX SHELL C", SHELL_C_START, SHELL_C_SIZE);
         fails += chkEntry(&t, 2, "XBOX CACHE X", CACHE_X_START, CACHE_SIZE);
@@ -394,7 +435,7 @@ int main(void)
         int n;
         for (n = 0; n < 4; ++n) {
             unsigned long long want = totals[n] - DATA_F_START - 1ULL;
-            fmtBuildTable(totals[n], &t);
+            fmtBuildTable(totals[n], 0, &t);
             if (fmtGetSize(&t.TableEntries[5]) != want) {
                 printf("FAIL full-capacity %d size %llX want %llX\n", n,
                     fmtGetSize(&t.TableEntries[5]), want); ++fails;
@@ -415,15 +456,17 @@ int main(void)
     /* small drive below F start -> no F entry */
     {
         unsigned long long total = DATA_F_START - 100ULL;
-        fmtBuildTable(total, &t);
+        fmtBuildTable(total, 0, &t);
         if (t.TableEntries[5].Flags != EOS_PART_NOTINUSE) { printf("FAIL small-drive F present\n"); ++fails; }
         fails += chkEntry(&t, 0, "XBOX DATA E", DATA_E_START, DATA_E_SIZE);  /* E still there */
     }
 
     /* device/mount path building */
     {
-        char d[40], m[8]; fmtDevicePath(6, d); fmtMountPath('f', m);
+        char d[40], m[8]; fmtDevicePath(0, 6, d); fmtMountPath('f', m);
         if (fmtMemCmp(d, "\\Device\\Harddisk0\\Partition6", 28) != 0) { printf("FAIL devpath '%s'\n", d); ++fails; }
+        fmtDevicePath(1, 6, d);
+        if (fmtMemCmp(d, "\\Device\\Harddisk1\\Partition6", 28) != 0) { printf("FAIL secondary devpath '%s'\n", d); ++fails; }
         if (fmtMemCmp(m, "\\??\\F:", 7) != 0) { printf("FAIL mntpath '%s'\n", m); ++fails; }
     }
 

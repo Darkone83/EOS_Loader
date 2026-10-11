@@ -11,6 +11,7 @@
 #include "eos_console.h"
 #include "eos_logo_data.h"   // EOS_LOGO_W/H, EOS_LOGO_PAL[15][3], EOS_LOGO_4BPP[]
 #include "eos_file.h"        // File_ListDir/Exists/ReadInto, EosFileEntry (custom themes)
+#include "eos_webfiles.h"    // bounded, nonblocking Phase 5 Files WebUI
 #include "eos_sdcard.h"      // FatFs-backed SD BIOS manager
 #include "eos_led.h"         // Web launch LED handoff
 #include "eos_xboxrgb.h"     // mirror bank launch to optional XBOX-RGB transient effect
@@ -22,12 +23,14 @@
 #define HTTP_RESP_MAX  1024
 #define HTTP_POLL_BUDGET (128 * 1024)  // max body bytes moved per frame
 
-enum { ST_IDLE = 0, ST_HDR, ST_BODY, ST_SEND };
+enum { ST_IDLE = 0, ST_HDR, ST_BODY, ST_SEND, ST_FILE_SEND };
 enum { M_GET = 0, M_POST };
 enum {
     R_NONE = 0, R_PAGE, R_LOGO, R_BANKS, R_RENAME, R_DELETE, R_FLASH, R_LAUNCH, R_EEPROM, R_RESET, R_SYSINFO, R_CLRXBDIAG,
     R_THEMES, R_TINI, R_TFILE, R_TDEL, R_SETCOLOR,
-    R_SDLIST, R_SDDEL, R_SDUP
+    R_SDLIST, R_SDDEL, R_SDUP,
+    R_FLIST, R_FSESSION, R_FMKDIR, R_FDELETE, R_FRENAME,
+    R_FUPLOAD, R_FDOWNLOAD, R_FJOB
 };   // custom-theme + SD BIOS web tools
 
 static SOCKET s_listen = INVALID_SOCKET;
@@ -39,6 +42,15 @@ static char   s_req[HTTP_REQ_MAX]; static int s_reqLen;
 static int    s_method, s_route, s_bank, s_clen;
 static int    s_rxRecv, s_rxStore, s_store, s_err;
 static int    s_launch = -1;
+static int    s_filesParseError = 0;
+static char   s_filesPath[EOS_WF_PATH], s_filesNew[80];
+static int    s_filesPage = 0, s_filesOverwrite = 0;
+static char   s_filesToken[17];              // session-scoped CSRF deterrent, NOT authentication
+static char   s_fileSmall[16 * 1024];          // always safe for 64 MB consoles
+static char* s_fileChunk = s_fileSmall;       // optional 64 KB on 128 MB consoles
+static int    s_fileChunkCap = (int)sizeof(s_fileSmall);
+static int    s_fileHave = 0, s_fileAt = 0;
+static unsigned long long s_fileTotal = 0, s_fileSent = 0;
 
 static unsigned char s_rx[HTTP_RX_MAX];
 static EosLayout     g_lay;   // scratch layout for descriptor updates on flash
@@ -154,9 +166,74 @@ static const char* k_page =
 "#mprog{color:var(--p);font-size:12px;min-height:16px;margin-top:8px;}\n"
 "#themecard .kv .k{overflow:hidden;text-overflow:ellipsis;}\n"
 "#themecard .kv button{padding:4px 9px;font-size:12px;margin-left:6px;}\n"
+".files-nav{max-width:1100px;margin:0 auto;padding:10px 20px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}\n"
+".files-nav button{border-color:#584074;color:#d7c0ee}\n"
+"#filesapp[hidden]{display:none}\n"
+"#filesapp{max-width:1060px;margin:0 auto 12px;background:var(--card);border:1px solid #322841;border-radius:12px;padding:16px}\n"
+".files-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}\n"
+".files-header h2{font-size:17px;color:var(--p);margin:0}\n"
+".files-breadcrumb{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin:13px 0;color:#b1a3c3;font-size:12px}\n"
+".files-breadcrumb button{padding:3px 6px;border:0;background:transparent;color:#c5a9e7}\n"
+".files-toolbar{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin:8px 0 12px}\n"
+".files-toolbar button:disabled,.files-row button:disabled{opacity:.35;cursor:not-allowed}\n"
+".files-row{display:flex;align-items:center;gap:9px;border-top:1px solid #282332;padding:8px 2px;min-height:45px}\n"
+".files-name{min-width:0;flex:1;overflow-wrap:anywhere;font-size:13px;color:var(--txt);text-align:left;background:transparent;border:0;padding:2px}\n"
+".files-dir{color:#d3b4f6;font-weight:600}\n"
+".files-meta{min-width:80px;text-align:right;color:var(--dim);font-size:11px}\n"
+".files-ops{display:flex;gap:4px;flex-wrap:wrap}\n"
+".files-ops button{padding:5px 8px;font-size:11px}\n"
+".files-ops button.danger{color:#d88989}\n"
+".files-status{font-size:12px;color:#afa2bd;min-height:18px;margin:8px 0}\n"
+".files-warning{border:1px solid #6b5833;background:#211c15;color:#f0d1a1;padding:9px;border-radius:7px;font-size:12px}\n"
+".files-bar{height:7px;border-radius:8px;background:#272130;overflow:hidden;margin:10px 0}\n"
+".files-bar>div{height:100%;background:var(--p);width:0;transition:width .1s}\n"
+".files-page{display:flex;gap:8px;align-items:center;justify-content:flex-end}\n"
+".files-page button{font-size:12px;padding:5px 10px}\n"
+".files-muted{font-size:11px;color:var(--dim)}\n"
+"@media(max-width:640px){#filesapp{margin:0 12px 12px;padding:12px}.files-row{flex-wrap:wrap}.files-name{flex:1 1 55%}.files-ops{width:100%;justify-content:flex-end}.files-meta{min-width:58px}}\n"
+".files-navline{display:flex;align-items:center;gap:9px;min-width:0}\n"
+".files-navline>button{padding:4px 12px;font-size:12px;flex:none}\n"
+".files-navline>button:disabled{opacity:.35;cursor:not-allowed}\n"
+".files-breadcrumb{min-width:0}\n"
+".files-dir:hover,.files-name:hover{color:var(--p)}\n"
+".files-ops button.danger{color:#ea8b8b;border-color:#76444b}\n"
+".files-ops button.danger:hover{background:#342024;color:#fff}\n"
+"#wf-confirm[hidden]{display:none}\n"
+".files-confirm-overlay{position:fixed;inset:0;z-index:90;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;padding:14px}\n"
+".files-confirm-card{background:var(--card);border:1px solid #6b4050;border-radius:12px;max-width:480px;width:100%;padding:20px;color:var(--txt);box-shadow:0 12px 36px rgba(0,0,0,.45)}\n"
+".files-confirm-card h3{margin:0 0 12px;color:#efb3be;font-size:17px}\n"
+".files-confirm-card p{font-size:13px;overflow-wrap:anywhere;line-height:1.5}\n"
+".files-delete-warning{color:#f5c2ad}\n"
+".files-confirm-buttons{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}\n"
+".files-confirm-buttons button.danger{background:#722e3b;border-color:#9f4051;color:#fff}\n"
+".files-confirm-buttons button.danger:hover{background:#973749}\n"
 "</style></head><body>\n"
 "<header><img src='/logo.bmp' alt=''><div><h1>EOS</h1><div class=sub>BIOS bank manager</div></div></header>\n"
 "<div id=budget style='max-width:1100px;margin:0 auto;padding:8px 20px 0;color:#9a9aa8;font-size:13px;'></div>\n"
+"<div class=files-nav><button id=wf-open type=button>File Manager</button>\n"
+"<span class=files-muted>Browse mounted HDD and SD volumes. Upload, rename, and delete files.</span></div>\n"
+"<section id=filesapp hidden>\n"
+"<div class=files-header><h2>File Manager</h2><span id=wf-rights class=files-muted>Select a volume to browse</span></div>\n"
+"<div class=files-navline><button id=wf-up type=button disabled>Up</button><div id=wf-crumb class=files-breadcrumb></div></div>\n"
+"<div class=files-toolbar>\n"
+"<button id=wf-mkdir type=button disabled>New Folder</button><button id=wf-upload type=button disabled>Upload Files</button>\n"
+"<button id=wf-folder type=button disabled>Upload Folder</button><button id=wf-refresh type=button>Refresh</button>\n"
+"<button id=wf-cancel type=button hidden>Cancel Upload</button>\n"
+"<input id=wf-file type=file multiple hidden><input id=wf-folderinput type=file webkitdirectory multiple hidden>\n"
+"</div>\n"
+"<div class=files-warning>Large uploads may take a while. Keep EOS running until the transfer completes. Deleting a file or folder requires confirmation and cannot be undone.</div>\n"
+"<div class=files-bar><div id=wf-progress></div></div>\n"
+"<div id=wf-status role=status class=files-status></div>\n"
+"<div id=wf-list></div>\n"
+"<div class=files-page><button id=wf-prev type=button disabled>Previous</button><span id=wf-pageno class=files-muted>Page 1</span><button id=wf-next type=button disabled>Next</button></div>\n"
+"</section>\n"
+"<div id=wf-confirm hidden class=files-confirm-overlay role=dialog aria-modal=true aria-labelledby=wf-confirm-title>\n"
+"<div class=files-confirm-card>\n"
+"<h3 id=wf-confirm-title>Confirm deletion</h3>\n"
+"<p id=wf-confirm-detail></p>\n"
+"<p id=wf-confirm-warning class=files-delete-warning></p>\n"
+"<div class=files-confirm-buttons><button id=wf-confirm-cancel type=button>Cancel</button><button id=wf-confirm-yes type=button class=danger>Delete</button></div>\n"
+"</div></div>\n"
 "<div class=grid id=grid></div>\n"
 "<div class=grid id=sys></div><div id=msg></div>\n"
 "<div id=cmodal><div id=cbox>\n"
@@ -346,6 +423,103 @@ static const char* k_page =
 " c.appendChild(info);let rr=document.createElement('div');rr.className='row';rr.appendChild(btn('Upload BIOS','go',function(){sdUpload.value='';sdUpload.click();}));rr.appendChild(btn('Refresh','',function(){renderSd(sdPath);}));c.appendChild(rr);host.appendChild(c);}\n"
 "async function sdDelete(name){if(!confirm('Delete BIOS \"'+name+'\" from SD card?'))return;let b=sdPath==='/'?'':sdPath.replace(/\\/$/,'');let p=b+'/'+name;let r=await fetch('/api/sd/delete?path='+encodeURIComponent(p),{method:'POST'});msg(r.ok?'BIOS deleted':'Delete failed: '+(await r.text()));renderSd(sdPath);}\n"
 "sdUpload.onchange=async function(){let f=sdUpload.files[0];if(!f)return;if(!(f.size==262144||f.size==524288||f.size==1048576)){msg('BIOS must be exactly 256K, 512K, or 1MB');return;}let b=sdPath==='/'?'':sdPath.replace(/\\/$/,'');let p=b+'/'+f.name;msg('Uploading '+f.name+'...');let r=await fetch('/api/sd/upload?path='+encodeURIComponent(p),{method:'POST',body:await f.arrayBuffer()});msg(r.ok?'BIOS uploaded':'Upload failed: '+(await r.text()));renderSd(sdPath);};\n"
+"// Phase 5: file manager UI. All destructive work remains server-validated.\n"
+"// Phase 5: file manager UI. All destructive work remains server-validated.\n"
+"let wfPath='/',wfPage=0,wfKey='',wfRunning=false,wfXhr=null,wfCancel=false,wfQueue=[];\n"
+"let wfN=0,wfTotal=0,wfFinished=0,wfConfirmActive=false;\n"
+"const wfId=s=>document.getElementById(s);\n"
+"function wfText(s){wfId('wf-status').textContent=s||'';}\n"
+"function wfProgress(p){wfId('wf-progress').style.width=Math.max(0,Math.min(100,p))+'%';}\n"
+"function wfJoin(base,name){return(base==='/'?'':base.replace(/\\/$/,''))+'/'+name;}\n"
+"function wfParent(path){if(path==='/')return '/';const x=path.lastIndexOf('/');return x<=0?'/':path.slice(0,x);}\n"
+"function wfByte(n){if(n>=1048576)return(n/1048576).toFixed(1)+' MB';if(n>=1024)return(n/1024).toFixed(1)+' KB';return n+' B';}\n"
+"function wfElement(tag,text,cls){const e=document.createElement(tag);if(text!==null&&text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;}\n"
+"function wfButton(label,fn,cls){const b=wfElement('button',label,cls||'');b.type='button';b.onclick=fn;return b;}\n"
+"async function wfSession(){if(wfKey)return;const r=await fetch('/api/files/session');if(!r.ok)throw Error('File manager unavailable');const j=await r.json();if(!j.key)throw Error('Missing file session');wfKey=j.key;}\n"
+"async function wfCall(url,method){await wfSession();const r=await fetch(url,{method:method||'POST',headers:{'X-EOS-Files-Key':wfKey}});let body={};try{body=await r.json();}catch(e){}if(!r.ok||body.ok===false)throw Error(body.error||('HTTP '+r.status));return{data:body,status:r.status};}\n"
+"async function wfOpen(){const el=wfId('filesapp');if(!el.hidden){if(wfRunning||wfConfirmActive)return;el.hidden=true;return;}el.hidden=false;try{await wfSession();await wfLoad('/',0);}catch(e){wfText('File Manager error: '+e.message);}el.scrollIntoView({block:'start'});}\n"
+"function wfCrumb(){const c=wfId('wf-crumb');c.replaceChildren();const pieces=wfPath.split('/').filter(Boolean);c.appendChild(wfButton('Drives',()=>wfLoad('/',0)));\n"
+"let path='';for(const p of pieces){path+='/'+p;c.appendChild(wfElement('span','/'));const dest=path;c.appendChild(wfButton(p,()=>wfLoad(dest,0)));}\n"
+"wfId('wf-up').disabled=(wfPath==='/');}\n"
+"async function wfLoad(path,page){if(wfRunning||wfConfirmActive)return;const items=wfId('wf-list');items.replaceChildren();wfText('Loading...');\n"
+"try{const r=await fetch('/api/files/list?path='+encodeURIComponent(path)+'&page='+(page||0));const j=await r.json();if(!r.ok||!j.ok)throw Error(j.error||'Listing failed');\n"
+"wfPath=path;wfPage=page||0;wfCrumb();const editable=!!j.writable;\n"
+"wfId('wf-mkdir').disabled=!editable;wfId('wf-upload').disabled=!editable;wfId('wf-folder').disabled=!editable;\n"
+"wfId('wf-rights').textContent=editable?'Mounted folder — upload, create, rename or delete':'Select a mounted volume to modify files';\n"
+"let dirs=0,files=0;\n"
+"for(const f of j.entries){if(f.d)dirs++;else files++;const row=wfElement('div',null,'files-row');const dst=wfJoin(wfPath,f.n);\n"
+"const name=wfButton((f.d?'[Folder] ':'')+f.n,()=>f.d?wfLoad(dst,0):wfDownload(dst),'files-name'+(f.d?' files-dir':''));name.title=f.d?'Open folder':'Download file';row.appendChild(name);\n"
+"row.appendChild(wfElement('span',f.d?'Folder':wfByte(f.s),'files-meta'));const ops=wfElement('div',null,'files-ops');\n"
+"if(f.d)ops.appendChild(wfButton('Open',()=>wfLoad(dst,0)));else ops.appendChild(wfButton('Download',()=>wfDownload(dst)));\n"
+"if(editable){ops.appendChild(wfButton('Rename',()=>wfRename(dst,f.n)));ops.appendChild(wfButton('Delete',()=>wfDelete(dst,f),'danger'));}\n"
+"row.appendChild(ops);items.appendChild(row);}\n"
+"if(!j.entries.length)items.appendChild(wfElement('div','This folder is empty.','files-status'));\n"
+"wfId('wf-prev').disabled=wfPage<=0;wfId('wf-next').disabled=!j.more;wfId('wf-pageno').textContent='Page '+(wfPage+1);\n"
+"wfText(dirs+' folder(s), '+files+' file(s) — folders first, A–Z'+(editable?'':' — open a mounted volume to modify files'));\n"
+"}catch(e){wfText('Browse failed: '+e.message);}}\n"
+"function wfDownload(path){window.location.href='/api/files/download?path='+encodeURIComponent(path);}\n"
+"async function wfMk(){if(wfRunning||wfConfirmActive)return;const name=prompt('New folder name:');if(!name||!name.trim())return;try{await wfCall('/api/files/mkdir?path='+encodeURIComponent(wfJoin(wfPath,name.trim())));await wfLoad(wfPath,wfPage);}catch(e){wfText('Create folder failed: '+e.message);}}\n"
+"async function wfRename(path,oldName){if(wfRunning||wfConfirmActive)return;const newName=prompt('Rename to:',oldName);if(!newName||!newName.trim()||newName===oldName)return;try{await wfCall('/api/files/rename?path='+encodeURIComponent(path)+'&name='+encodeURIComponent(newName.trim()));await wfLoad(wfPath,wfPage);}catch(e){wfText('Rename failed: '+e.message);}}\n"
+"function wfConfirmDelete(path,item){return new Promise(resolve=>{\n"
+"if(wfConfirmActive){resolve(false);return;}wfConfirmActive=true;\n"
+"const overlay=wfId('wf-confirm'),accept=wfId('wf-confirm-yes'),cancel=wfId('wf-confirm-cancel');\n"
+"wfId('wf-confirm-title').textContent=item.d?'Delete folder and contents?':'Delete file?';\n"
+"wfId('wf-confirm-detail').textContent='Target: '+path;\n"
+"wfId('wf-confirm-warning').textContent=item.d?'This permanently deletes this folder and all its contents.':'This permanently deletes this file.';\n"
+"accept.disabled=false;\n"
+"accept.textContent=item.d?'Delete Folder and Contents':'Delete File';overlay.hidden=false;cancel.focus();\n"
+"function finish(approved){overlay.hidden=true;wfConfirmActive=false;accept.onclick=null;cancel.onclick=null;document.removeEventListener('keydown',key);resolve(approved);}\n"
+"function key(e){if(e.key==='Escape'){e.preventDefault();finish(false);}}\n"
+"accept.onclick=()=>finish(true);cancel.onclick=()=>finish(false);document.addEventListener('keydown',key);\n"
+"});}\n"
+"async function wfDelete(path,item){if(wfRunning||wfConfirmActive)return;if(!await wfConfirmDelete(path,item))return;\n"
+"try{const result=await wfCall('/api/files/delete?path='+encodeURIComponent(path));let resultMessage='File deleted';\n"
+"if(result.status===202){wfRunning=true;resultMessage=await wfWaitJob();wfRunning=false;}\n"
+"const targetPath=wfPath,targetPage=wfPage;await wfLoad(targetPath,targetPage);wfText(resultMessage);\n"
+"}catch(e){wfRunning=false;wfText('Delete failed: '+e.message+' — some items may already be deleted');}}\n"
+"async function wfWaitJob(){for(;;){const r=await fetch('/api/files/job');const d=await r.json();if(!r.ok)throw Error('Could not read deletion progress');\n"
+"if(d.state==='done')return 'Folder and '+d.removed+' item(s) deleted';\n"
+"if(d.state==='failed')throw Error(d.error||'Folder deletion failed');\n"
+"wfText('Deleting folder contents... '+d.removed+' item(s) removed');await new Promise(resolve=>setTimeout(resolve,350));}}\n"
+"async function wfQueueFiles(list){if(wfRunning||wfConfirmActive)return;const arr=Array.from(list||[]);if(!arr.length)return;\n"
+"wfQueue=[];wfTotal=0;for(const file of arr){const rel=file.webkitRelativePath||file.name;\n"
+"const bits=rel.replace(/\\\\/g,'/').split('/').filter(Boolean);if(!bits.length||bits.some(x=>x==='.'||x==='..')){wfText('Invalid folder path');return;}\n"
+"if(file.size>2147483647){wfText('File exceeds 2 GB HTTP transfer limit');return;}\n"
+"wfQueue.push({file,rel:bits.join('/'),bits});wfTotal+=file.size;}\n"
+"if(wfTotal>=32*1048576||arr.some(f=>f.size>=32*1048576)){\n"
+"if(!confirm('Large upload ('+wfByte(wfTotal)+'). This may take a while. Keep EOS running and do not reboot or power off the Xbox until finished. Continue?'))return;}\n"
+"wfCancel=false;wfFinished=0;wfRunning=true;wfId('wf-cancel').hidden=false;wfProgress(0);\n"
+"let finalMessage='';try{for(wfN=0;wfN<wfQueue.length;wfN++){\n"
+"if(wfCancel)throw Error('Transfer cancelled');const job=wfQueue[wfN];let dir=wfPath;\n"
+"for(let i=0;i<job.bits.length-1;i++){if(wfCancel)throw Error('Transfer cancelled');dir=wfJoin(dir,job.bits[i]);await wfCall('/api/files/mkdir?path='+encodeURIComponent(dir));}\n"
+"const dest=wfJoin(dir,job.bits[job.bits.length-1]);wfText('Uploading '+job.rel+' ('+(wfN+1)+'/'+wfQueue.length+')');\n"
+"let overwrite=false;while(true){try{await wfSend(dest,job.file,overwrite);break;}catch(e){\n"
+"if(e.status===409&&confirm('Replace existing file \"'+job.rel+'\"?')){overwrite=true;continue;}throw e;}}\n"
+"wfFinished+=job.file.size;wfProgress(wfTotal?100*wfFinished/wfTotal:100);}\n"
+"finalMessage='Finished: '+wfQueue.length+' file(s) uploaded and finalized';\n"
+"}catch(e){finalMessage='Upload stopped: '+e.message+'. Check the destination before retrying.';}\n"
+"wfRunning=false;wfId('wf-cancel').hidden=true;wfXhr=null;wfId('wf-file').value='';wfId('wf-folderinput').value='';\n"
+"await wfLoad(wfPath,wfPage);wfText(finalMessage);}\n"
+"function wfSend(path,file,overwrite){return new Promise(async(resolve,reject)=>{\n"
+"try{await wfSession();if(wfCancel)throw Error('Cancelled');const x=new XMLHttpRequest();wfXhr=x;\n"
+"x.open('POST','/api/files/upload?path='+encodeURIComponent(path)+'&overwrite='+(overwrite?'1':'0'));\n"
+"x.setRequestHeader('X-EOS-Files-Key',wfKey);x.setRequestHeader('Content-Type','application/octet-stream');\n"
+"x.upload.onprogress=function(e){if(e.lengthComputable){const part=wfFinished+e.loaded;wfProgress(wfTotal?100*part/wfTotal:100);wfText('Uploading '+file.name+' — '+wfByte(e.loaded)+' / '+wfByte(file.size));}};\n"
+"x.onload=function(){let d={};try{d=JSON.parse(x.responseText);}catch(e){}if(x.status>=200&&x.status<300&&d.ok)resolve();else{const e=Error(d.error||('HTTP '+x.status));e.status=x.status;reject(e);}};\n"
+"x.onerror=function(){reject(Error('Connection lost'));};x.onabort=function(){reject(Error('Cancelled'));};x.send(file);\n"
+"}catch(e){reject(e);}});}\n"
+"function wfStop(){wfCancel=true;if(wfXhr)wfXhr.abort();}\n"
+"wfId('wf-open').onclick=wfOpen;\n"
+"wfId('wf-up').onclick=()=>wfLoad(wfParent(wfPath),0);\n"
+"wfId('wf-mkdir').onclick=wfMk;\n"
+"wfId('wf-prev').onclick=()=>wfLoad(wfPath,wfPage-1);\n"
+"wfId('wf-next').onclick=()=>wfLoad(wfPath,wfPage+1);\n"
+"wfId('wf-refresh').onclick=()=>wfLoad(wfPath,wfPage);\n"
+"wfId('wf-upload').onclick=()=>wfId('wf-file').click();\n"
+"wfId('wf-folder').onclick=()=>wfId('wf-folderinput').click();\n"
+"wfId('wf-file').onchange=e=>wfQueueFiles(e.target.files);\n"
+"wfId('wf-folderinput').onchange=e=>wfQueueFiles(e.target.files);\n"
+"wfId('wf-cancel').onclick=wfStop;\n"
 "loadSys();\n"
 "load();\n"
 "buildColorInputs();initModal();\n"
@@ -515,7 +689,12 @@ static int findCLen(void)   // scan headers for Content-Length, -1 if absent
             i += j;
             while (i < s_reqLen && (s_req[i] == ' ' || s_req[i] == '\t')) ++i;
             v = 0;
-            while (i < s_reqLen && s_req[i] >= '0' && s_req[i] <= '9') { v = v * 10 + (s_req[i] - '0'); ++i; }
+            if (i >= s_reqLen || s_req[i] < '0' || s_req[i]>'9')return -1;
+            while (i < s_reqLen && s_req[i] >= '0' && s_req[i] <= '9') {
+                int digit = s_req[i] - '0';
+                if (v > 214748364 || (v == 214748364 && digit > 7))return -1;
+                v = v * 10 + digit; ++i;
+            }
             return v;
         }
         while (i < s_reqLen && s_req[i] != '\n') ++i;
@@ -729,6 +908,64 @@ static int deleteThemeFolder(const char* folder, int sd)
     }
     return RemoveDirectoryA(dir) ? 1 : 0;
 }
+// File-manager request routing deliberately requires an exact endpoint name.
+// Existing bank/BIOS route matching remains untouched.
+static int matchRoute(const char* path, const char* name)
+{
+    int i = 0; while (name[i]) { if (path[i] != name[i])return 0; ++i; }
+    return path[i] == 0 || path[i] == '?' || path[i] == ' ' || path[i] == '\r';
+}
+static int filesTokenOk(void)
+{
+    const char* k = "x-eos-files-key:"; int kl = aLen(k);
+    for (int i = 0; i < s_reqLen;) {
+        int end = i; while (end < s_reqLen && s_req[end] != '\n')++end;
+        if (end <= i + 2)break;
+        int matched = 1;
+        for (int x = 0; x < kl; ++x)if (i + x >= end || lc(s_req[i + x]) != k[x]) { matched = 0; break; }
+        if (matched) {
+            int pos = i + kl; while (pos < end && (s_req[pos] == ' ' || s_req[pos] == '\t'))++pos;
+            for (int x = 0; x < 16; ++x)if (pos + x >= end || s_req[pos + x] != s_filesToken[x])return 0;
+            return pos + 16 >= end || s_req[pos + 16] == '\r' || s_req[pos + 16] == '\n';
+        }
+        i = end + 1;
+    }
+    return 0;
+}
+// Unlike the legacy theme query parser, this fails closed on truncation,
+// malformed percent escapes and encoded NUL bytes. Never act on a truncated path.
+static int fileParam(const char* request, const char* key, char* out, int cap)
+{
+    int kl = aLen(key); out[0] = 0;
+    const char* q = request; while (*q && *q != '?' && *q != ' ' && *q != '\r')++q;
+    if (*q == '?')++q; else return 1; // absent (caller can default to '/')
+    while (*q && *q != ' ' && *q != '\r') {
+        const char* start = q; const char* eq = q;
+        while (*eq && *eq != '=' && *eq != '&' && *eq != ' ' && *eq != '\r')++eq;
+        int match = (eq - start == kl && *eq == '=');
+        for (int i = 0; i < kl && match; i++)if (start[i] != key[i])match = 0;
+        if (match) {
+            const char* p = eq + 1; int n = 0;
+            while (*p && *p != '&' && *p != ' ' && *p != '\r') {
+                unsigned char c = (unsigned char)*p++;
+                if (c == '%') {
+                    int hi = -1, lo = -1;
+                    if (*p) { char x = *p++; hi = (x >= '0' && x <= '9') ? x - '0' : (x >= 'a' && x <= 'f') ? x - 'a' + 10 : (x >= 'A' && x <= 'F') ? x - 'A' + 10 : -1; }
+                    if (*p) { char x = *p++; lo = (x >= '0' && x <= '9') ? x - '0' : (x >= 'a' && x <= 'f') ? x - 'a' + 10 : (x >= 'A' && x <= 'F') ? x - 'A' + 10 : -1; }
+                    if (hi < 0 || lo < 0)return 0; c = (unsigned char)((hi << 4) | lo);
+                }
+                else if (c == '+')c = ' ';
+                if (c < 32 || c == 127 || n >= cap - 1)return 0;
+                out[n++] = (char)c;
+            }
+            out[n] = 0; return 1;
+        }
+        q = eq; while (*q && *q != '&' && *q != ' ' && *q != '\r')++q;
+        if (*q == '&')++q;
+    }
+    return 1;
+}
+static int filesInt(const char* q, const char* key);
 static void parseReq(void)
 {
     int i = 0; const char* path;
@@ -739,7 +976,15 @@ static void parseReq(void)
     else return;
 
     path = s_req + i;
-    if (strEqN(path, "/api/banks", 10)) s_route = R_BANKS;
+    if (matchRoute(path, "/api/files/list")) s_route = R_FLIST;
+    else if (matchRoute(path, "/api/files/session")) s_route = R_FSESSION;
+    else if (matchRoute(path, "/api/files/mkdir")) s_route = R_FMKDIR;
+    else if (matchRoute(path, "/api/files/delete")) s_route = R_FDELETE;
+    else if (matchRoute(path, "/api/files/rename")) s_route = R_FRENAME;
+    else if (matchRoute(path, "/api/files/upload")) s_route = R_FUPLOAD;
+    else if (matchRoute(path, "/api/files/download")) s_route = R_FDOWNLOAD;
+    else if (matchRoute(path, "/api/files/job")) s_route = R_FJOB;
+    else if (strEqN(path, "/api/banks", 10)) s_route = R_BANKS;
     else if (strEqN(path, "/api/rename", 11)) s_route = R_RENAME;
     else if (strEqN(path, "/api/delete", 11)) s_route = R_DELETE;
     else if (strEqN(path, "/api/flash", 10)) s_route = R_FLASH;
@@ -771,6 +1016,14 @@ static void parseReq(void)
     if (s_route == R_SDLIST || s_route == R_SDDEL || s_route == R_SDUP) {
         qStr(path, "path", s_sdPath, sizeof(s_sdPath));
     }
+    s_filesParseError = 0;
+    if (s_route >= R_FLIST && s_route <= R_FJOB) {
+        if (!fileParam(path, "path", s_filesPath, sizeof(s_filesPath)))s_filesParseError = 1;
+        if (!s_filesPath[0]) { s_filesPath[0] = '/'; s_filesPath[1] = 0; }
+        if (!fileParam(path, "name", s_filesNew, sizeof(s_filesNew)))s_filesParseError = 1;
+        s_filesPage = filesInt(path, "page");
+        s_filesOverwrite = filesInt(path, "overwrite") == 1;
+    }
     if (s_method == M_POST) s_clen = findCLen();
 }
 
@@ -791,11 +1044,97 @@ static void respondText(const char* status, const char* msg)
     respond(status, "text/plain", msg, aLen(msg));
 }
 
+static int filesInt(const char* q, const char* key)
+{
+    char tmp[14]; qStr(q, key, tmp, sizeof(tmp)); int val = 0;
+    for (int i = 0; tmp[i]; ++i) {
+        if (tmp[i] < '0' || tmp[i]>'9')return -1;
+        if (val > 100000)return -1; val = val * 10 + (tmp[i] - '0');
+    }
+    return val;
+}
+static int fileStatus(int r)
+{
+    if (r == WF_BADPATH)return 400;
+    if (r == WF_DENIED)return 403;
+    if (r == WF_NOTFOUND)return 404;
+    if (r == WF_STALE)return 423;
+    if (r == WF_EXISTS || r == WF_BUSY)return 409;
+    if (r == WF_UNAVAILABLE)return 503;
+    if (r == WF_DEPTH)return 422;
+    return 500;
+}
+static void fileAnswer(int r)
+{
+    if (r == WF_OK) { respond("200 OK", "application/json", "{\"ok\":true}", 11); return; }
+    int p = 0; const char* err = Wf_Error(r);
+    p += appS(s_json + p, "{\"ok\":false,\"error\":\""); p += appJson(s_json + p, err); p += appS(s_json + p, "\"}");
+    const char* status = "500 Internal Server Error"; int code = fileStatus(r);
+    if (code == 400)status = "400 Bad Request"; else if (code == 403)status = "403 Forbidden";
+    else if (code == 404)status = "404 Not Found"; else if (code == 409)status = "409 Conflict";
+    else if (code == 422)status = "422 Unprocessable Entity"; else if (code == 423)status = "423 Locked";
+    else if (code == 503)status = "503 Service Unavailable";
+    respond(status, "application/json", s_json, p);
+}
+static void sendFileHeader(unsigned long long length, const char* name)
+{
+    int p = 0; char num[24]; int j = 0; unsigned long long v = length;
+    if (!v)num[j++] = '0'; while (v && j < 23) { num[j++] = (char)('0' + v % 10); v /= 10; }
+    p += appS(s_resp + p, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"");
+    p += appS(s_resp + p, name); p += appS(s_resp + p, "\"\r\nContent-Length: ");
+    while (j > 0)s_resp[p++] = num[--j];
+    p += appS(s_resp + p, "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n");
+    s_txH = s_resp; s_txHLen = p; s_txHOff = 0;
+    s_fileHave = 0; s_fileAt = 0; s_fileTotal = length; s_fileSent = 0; s_state = ST_FILE_SEND;
+}
+
 // ---- act on a fully-received request --------------------------------------
 static void process(void)
 {
     int n = Bank_Count();
 
+    // Phase 5 file manager: only read endpoints accept GET; every mutation
+    // requires POST and the session-scoped header, including empty-body POSTs.
+    if (s_route >= R_FLIST && s_route <= R_FJOB) {
+        if (s_filesParseError) { fileAnswer(WF_BADPATH); return; }
+        int write = (s_route == R_FMKDIR || s_route == R_FDELETE || s_route == R_FRENAME || s_route == R_FUPLOAD);
+        if ((write && s_method != M_POST) || (!write && s_method != M_GET)) {
+            respondText("405 Method Not Allowed", "bad method"); return;
+        }
+        if (write && !filesTokenOk()) { respondText("403 Forbidden", "file session required"); return; }
+        if (s_route == R_FSESSION) {
+            int p = 0; p += appS(s_json + p, "{\"key\":\""); p += appS(s_json + p, s_filesToken); p += appS(s_json + p, "\"}");
+            respond("200 OK", "application/json", s_json, p); return;
+        }
+        if (s_route == R_FLIST) {
+            int r = Wf_List(s_filesPath, s_filesPage, s_json, HTTP_JSON_MAX);
+            if (r < 0)fileAnswer(r); else respond("200 OK", "application/json", s_json, r); return;
+        }
+        if (s_route == R_FJOB) {
+            int r = Wf_JobInfo(s_json, HTTP_JSON_MAX);
+            if (r < 0)fileAnswer(r); else respond("200 OK", "application/json", s_json, r); return;
+        }
+        if (s_route == R_FMKDIR) { fileAnswer(Wf_Mkdir(s_filesPath)); return; }
+        if (s_route == R_FRENAME) { fileAnswer(Wf_Rename(s_filesPath, s_filesNew)); return; }
+        if (s_route == R_FDELETE) {
+            int r = Wf_Delete(s_filesPath);
+            if (r == 1) {
+                int p = Wf_JobInfo(s_json, HTTP_JSON_MAX);
+                respond("202 Accepted", "application/json", s_json, p); return;
+            }
+            fileAnswer(r); return;
+        }
+        if (s_route == R_FUPLOAD) {
+            if (s_err) { fileAnswer(s_err == 403 ? WF_DENIED : s_err == 409 ? WF_EXISTS : s_err == 400 ? WF_BADPATH : WF_IOERROR); return; }
+            if (s_clen < 0 || s_rxRecv != s_clen) { Wf_UploadAbort(); fileAnswer(WF_INCOMPLETE); return; }
+            fileAnswer(Wf_UploadFinish()); return;
+        }
+        if (s_route == R_FDOWNLOAD) {
+            unsigned long long length = 0; char name[80];
+            int r = Wf_DownloadOpen(s_filesPath, &length, name, sizeof(name));
+            if (r < 0) { fileAnswer(r); return; }sendFileHeader(length, name); return;
+        }
+    }
     if (s_route == R_PAGE) { respond("200 OK", "text/html", k_page, aLen(k_page)); return; }
     if (s_route == R_BANKS) { int len = buildBanks(s_json); respond("200 OK", "application/json", s_json, len); return; }
     if (s_route == R_SYSINFO) { int len = buildSysInfo(s_json); respond("200 OK", "application/json", s_json, len); return; }
@@ -1075,6 +1414,7 @@ static void process(void)
 // ---- connection lifecycle --------------------------------------------------
 static void closeConn(void)
 {
+    Wf_UploadAbort(); Wf_DownloadClose();
     if (s_upFile != INVALID_HANDLE_VALUE) { CloseHandle(s_upFile); s_upFile = INVALID_HANDLE_VALUE; }
     if (s_sdUpOpen) { f_close(&s_sdUpFile); s_sdUpOpen = 0; }
     if (s_conn != INVALID_SOCKET) { closesocket(s_conn); s_conn = INVALID_SOCKET; }
@@ -1085,6 +1425,14 @@ static void closeConn(void)
 static void beginBody(void)
 {
     s_rxRecv = 0; s_rxStore = 0; s_store = 1; s_err = 0;
+    if (s_route == R_FUPLOAD) {
+        if (s_filesParseError) { s_err = 400; s_store = 0; return; }
+        if (!filesTokenOk()) { s_err = 403; s_store = 0; return; }
+        if (s_clen < 0) { s_err = 400; s_store = 0; return; }
+        int result = Wf_UploadBegin(s_filesPath, s_clen, s_filesOverwrite);
+        if (result != WF_OK) { s_err = (result == WF_EXISTS ? 409 : (result == WF_BADPATH ? 400 : (result == WF_DENIED ? 403 : 500))); s_store = 0; }
+        return;
+    }
     if (s_route == R_FLASH || s_route == R_SDUP) {
         // Both flash and SD BIOS uploads share the existing 1MB receive buffer.
         int cap = HTTP_RX_MAX;
@@ -1135,6 +1483,12 @@ static void stashBody(const char* src, int len)
 {
     int cap, room, i;
     if (!s_store) { s_rxRecv += len; return; }
+    if (s_route == R_FUPLOAD) {
+        int remaining = s_clen - s_rxRecv;
+        int use = len < remaining ? len : remaining;
+        if (use > 0) { int r = Wf_UploadWrite(src, use); if (r != WF_OK) { s_err = 500; s_store = 0; } }
+        s_rxRecv += len; return;
+    }
     if (s_route == R_FLASH || s_route == R_EEPROM || s_route == R_SDUP) {
         cap = (s_route == R_EEPROM) ? EOS_EEPROM_SIZE : HTTP_RX_MAX;
         room = cap - s_rxStore; if (room > len) room = len;
@@ -1175,6 +1529,7 @@ void Http_Poll(void)
     int  moved = 0, r;
 
     if (!s_up) return;
+    Wf_Tick(); // at most eight HDD/SD entries per frame during folder deletion
 
     // accept one client if idle
     if (s_conn == INVALID_SOCKET) {
@@ -1204,16 +1559,21 @@ void Http_Poll(void)
             if (he < 0) { if ((moved += r) > HTTP_POLL_BUDGET) return; continue; }
 
             parseReq();
-            if (s_method == M_POST && s_clen > 0) {
+            if (s_method == M_POST && s_route == R_FUPLOAD) {
+                int after = s_reqLen - he; beginBody();
+                // Reject inaccessible destinations without consuming large bodies.
+                if (s_err) { process(); break; }
+                if (after > 0)stashBody(s_req + he, after);
+                if (s_err || s_rxRecv >= s_clen)process(); else s_state = ST_BODY;
+            }
+            else if (s_method == M_POST && s_clen > 0) {
                 int after = s_reqLen - he;
                 beginBody();
                 if (after > 0) stashBody(s_req + he, after);
                 if (s_rxRecv >= s_clen) { process(); }
                 else { s_state = ST_BODY; }
             }
-            else {
-                process();
-            }
+            else { process(); }
             break;
         }
     }
@@ -1227,11 +1587,36 @@ void Http_Poll(void)
                 closeConn(); return;
             }
             stashBody(buf, r);
+            // Abort a failed streamed write immediately rather than making the
+            // browser finish transmitting an already-doomed large upload.
+            if (s_route == R_FUPLOAD && s_err) { process(); break; }
             if (s_rxRecv >= s_clen) { process(); break; }
             if ((moved += r) > HTTP_POLL_BUDGET) return;          // yield, resume next frame
         }
     }
 
+    if (s_state == ST_FILE_SEND) {
+        int budget = HTTP_POLL_BUDGET;
+        while (s_txHOff < s_txHLen) {
+            r = send(s_conn, s_txH + s_txHOff, s_txHLen - s_txHOff, 0);
+            if (r <= 0) { if (r == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK)return; closeConn(); return; }
+            s_txHOff += r;
+        }
+        while (budget > 0) {
+            if (s_fileAt >= s_fileHave) {
+                if (s_fileSent >= s_fileTotal) { closeConn(); return; }
+                unsigned long long remaining = s_fileTotal - s_fileSent;
+                int want = s_fileChunkCap; if (remaining < (unsigned long long)want)want = (int)remaining;
+                s_fileHave = Wf_DownloadRead(s_fileChunk, want); s_fileAt = 0;
+                if (s_fileHave <= 0) { closeConn(); return; }
+            }
+            int want = s_fileHave - s_fileAt; if (want > budget)want = budget;
+            r = send(s_conn, s_fileChunk + s_fileAt, want, 0);
+            if (r <= 0) { if (r == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK)return; closeConn(); return; }
+            s_fileAt += r; s_fileSent += (unsigned)r; budget -= r;
+        }
+        return;
+    }
     if (s_state == ST_SEND) {
         // headers
         while (s_txHOff < s_txHLen) {
@@ -1296,12 +1681,25 @@ void Http_Start(void)
     if (listen(s, 4) != 0) { closesocket(s); return; }
     ioctlsocket(s, FIONBIO, &nb);
 
-    s_listen = s; s_conn = INVALID_SOCKET; s_state = ST_IDLE; s_launch = -1; s_up = 1;
+    s_listen = s; s_conn = INVALID_SOCKET; s_state = ST_IDLE; s_launch = -1;
+    // Optional 128 MB speed path. Stock consoles retain the fixed 16 KB buffer.
+    MEMORYSTATUS mem; ZeroMemory(&mem, sizeof(mem)); mem.dwLength = sizeof(mem); GlobalMemoryStatus(&mem);
+    if (mem.dwTotalPhys >= 112UL * 1024UL * 1024UL && mem.dwAvailPhys >= 24UL * 1024UL * 1024UL) {
+        char* large = (char*)GlobalAlloc(GMEM_FIXED, 64 * 1024);
+        if (large) { s_fileChunk = large; s_fileChunkCap = 64 * 1024; }
+    }
+    unsigned long seed = GetTickCount() ^ (unsigned long)(size_t)&s_req ^ (unsigned long)(size_t)&s_conn;
+    const char* hex = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) { seed = seed * 1664525UL + 1013904223UL; s_filesToken[i] = hex[(seed >> 24) & 15]; }
+    s_filesToken[16] = 0;
+    s_up = 1;
 }
 
 void Http_Stop(void)
 {
-    if (s_conn != INVALID_SOCKET) { closesocket(s_conn);   s_conn = INVALID_SOCKET; }
+    closeConn();
+    Wf_Shutdown();
+    if (s_fileChunk != s_fileSmall) { GlobalFree(s_fileChunk); s_fileChunk = s_fileSmall; s_fileChunkCap = sizeof(s_fileSmall); }
     if (s_listen != INVALID_SOCKET) { closesocket(s_listen); s_listen = INVALID_SOCKET; }
     s_up = 0; s_state = ST_IDLE; s_launch = -1;
 }

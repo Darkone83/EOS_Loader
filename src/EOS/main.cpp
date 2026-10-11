@@ -20,6 +20,7 @@
 #include "eos_hdd.h"
 #include "eos_fan.h"
 #include "eos_format.h"
+#include "eos_dlc.h"
 #include "eos_flash.h"
 #include "eos_file.h"
 #include "eos_sdcard.h"    // onboard SD card: FAT32 browse + BIOS precache/launch
@@ -43,7 +44,7 @@ enum AppPhase {
     PH_SPLASH = 0, PH_AUTOBOOT, PH_MENU, PH_BANKSEL, PH_BANKMGMT, PH_CONFIRM, PH_BROWSE, PH_RENAME, PH_TOOLS, PH_EE_TOOLS, PH_FW_TOOLS, PH_FW_BACKUP, PH_FW_RPICK,
     PH_FW_RTARGET, PH_FW_RCONFIRM, PH_HDD_TOOLS, PH_HDD_INFO, PH_EE_RESTORE, PH_EE_CONFIRM, PH_FORMAT, PH_FORMAT_CONFIRM, PH_SETTINGS, PH_POWER, PH_ABOUT, PH_CLEARCFG,
     PH_CERB_MENU, PH_CERB_EDIT, PH_CERB_SAVED, PH_CERB_OC, PH_CERB_COMBO,
-    PH_LEDCOLOR, PH_EOS_SCRIPTS, PH_FAN
+    PH_LEDCOLOR, PH_EOS_SCRIPTS, PH_FAN, PH_DLC_SIGN
 };
 
 static AppPhase s_phase = PH_SPLASH;
@@ -130,6 +131,7 @@ static void EnterSdBrowse(void);
 // transient status line after a stub selection
 static char  s_status[64] = { 0 };
 static DWORD s_statusUntil = 0;
+static int   s_statusSeverity = 0;  // -1 operation failed; +1 operation complete; 0 notice
 
 // ---- persistent top-right info HUD -----------------------------------------
 // CPU temp / MB (ambient) temp / RAM used-free, refreshed on a timer (SMBus is
@@ -162,8 +164,10 @@ static void hudPoll(void)
 
 // Compact system-card helpers. The persistent HUD deliberately reuses the
 // existing rounded/glow primitives so it gains hierarchy without adding assets.
-#define HUD_K       0.72f
-#define HUD_HEAD_K  0.58f
+// Compact HUD stays aligned with the Bank Details card (178 px).
+// Larger text improves 480i legibility without touching menu renderers.
+#define HUD_K       0.78f
+#define HUD_HEAD_K  0.74f
 
 static int hudLine(int left, int right, int y, const char* label, const char* val, DWORD col)
 {
@@ -187,7 +191,7 @@ static void hudDraw(void)
     if (Config_GetSystemCardOn()) {
         bx = 10;
         by = 10;
-        bw = 164;
+        bw = 178;  // matches the Bank Details card on the same left rail
         // Compact system card. When the physical 1.6_EN strap is active, add
         // a fourth instrumentation row using the same visual language as CPU/MB/RAM.
         bh = s_eosMode16 ? 101 : 84;
@@ -266,7 +270,18 @@ static void hudDraw(void)
 
     // Global transient feedback belongs to the overlay rather than individual
     // screens, so browser/SD errors and tool results are visible everywhere.
-    if (s_status[0] && GetTickCount() < s_statusUntil) Ui_StatusToast(s_status);
+    if (s_status[0] && GetTickCount() < s_statusUntil) {
+        Ui_StatusToast(s_status);
+        if (s_statusSeverity != 0) {
+            // Small result marker in the toast's built-in left padding. Does not
+            // move the toast, replace its style, or overlap the footer/cards.
+            int pw = Font_TextWidth(s_status) + 44;
+            if (pw > g_scrW - 70) pw = g_scrW - 70;
+            if (pw > 0)
+                Gfx_FillRounded((g_scrW - pw) / 2 + 11, g_scrH - 108,
+                    4, 12, 2, s_statusSeverity < 0 ? 0xFFE16D73u : 0xFF52C99Du);
+        }
+    }
 
     // Draw the phase veil last so the HUD and status participate in the handoff.
     Ui_TransitionDraw();
@@ -277,7 +292,17 @@ static void SetStatus(const char* msg)
 {
     int i = 0; for (; msg[i] && i < 63; ++i) s_status[i] = msg[i];
     s_status[i] = 0;
+    s_statusSeverity = 0;
     s_statusUntil = GetTickCount() + 1500;
+}
+
+// Keep results visible long enough to read. The base SetStatus behavior is
+// unchanged for unrelated notices, including autoboot and file browsing.
+static void SetOperationStatus(const char* msg, int failed)
+{
+    SetStatus(msg);
+    s_statusSeverity = failed ? -1 : 1;
+    s_statusUntil = GetTickCount() + (failed ? 5200u : 3400u);
 }
 
 static bool Pressed(WORD now, WORD prev, WORD mask)
@@ -310,6 +335,7 @@ static const char* PhaseName(AppPhase p)
     case PH_FAN:         return "Fan Control";
     case PH_FORMAT:
     case PH_FORMAT_CONFIRM: return "Format";
+    case PH_DLC_SIGN: return "DLC Signer";
     case PH_CLEARCFG:    return "Reset Settings";
     case PH_CERB_MENU:   return "Cerbios Config";
     case PH_CERB_EDIT:
@@ -456,13 +482,13 @@ static void Power_Frame(WORD b)
         GotoPhase(PH_MENU);
         return;
     }
-    if (Pressed(b, s_prevBtn, BTN_DPAD_UP)) {
-        s_powerSel = (s_powerSel + count - 1) % count;
-        s_powerArm = 0;
-    }
-    if (Pressed(b, s_prevBtn, BTN_DPAD_DOWN)) {
-        s_powerSel = (s_powerSel + 1) % count;
-        s_powerArm = 0;
+    {
+        int oldSel = s_powerSel;
+        s_powerSel = Ui_MenuNavigate(items, count, s_powerSel, b, s_prevBtn);
+        // Selection changes always cancel a pending power confirmation.
+        // Classic still cancels on Up/Down exactly as before.
+        if (s_powerSel != oldSel || Pressed(b, s_prevBtn, BTN_DPAD_UP) ||
+            Pressed(b, s_prevBtn, BTN_DPAD_DOWN)) s_powerArm = 0;
     }
 
     if (Pressed(b, s_prevBtn, BTN_A)) {
@@ -640,14 +666,17 @@ static void BankSel_Frame(WORD b)
     int tsopIdx = cap + (hasDiag ? 1 : 0);        // TSOP is always the last hard-flash item
     int sdIdx = tsopIdx + 1;                      // SD Card is always last of all
     int total = sdIdx + 1;
+    const char* names[EOS_BANK_MAX + 3];
     int i;
 
+    // The same entry array drives input and drawing, including the adaptive
+    // single-column grid for long bank names.
+    for (i = 0; i < cap; ++i) names[i] = Bank_Name(Bank_LaunchIndex(i));
+    if (hasDiag) names[diagIdx] = "XbDiag Lite";
+    names[tsopIdx] = "TSOP  (onboard flash)";
+    names[sdIdx] = "SD Card";
     if (s_bankSel >= total) s_bankSel = total - 1;
-
-    if (Pressed(b, s_prevBtn, BTN_DPAD_UP))
-        s_bankSel = (s_bankSel + total - 1) % total;
-    if (Pressed(b, s_prevBtn, BTN_DPAD_DOWN))
-        s_bankSel = (s_bankSel + 1) % total;
+    s_bankSel = Ui_MenuNavigate(names, total, s_bankSel, b, s_prevBtn);
 
     if (Pressed(b, s_prevBtn, BTN_B)) {
         GotoPhase(PH_MENU);
@@ -682,13 +711,13 @@ static void BankSel_Frame(WORD b)
     Gfx_Begin(EOS_BG); Ui_Backdrop();
     Ui_TitleBar("SELECT BANK");
 
-    {
-        const char* names[EOS_BANK_MAX + 3];      // real banks + XbDiag + TSOP + SD Card
-        for (i = 0; i < cap; ++i) names[i] = Bank_Name(Bank_LaunchIndex(i));
-        if (hasDiag) names[diagIdx] = "XbDiag Lite";
-        names[tsopIdx] = "TSOP  (onboard flash)";
-        names[sdIdx] = "SD Card";
-        Ui_Menu3D(names, total, s_bankSel);
+    Ui_Menu3D(names, total, s_bankSel);
+
+    // Identification only: the currently highlighted bank is the configured
+    // autoboot target. Does not alter menu selection, launch, or timeouts.
+    if (s_bankSel < cap && Bank_IsAutoBoot(Bank_LaunchIndex(s_bankSel))) {
+        DWORD pulseColor = ((GetTickCount() / 420UL) & 1UL) ? EOS_GLOW : EOS_PURPLE;
+        Font_DrawCentered(0, g_scrW, 78, "AUTOBOOT BANK", pulseColor);
     }
 
     if (cap == 0 && !hasDiag)
@@ -709,6 +738,54 @@ static int appendStr(char* out, int p, const char* s)
     while (*s && p < 62) out[p++] = *s++;
     out[p] = 0;
     return p;
+}
+
+// Bank numbers in the four-slot descriptor are user-visible 1..4. These
+// helpers describe actual allocation footprints, never a guessed flash target.
+static int appendBankNumber(char* dst, int p, int number)
+{
+    char n[4];
+    int q = 0;
+    if (number >= 10) n[q++] = (char)('0' + (number / 10) % 10);
+    n[q++] = (char)('0' + number % 10);
+    n[q] = 0;
+    return appendStr(dst, p, n);
+}
+
+static int mgmtDeleteFootprint(int idx, int* anchorOut, int* spanOut)
+{
+    int slot = descSlotForBank(idx);
+    int anchor = slot, span;
+    if (anchorOut) *anchorOut = slot;
+    if (spanOut) *spanOut = 1;
+    if (slot < 0 || slot >= EOS_DESC_SLOTS || !s_layoutOk) return 0;
+    if (s_layout.slot[slot].state == EOS_SLOT_SHADOW) {
+        while (anchor > 0 && s_layout.slot[anchor].state != EOS_SLOT_ANCHOR)
+            --anchor;
+    }
+    if (s_layout.slot[anchor].state != EOS_SLOT_ANCHOR) return 0;
+    span = Desc_SlotsFor(s_layout.slot[anchor].sizeCode);
+    if (span < 2 || anchor + span > EOS_DESC_SLOTS || slot >= anchor + span)
+        return 0;
+    if (anchorOut) *anchorOut = anchor;
+    if (spanOut) *spanOut = span;
+    return 1;
+}
+
+static void mgmtFootprintText(char* out, int anchor, int span)
+{
+    int p = 0;
+    if (anchor < 0 || anchor >= EOS_DESC_SLOTS) {
+        appendStr(out, 0, "SYSTEM BANK");
+        return;
+    }
+    p = appendStr(out, p, span > 1 ? "Banks " : "Bank ");
+    p = appendBankNumber(out, p, anchor + 1);
+    if (span > 1) {
+        p = appendStr(out, p, "-");
+        p = appendBankNumber(out, p, anchor + span);
+    }
+    appendStr(out, p, span == 4 ? " (1 MB)" : (span == 2 ? " (512 KB)" : " (256 KB)"));
 }
 
 static const char* sizeStr(int code)
@@ -775,9 +852,12 @@ static void buildMgmtRow(char* out, int idx)
 
 static void DoDelete(int idx)
 {
-    int rc, slot;
-    if (idx < 0 || Bank_IsLocked(idx)) { SetStatus("Protected bank"); return; }
+    int rc, slot, anchorForMsg, spanForMsg, eraseFailed;
+    char bankText[64], result[64];
+    if (idx < 0 || Bank_IsLocked(idx)) { SetOperationStatus("Delete refused: protected bank", 1); return; }
 
+    mgmtDeleteFootprint(idx, &anchorForMsg, &spanForMsg);
+    mgmtFootprintText(bankText, anchorForMsg, spanForMsg);
     slot = descSlotForBank(idx);   // descriptor slot 0..3, or -1 if not a user bank
 
     // If the descriptor marks this slot as oversized (anchor or shadow), clear it
@@ -793,6 +873,7 @@ static void DoDelete(int idx)
             while (anchor > 0 && s_layout.slot[anchor].state != EOS_SLOT_ANCHOR) --anchor;
         }
 
+        eraseFailed = 0;
         if (s_layout.slot[anchor].state == EOS_SLOT_ANCHOR) {
             unsigned int base = s_layout.slot[anchor].physBase;
             span = Desc_SlotsFor(s_layout.slot[anchor].sizeCode);
@@ -802,7 +883,13 @@ static void DoDelete(int idx)
                 int nblk = (span == 4) ? 16 : 8;
                 int bk;
                 for (bk = 0; bk < nblk && (firstBlk + bk) < 16; ++bk)
-                    Flash_EraseBlock(EOS_BANK_NEWREGION, firstBlk + bk);
+                    if (Flash_EraseBlock(EOS_BANK_NEWREGION, firstBlk + bk) != EOS_FLASH_OK)
+                        eraseFailed = 1;
+            }
+            else {
+                // Preserve the old descriptor cleanup path, but never report
+                // an erase as successful if its recorded flash base is invalid.
+                eraseFailed = 1;
             }
         }
         else {
@@ -820,28 +907,43 @@ static void DoDelete(int idx)
             tblIdx = Bank_IndexForEf((unsigned char)(0x3 + anchor + j));
             if (tblIdx >= 0) Bank_ClearEntry(tblIdx);
         }
-        Desc_Save(&s_layout);
-        Config_Save();
-        SetStatus("Bank cleared");
+        rc = Desc_Save(&s_layout);
+        if (Config_Save() != EOS_FLASH_OK || rc != EOS_FLASH_OK || eraseFailed) {
+            SetOperationStatus("ERASE ERROR: check bank allocation", 1);
+        }
+        else {
+            int p = appendStr(result, 0, bankText);
+            appendStr(result, p, " cleared");
+            SetOperationStatus(result, 0);
+        }
         return;
     }
 
     // normal 256K bank (native or plain) -- default range, exactly as before.
     rc = Flash_EraseBank(Bank_Ef(idx));
     if (rc == EOS_FLASH_OK) {
+        int descRc = EOS_FLASH_OK;
+        int configRc;
         if (slot >= 0 && Desc_Load(&s_layout) && s_layout.valid &&
             s_layout.slot[slot].state == EOS_SLOT_NATIVE) {
             s_layout.slot[slot].state = EOS_SLOT_FREE;
             s_layout.slot[slot].sizeCode = EOS_SZC_256K;
             s_layout.slot[slot].physBase = 0;
-            Desc_Save(&s_layout);
+            descRc = Desc_Save(&s_layout);
         }
         Bank_ClearEntry(idx);
-        Config_Save();
-        SetStatus("Bank cleared");
+        configRc = Config_Save();
+        if (descRc != EOS_FLASH_OK || configRc != EOS_FLASH_OK) {
+            SetOperationStatus("Bank erased; metadata save FAILED", 1);
+        }
+        else {
+            int p = appendStr(result, 0, bankText);
+            appendStr(result, p, " cleared");
+            SetOperationStatus(result, 0);
+        }
     }
     else {
-        SetStatus("Erase FAILED");
+        SetOperationStatus("Bank erase FAILED: flash engine", 1);
     }
 }
 
@@ -861,8 +963,44 @@ static void Confirm_Frame(WORD b)
     }
     Gfx_Begin(EOS_BG); Ui_Backdrop();
     Ui_TitleBar("Confirm Action");
-    Font_DrawCentered(0, g_scrW, 190, s_confirmMsg, EOS_WHITE);
-    Font_DrawCentered(0, g_scrW, 230, "This cannot be undone.", EOS_PURPLE);
+    if (s_pendAct == ACT_DELETE && s_pendIdx >= 0) {
+        int anchor, span;
+        char range[64];
+        mgmtDeleteFootprint(s_pendIdx, &anchor, &span);
+        mgmtFootprintText(range, anchor, span);
+        Ui_TextCenteredFit(28, g_scrW - 56, 142, "ERASE BIOS", EOS_PURPLE);
+        Ui_TextCenteredFit(28, g_scrW - 56, 176,
+            Bank_Name(s_pendIdx), EOS_WHITE);
+        Ui_TextCenteredFit(28, g_scrW - 56, 207, range, EOS_WHITE);
+        Ui_TextCenteredFit(28, g_scrW - 56, 248,
+            span > 1 ? "ALL linked bank slots will be erased."
+            : "This bank's BIOS contents will be erased.", EOS_DIM);
+        Ui_TextCenteredFit(28, g_scrW - 56, 277,
+            "This cannot be undone.", EOS_PURPLE);
+    }
+    else if (s_pendAct == ACT_FLASH && s_pendIdx >= 0) {
+        int slot = descSlotForBank(s_pendIdx), p = 0;
+        char target[64];
+        const char* name = s_flashPath;
+        const char* scan = s_flashPath;
+        while (*scan) {
+            if (*scan == '\\' || *scan == '/') name = scan + 1;
+            ++scan;
+        }
+        p = appendStr(target, p, "Selected: Bank ");
+        if (slot >= 0) p = appendBankNumber(target, p, slot + 1);
+        else p = appendStr(target, p, "?");
+        Ui_TextCenteredFit(28, g_scrW - 56, 139, "PROGRAM BIOS", EOS_PURPLE);
+        Ui_TextCenteredFit(28, g_scrW - 56, 173, name, EOS_WHITE);
+        Ui_TextCenteredFit(28, g_scrW - 56, 209, target, EOS_WHITE);
+        Ui_TextCenteredFit(28, g_scrW - 56, 248,
+            "512K/1MB images are placed automatically.", EOS_DIM);
+        Ui_TextCenteredFit(28, g_scrW - 56, 277,
+            "Existing contents may be overwritten.", EOS_PURPLE);
+    }
+    else {
+        Ui_TextCenteredFit(28, g_scrW - 56, 190, s_confirmMsg, EOS_WHITE);
+    }
     Ui_Footer("A  CONFIRM      B  CANCEL");
     Gfx_End();
 }
@@ -911,6 +1049,13 @@ static int navSel(WORD b, int sel, int count)
     return sel;
 }
 
+// Only listScreen() callers use presentation-aware navigation. Editor rows,
+// fan controls and file browsers keep their original directional behavior.
+static int navMenuSel(WORD b, int sel, const char** items, int count)
+{
+    return Ui_MenuNavigate(items, count, sel, b, s_prevBtn);
+}
+
 // Standard list screen: title pill + a scrolling column of pills + status line.
 static void listScreen(const char* title, const char** items, int count, int sel)
 {
@@ -930,6 +1075,7 @@ static void FwBackup_Enter(void);
 static void FwRestore_Enter(void);
 static void HddTools_Enter(void);
 static void Format_Enter(void);
+static void Dlc_Enter(void);
 static void FanControl_Enter(void);
 
 static void EnterEosScripts(void);
@@ -1279,7 +1425,7 @@ static void CerbMenu_Frame(WORD b)
 {
     static const char* items[3] = { "Cerbios 3.x.x", "Legacy (2.4.2)", "Overclock Calc" };
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_TOOLS); return; }
-    s_cerbMenuSel = navSel(b, s_cerbMenuSel, 3);
+    s_cerbMenuSel = navMenuSel(b, s_cerbMenuSel, items, 3);
     if (Pressed(b, s_prevBtn, BTN_A)) {
         if (s_cerbMenuSel == 0)      CerbEdit_Enter(CERB_NEW);
         else if (s_cerbMenuSel == 1) CerbEdit_Enter(CERB_LEGACY);
@@ -1725,10 +1871,10 @@ static void CerbOc_Frame(WORD b)
 
 static void Tools_Frame(WORD b)             // top level: tool categories
 {
-    static const char* cats[8] = { "EEPROM", "Firmware", "HDD", "Fan Control", "Cerbios Config Editor", "EOS Scripts", "Format", "Clear Settings" };
-    const int catCount = 8;
+    static const char* cats[9] = { "EEPROM", "Firmware", "HDD", "Fan Control", "Cerbios Config Editor", "EOS Scripts", "Format", "DLC / Update Signer", "Clear Settings" };
+    const int catCount = 9;
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_MENU); return; }
-    s_toolSel = navSel(b, s_toolSel, catCount);
+    s_toolSel = navMenuSel(b, s_toolSel, cats, catCount);
     if (Pressed(b, s_prevBtn, BTN_A)) {
         if (s_toolSel == 0) { s_eeToolSel = 0; GotoPhase(PH_EE_TOOLS); }
         else if (s_toolSel == 1) { s_fwToolSel = 0; GotoPhase(PH_FW_TOOLS); }
@@ -1737,6 +1883,7 @@ static void Tools_Frame(WORD b)             // top level: tool categories
         else if (s_toolSel == 4) { s_cerbMenuSel = 0; GotoPhase(PH_CERB_MENU); }
         else if (s_toolSel == 5) { EnterEosScripts(); }
         else if (s_toolSel == 6) { Format_Enter(); }
+        else if (s_toolSel == 7) { Dlc_Enter(); }
         else { GotoPhase(PH_CLEARCFG); }
     }
     listScreen("Tools", cats, catCount, s_toolSel);
@@ -1884,7 +2031,7 @@ static void EeTools_Frame(WORD b)           // EEPROM: Backup / Restore
 {
     static const char* it[2] = { "Backup EEPROM", "Restore EEPROM" };
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_TOOLS); return; }
-    s_eeToolSel = navSel(b, s_eeToolSel, 2);
+    s_eeToolSel = navMenuSel(b, s_eeToolSel, it, 2);
     if (Pressed(b, s_prevBtn, BTN_A)) {
         if (s_eeToolSel == 0) DoBackupEeprom();
         else                  RestoreEeprom_Enter();
@@ -1896,7 +2043,7 @@ static void FwTools_Frame(WORD b)           // Firmware: Backup / Restore
 {
     static const char* it[2] = { "Backup Firmware", "Restore Firmware" };
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_TOOLS); return; }
-    s_fwToolSel = navSel(b, s_fwToolSel, 2);
+    s_fwToolSel = navMenuSel(b, s_fwToolSel, it, 2);
     if (Pressed(b, s_prevBtn, BTN_A)) {
         if (s_fwToolSel == 0) FwBackup_Enter();
         else                  FwRestore_Enter();
@@ -2046,7 +2193,7 @@ static void FwBackup_Frame(WORD b)
     const char* names[8]; int n; char path[160]; char msg[96]; int p, rc;
     bankNames(names, &n);
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_FW_TOOLS); return; }
-    s_fwBankSel = navSel(b, s_fwBankSel, n);
+    s_fwBankSel = navMenuSel(b, s_fwBankSel, names, n);
     if (Pressed(b, s_prevBtn, BTN_A) && n > 0) {
         rc = Firmware_BackupBank(s_fwBankSel, path, (int)sizeof(path));
         if (rc == FW_OK) {
@@ -2070,15 +2217,15 @@ static void FwRestore_Enter(void)
 static void FwRestPick_Frame(WORD b)
 {
     const char* items[FW_LIST_MAX]; int i, k;
+    for (i = 0; i < s_fwCount; ++i) items[i] = s_fwNames[i];
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_FW_TOOLS); return; }
-    s_fwFileSel = navSel(b, s_fwFileSel, s_fwCount);
+    s_fwFileSel = navMenuSel(b, s_fwFileSel, items, s_fwCount);
     if (Pressed(b, s_prevBtn, BTN_A) && s_fwCount > 0) {
         k = 0;
         while (s_fwNames[s_fwFileSel][k] && k < 63) { s_fwFile[k] = s_fwNames[s_fwFileSel][k]; ++k; }
         s_fwFile[k] = 0;
         s_fwTgtSel = 0; GotoPhase(PH_FW_RTARGET);
     }
-    for (i = 0; i < s_fwCount; ++i) items[i] = s_fwNames[i];
     {
         char ttl[40]; int tp = 0;
         const char* t = "Restore FW: ";
@@ -2096,7 +2243,7 @@ static void FwRestTarget_Frame(WORD b)
     const char* names[8]; int n;
     bankNames(names, &n);
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_FW_RPICK); return; }
-    s_fwTgtSel = navSel(b, s_fwTgtSel, n);
+    s_fwTgtSel = navMenuSel(b, s_fwTgtSel, names, n);
     if (Pressed(b, s_prevBtn, BTN_A) && n > 0) GotoPhase(PH_FW_RCONFIRM);
     listScreen("Restore to bank", names, n, s_fwTgtSel);
 }
@@ -2262,7 +2409,7 @@ static void HddTools_Frame(WORD b)
     int prev, rc;
 
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_TOOLS); return; }
-    prev = s_hddToolSel; s_hddToolSel = navSel(b, s_hddToolSel, 3);
+    prev = s_hddToolSel; s_hddToolSel = navMenuSel(b, s_hddToolSel, it, 3);
     if (prev != s_hddToolSel) s_hddArm = 0;
 
     if (Pressed(b, s_prevBtn, BTN_A)) {
@@ -2369,101 +2516,366 @@ static void HddInfo_Frame(WORD b)
 }
 
 
-/* ---- Format (HDD staging: partition + format a fresh drive) ------------- */
-static int           s_fmtArm = 0;
-static int           s_fmtHasDisk = 0;
-static unsigned long s_fmtTotalMB = 0, s_fmtEMB = 0, s_fmtFMB = 0;
+/* ---- DLC/Update Signer: PrometheOS-compatible ContentMeta.xbx HMAC. ---- */
+static int s_dlcState = 0;  /* 0 preview, 1 scan, 2 ready, 3 confirm, 4 run, 5 done, 6 error */
+static int s_dlcMode = DLC_SCAN_ONLY;
+static EosDlcReport s_dlcReport;
 
-static void Format_Enter(void)
+static void Dlc_Enter(void)
 {
-    s_fmtArm = 0;
-    s_fmtHasDisk = Format_PlanInfo(&s_fmtTotalMB, &s_fmtEMB, &s_fmtFMB);
-    GotoPhase(PH_FORMAT);
+    s_dlcState = 0;
+    s_dlcMode = DLC_SCAN_ONLY;
+    GotoPhase(PH_DLC_SIGN);
 }
-
-static void Format_Frame(WORD b)            /* overview + first gate */
+static void Dlc_Frame(WORD b)
 {
-    char line[80]; int p, y;
-
-    if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_TOOLS); return; }
-    if (Pressed(b, s_prevBtn, BTN_A) && s_fmtHasDisk) { s_fmtArm = 0; GotoPhase(PH_FORMAT_CONFIRM); return; }
-
-    Gfx_Begin(EOS_BG); Ui_Backdrop();
-    Ui_TitleBar("Stage Hard Drive");
-
-    if (!s_fmtHasDisk) {
-        Font_DrawCentered(0, g_scrW, 170, "No drive detected on the primary channel.", EOS_DIM);
-        Ui_Footer("B  BACK");
-        Gfx_End();
-        return;
+    char line[72], num[16];
+    int p;
+    if (Pressed(b, s_prevBtn, BTN_B) && s_dlcState != 4) {
+        GotoPhase(PH_TOOLS); return;
+    }
+    if (s_dlcState == 0) s_dlcState = 1;
+    else if (s_dlcState == 1) {
+        s_dlcState = Dlc_Run(DLC_SCAN_ONLY, &s_dlcReport) ? 2 : 6;
+    }
+    else if (s_dlcState == 4) {
+        // Run after the confirmation screen has been drawn at least once.
+        s_dlcState = Dlc_Run(s_dlcMode, &s_dlcReport) ? 5 : 6;
+        SetOperationStatus(s_dlcState == 5 ? "DLC metadata processing complete"
+            : "DLC signer: TDATA scan failed", s_dlcState != 5 || s_dlcReport.failed > 0);
     }
 
-    Font_DrawCentered(0, g_scrW, 104, "Create the standard Xbox partition layout", EOS_WHITE);
-    Font_DrawCentered(0, g_scrW, 128, "and format the entire drive.", EOS_WHITE);
-
-    y = 180;
-    Font_Draw(140, y, "Drive size", EOS_DIM);
-    p = 0; p = appendUInt(line, p, s_fmtTotalMB / 1024); p = appendStr(line, p, " GB"); line[p] = 0;
-    Font_Draw(320, y, line, EOS_WHITE); y += 34;
-
-    Font_Draw(140, y, "C E X Y Z", EOS_DIM);
-    Font_Draw(320, y, "system + caches", EOS_WHITE); y += 34;
-
-    Font_Draw(140, y, "F  extended", EOS_DIM);
-    if (s_fmtFMB) {
-        p = 0; p = appendUInt(line, p, s_fmtFMB / 1024); p = appendStr(line, p, " GB"); line[p] = 0;
-        Font_Draw(320, y, line, EOS_WHITE);
+    if (s_dlcState == 2 && s_dlcReport.found != 0) {
+        if (Pressed(b, s_prevBtn, BTN_A)) { s_dlcMode = DLC_SIGN_ALL; s_dlcState = 3; }
+        else if (Pressed(b, s_prevBtn, BTN_Y)) { s_dlcMode = DLC_SIGN_INVALID; s_dlcState = 3; }
     }
-    else { Font_Draw(320, y, "none (small drive)", EOS_DIM); }
-    y += 46;
-
-    Font_DrawCentered(0, g_scrW, y, "ERASES THE ENTIRE DRIVE.", EOS_PURPLE);
-
-    Ui_Footer("A  CONTINUE     B  CANCEL");
+    else if (s_dlcState == 3 && Pressed(b, s_prevBtn, BTN_A)) {
+        s_dlcState = 4;
+    }
+    Gfx_Begin(EOS_BG); Ui_Backdrop(); Ui_TitleBar("DLC / Update Signer");
+    Font_DrawCentered(0, g_scrW, 100, "E:\\TDATA  -  ContentMeta.xbx", EOS_PURPLE);
+    if (s_dlcState == 1) {
+        Font_DrawCentered(0, g_scrW, 195, "Scanning installed content...", EOS_WHITE);
+    }
+    else if (s_dlcState == 6) {
+        Font_DrawCentered(0, g_scrW, 195, "Unable to enumerate E:\\TDATA", EOS_WHITE);
+    }
+    else if (s_dlcState == 3 || s_dlcState == 4) {
+        Font_DrawCentered(0, g_scrW, 170,
+            s_dlcMode == DLC_SIGN_ALL ? "Sign ALL content metadata?" : "Re-sign INVALID metadata only?",
+            EOS_WHITE);
+        Font_DrawCentered(0, g_scrW, 215,
+            "Updates Xbox content signatures in place.", EOS_DIM);
+        Font_DrawCentered(0, g_scrW, 250,
+            s_dlcState == 4 ? "Signing..." : "A CONFIRM     B CANCEL", EOS_PURPLE);
+    }
+    else {
+        p = 0; p = appendStr(line, p, "Packages: ");
+        p = appendStr(line, p, iToB(s_dlcReport.found, num)); line[p] = 0;
+        Font_DrawCentered(0, g_scrW, 153, line, EOS_WHITE);
+        p = 0; p = appendStr(line, p, "Already valid: ");
+        p = appendStr(line, p, iToB(s_dlcReport.valid, num)); line[p] = 0;
+        Font_DrawCentered(0, g_scrW, 187, line, EOS_DIM);
+        if (s_dlcState == 5) {
+            p = 0; p = appendStr(line, p, "Signed: ");
+            p = appendStr(line, p, iToB(s_dlcReport.signedCount, num));
+            p = appendStr(line, p, "  Skipped: ");
+            p = appendStr(line, p, iToB(s_dlcReport.skipped, num)); line[p] = 0;
+            Font_DrawCentered(0, g_scrW, 226, line, EOS_WHITE);
+            p = 0; p = appendStr(line, p, "Failures: ");
+            p = appendStr(line, p, iToB(s_dlcReport.failed, num)); line[p] = 0;
+            Font_DrawCentered(0, g_scrW, 262, line,
+                s_dlcReport.failed ? EOS_PURPLE : EOS_DIM);
+        }
+        else {
+            Font_DrawCentered(0, g_scrW, 232,
+                s_dlcReport.found ? "A SIGN ALL       Y INVALID ONLY"
+                : "No DLC or title update metadata found", EOS_PURPLE);
+        }
+    }
+    Ui_Footer(s_dlcState == 3 ? "A  CONFIRM     B  CANCEL"
+        : s_dlcState == 2 ? "A  SIGN ALL     Y  INVALID ONLY     B  BACK"
+        : "B  BACK");
     Gfx_End();
 }
 
-static void FormatConfirm_Frame(WORD b)     /* final armed confirm */
+/* ---- Format: explicitly select disk 0 (primary) or disk 1 (secondary). ---- */
+static int s_fmtArm = 0;
+static int s_fmtDisk = 0;   /* ALWAYS enter on disk 0; never auto-select disk 1 */
+static int s_fmtHasDisk[2] = { 0, 0 };
+static unsigned long s_fmtTotalMB[2] = { 0, 0 };
+static unsigned long s_fmtEMB[2] = { 0, 0 };
+static unsigned long s_fmtFMB[2] = { 0, 0 };
+static unsigned long long s_fmtSectors[2] = { 0, 0 };
+
+static void Format_Refresh(int disk)
+{
+    if (disk < 0 || disk > 1) return;
+    s_fmtHasDisk[disk] = Format_PlanInfoForDisk(disk, &s_fmtTotalMB[disk],
+        &s_fmtEMB[disk], &s_fmtFMB[disk], &s_fmtSectors[disk]);
+}
+static void Format_Enter(void)
+{
+    s_fmtArm = 0;
+    s_fmtDisk = 0;
+    Format_Refresh(0);
+    Format_Refresh(1);
+    GotoPhase(PH_FORMAT);
+}
+
+static void Format_Frame(WORD b)
+{
+    char line[80]; int p, y;
+    if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_TOOLS); return; }
+    if (Pressed(b, s_prevBtn, BTN_DPAD_LEFT) ||
+        Pressed(b, s_prevBtn, BTN_DPAD_RIGHT)) {
+        s_fmtDisk = 1 - s_fmtDisk;
+        s_fmtArm = 0;
+        Format_Refresh(s_fmtDisk);
+    }
+    if (Pressed(b, s_prevBtn, BTN_A) && s_fmtHasDisk[s_fmtDisk]) {
+        s_fmtArm = 0;
+        Format_Refresh(s_fmtDisk);
+        if (s_fmtHasDisk[s_fmtDisk]) { GotoPhase(PH_FORMAT_CONFIRM); return; }
+    }
+
+    Gfx_Begin(EOS_BG); Ui_Backdrop();
+    Ui_TitleBar("Stage Hard Drive");
+    Font_DrawCentered(0, g_scrW, 88,
+        s_fmtDisk == 0 ? "TARGET: HDD0  -  PRIMARY" : "TARGET: HDD1  -  SECONDARY",
+        EOS_PURPLE);
+    Font_DrawCentered(0, g_scrW, 115, "LEFT / RIGHT  choose physical drive", EOS_DIM);
+
+    if (!s_fmtHasDisk[s_fmtDisk]) {
+        Font_DrawCentered(0, g_scrW, 182,
+            s_fmtDisk == 0 ? "Harddisk0 unavailable / unsupported geometry"
+            : "Harddisk1 not detected by active BIOS", EOS_WHITE);
+        Font_DrawCentered(0, g_scrW, 215, "No format action is available.", EOS_DIM);
+        Ui_Footer("LEFT / RIGHT  DRIVE     B  BACK");
+        Gfx_End(); return;
+    }
+    Font_DrawCentered(0, g_scrW, 149, "Create the Xbox FATX layout and ERASE this disk", EOS_WHITE);
+    y = 203;
+    Font_Draw(140, y, "Physical device", EOS_DIM);
+    Font_Draw(320, y, s_fmtDisk == 0 ? "Harddisk0" : "Harddisk1", EOS_WHITE); y += 34;
+    Font_Draw(140, y, "Capacity", EOS_DIM);
+    p = 0; p = appendUInt(line, p, s_fmtTotalMB[s_fmtDisk] / 1024);
+    p = appendStr(line, p, " GB"); line[p] = 0;
+    Font_Draw(320, y, line, EOS_WHITE); y += 34;
+    Font_Draw(140, y, "C E X Y Z", EOS_DIM);
+    Font_Draw(320, y, "system + caches", EOS_WHITE); y += 34;
+    Font_Draw(140, y, "F  extended", EOS_DIM);
+    if (s_fmtFMB[s_fmtDisk]) {
+        p = 0; p = appendUInt(line, p, s_fmtFMB[s_fmtDisk] / 1024);
+        p = appendStr(line, p, " GB"); line[p] = 0;
+        Font_Draw(320, y, line, EOS_WHITE);
+    }
+    else Font_Draw(320, y, "none (small drive)", EOS_DIM);
+    y += 32;
+    Font_DrawCentered(0, g_scrW, y, "ERASES THE SELECTED PHYSICAL DRIVE.", EOS_PURPLE);
+    Ui_Footer("LEFT / RIGHT  DRIVE     A  CONTINUE     B  BACK");
+    Gfx_End();
+}
+
+static void FormatConfirm_Frame(WORD b)
 {
     if (Pressed(b, s_prevBtn, BTN_B)) { s_fmtArm = 0; GotoPhase(PH_FORMAT); return; }
-
     if (Pressed(b, s_prevBtn, BTN_A)) {
-        if (!s_fmtArm) { s_fmtArm = 1; }
+        if (!s_fmtArm) s_fmtArm = 1;
         else {
-            int rc = Format_StageDrive();
+            int rc;
+            // Formatter re-reads device geometry and refuses if it changed.
+            rc = Format_StageDriveChecked(s_fmtDisk, s_fmtSectors[s_fmtDisk]);
             s_fmtArm = 0;
-            SetStatus(rc == FMT_OK ? "Drive staged -- standard layout written"
-                : Format_ErrStr(rc));
+            if (rc == FMT_OK) {
+                SetOperationStatus(s_fmtDisk == 0 ? "Harddisk0 staged successfully"
+                    : "Harddisk1 staged; mount through dual-drive BIOS", 0);
+            }
+            else SetOperationStatus(Format_ErrStr(rc), 1);
             GotoPhase(PH_TOOLS);
             return;
         }
     }
-
     Gfx_Begin(EOS_BG); Ui_Backdrop();
-    Ui_TitleBar("Stage Hard Drive");
-    Font_DrawCentered(0, g_scrW, 150, "This ERASES the entire drive and writes", EOS_WHITE);
-    Font_DrawCentered(0, g_scrW, 174, "a fresh partition table.", EOS_WHITE);
-    Font_DrawCentered(0, g_scrW, 232,
-        s_fmtArm ? "Press A again to STAGE THE DRIVE" : "Press A to confirm",
+    Ui_TitleBar("Confirm Hard Drive Format");
+    Font_DrawCentered(0, g_scrW, 112,
+        s_fmtDisk == 0 ? "ERASE: PRIMARY Harddisk0" : "ERASE: SECONDARY Harddisk1",
         EOS_PURPLE);
-    Font_DrawCentered(0, g_scrW, 266, "B to cancel", EOS_DIM);
+    Font_DrawCentered(0, g_scrW, 152, "ALL DATA ON THIS PHYSICAL DISK WILL BE LOST.", EOS_WHITE);
+    Font_DrawCentered(0, g_scrW, 185, "The other disk is not the target.", EOS_DIM);
+    Font_DrawCentered(0, g_scrW, 237,
+        s_fmtArm ? "Press A again to FORMAT the selected HDD" : "Press A to arm formatting",
+        EOS_PURPLE);
+    Font_DrawCentered(0, g_scrW, 272, "B CANCELS - no changes made", EOS_DIM);
     Ui_Footer("A  CONFIRM     B  CANCEL");
     Gfx_End();
 }
 
+// Read-only Bank Management details. Kept entirely in the left rail, below the
+// optional System Info HUD (10,10,164x84 or 164x101). No menu callbacks, bank
+// flags, descriptor writes, or flash actions are introduced here.
+#define MGMT_MENU_LEFT    212
+#define MGMT_MENU_RIGHT   630
+#define MGMT_CARD_LEFT    10
+#define MGMT_CARD_WIDTH   178
+#define MGMT_CARD_HEIGHT  224
+
+// The descriptor is authoritative for ext-bank anchors/shadows; use the bank
+// table only when the descriptor describes a free (legacy) slot.
+static int mgmtVisualSlotState(int slot)
+{
+    int idx;
+    if (slot < 0 || slot >= EOS_DESC_SLOTS) return EOS_SLOT_FREE;
+    if (s_layoutOk && s_layout.slot[slot].state != EOS_SLOT_FREE)
+        return s_layout.slot[slot].state;
+    idx = Bank_IndexForEf((unsigned char)(0x3 + slot));
+    return (idx >= 0 && Bank_Occupied(idx)) ? EOS_SLOT_NATIVE : EOS_SLOT_FREE;
+}
+
+static int mgmtSlotOwner(int slot)
+{
+    int anchor, span;
+    if (slot < 0 || slot >= EOS_DESC_SLOTS) return -1;
+    if (mgmtVisualSlotState(slot) != EOS_SLOT_SHADOW) return slot;
+    for (anchor = slot - 1; anchor >= 0; --anchor) {
+        if (mgmtVisualSlotState(anchor) != EOS_SLOT_ANCHOR) continue;
+        span = Desc_SlotsFor(s_layout.slot[anchor].sizeCode);
+        if (span > 1 && anchor + span > slot) return anchor;
+    }
+    return -1; // malformed descriptor: never guess a bank owner
+}
+
+static void mgmtCardLine(int x, int y, const char* label, const char* value,
+    DWORD valueColor)
+{
+    int left = x + 14;
+    int right = x + MGMT_CARD_WIDTH - 12;
+    float lk = 0.76f, vk = 0.79f;
+    int lw = Font_TextWidthScaled(label, lk);
+    int vw = Font_TextWidthScaled(value, vk);
+    // Keep an actual gap between both columns even in 480p font-bump mode.
+    // The old width clamp moved the text but never constrained its drawing.
+    if (lw + vw > right - left - 8 && lw + vw > 0) {
+        float fit = (float)(right - left - 8) / (float)(lw + vw);
+        lk *= fit;
+        vk *= fit;
+        vw = Font_TextWidthScaled(value, vk);
+    }
+    Font_DrawScaled(left, y, label, EOS_DIM, lk);
+    Font_DrawScaled(right - vw, y, value, valueColor, vk);
+}
+
+static void BankMgmt_DrawDetails(int idx)
+{
+    int x, y, w, slot, state, owner, sizeCode, i;
+    int autoBoot, ledOn;
+    DWORD panel, edge, rowFace, ledRgb, swatch;
+    const char* status;
+    const char* size;
+    const char* autoText;
+    const char* colorText;
+    char bankId[26];
+    int n, num;
+
+    if (idx < 0 || idx >= Bank_Count()) return;
+    x = MGMT_CARD_LEFT;
+    // Keep an 11px gap below the optional System Info card. The shortened
+    // card ends at y=346 in 1.6 mode, 18px above the status toast at 480i.
+    y = Config_GetSystemCardOn() ? (s_eosMode16 ? 122 : 105) : 105;
+    w = MGMT_CARD_WIDTH;
+    if (y + MGMT_CARD_HEIGHT > g_scrH - 130)
+        y = g_scrH - 130 - MGMT_CARD_HEIGHT;
+    if (y < 79) y = 79;
+    slot = descSlotForBank(idx);
+    state = mgmtVisualSlotState(slot);
+    owner = mgmtSlotOwner(slot);
+
+    if (Bank_IsBoot(idx)) status = "SYSTEM";
+    else if (slot >= 0 && state == EOS_SLOT_SHADOW) status = "RESERVED";
+    else if (Bank_IsLocked(idx)) status = "LOCKED";
+    else if (Bank_Occupied(idx) || (slot >= 0 && state == EOS_SLOT_ANCHOR)) status = "READY";
+    else status = "EMPTY";
+
+    sizeCode = Bank_SizeCode(idx);
+    if (slot >= 0 && state == EOS_SLOT_ANCHOR)
+        sizeCode = s_layout.slot[slot].sizeCode;
+    if (state == EOS_SLOT_SHADOW && owner >= 0)
+        sizeCode = s_layout.slot[owner].sizeCode;
+    size = (state == EOS_SLOT_SHADOW && owner < 0) ? "SHARED" : sizeStr(sizeCode);
+    autoBoot = Bank_IsAutoBoot(idx);
+    autoText = autoBoot ? "ON" : "OFF";
+    ledOn = (slot >= 0 && state != EOS_SLOT_SHADOW && !Bank_IsLocked(idx));
+    ledRgb = ledOn ? s_layout.color[slot] : 0xFFFFFFu;
+    colorText = !ledOn ? "--" : (ledRgb == 0xFFFFFFu ? "OFF" : "SET");
+
+    panel = (EOS_PANEL & 0x00FFFFFF) | 0xCF000000u;
+    edge = (EOS_GLOW & 0x00FFFFFF) | 0x78000000u;
+    rowFace = (EOS_BG & 0x00FFFFFF) | 0x50000000u;
+    Gfx_GlowSoft(x + w / 2, y + 49, w + 13, 118, EOS_GLOW, 19);
+    Gfx_FillRounded(x, y, w, MGMT_CARD_HEIGHT, 12, panel);
+    Font_DrawScaled(x + 16, y + 10, "BANK DETAILS", EOS_WHITE, 0.78f);
+    Gfx_Fill((float)(x + 14), (float)(y + 30), (float)(w - 28), 1.0f, edge);
+    Ui_TextLeftFit(x + 14, y + 37, w - 28, Bank_Name(idx), EOS_WHITE);
+
+    n = 0;
+    bankId[n++] = 'B'; bankId[n++] = 'A'; bankId[n++] = 'N';
+    bankId[n++] = 'K'; bankId[n++] = ' ';
+    num = slot >= 0 ? slot + 1 : idx;
+    if (num >= 10) bankId[n++] = (char)('0' + num / 10);
+    bankId[n++] = (char)('0' + num % 10);
+    if (slot >= 0 && state == EOS_SLOT_SHADOW && owner >= 0) {
+        const char* s = " / PART OF ";
+        while (*s && n < 23) bankId[n++] = *s++;
+        bankId[n++] = (char)('1' + owner);
+    }
+    bankId[n] = 0;
+    Font_DrawScaled(x + 15, y + 65, bankId, EOS_DIM, 0.77f);
+    Gfx_Fill((float)(x + 14), (float)(y + 87), (float)(w - 28), 1.0f, edge);
+
+    Gfx_FillRounded(x + 11, y + 94, w - 22, 63, 8, rowFace);
+    mgmtCardLine(x, y + 97, "STATUS", status, EOS_WHITE);
+    mgmtCardLine(x, y + 117, "SIZE", size, EOS_WHITE);
+    mgmtCardLine(x, y + 137, "AUTO", autoText, autoBoot ? EOS_GLOW : EOS_DIM);
+
+    Font_DrawScaled(x + 16, y + 161, "BANK LED", EOS_DIM, 0.76f);
+    if (ledOn && ledRgb != 0xFFFFFFu) {
+        swatch = 0xFF000000u | (ledRgb & 0xFFFFFFu);
+        Gfx_GlowSoft(x + w - 28, y + 167, 25, 23, swatch, 22);
+        Gfx_FillRounded(x + w - 35, y + 161, 14, 14, 5, swatch);
+    }
+    Font_DrawScaled(x + w - 72, y + 162, colorText, EOS_WHITE, 0.76f);
+
+    Font_DrawScaled(x + 16, y + 181, "SLOT MAP", EOS_DIM, 0.76f);
+    for (i = 0; i < EOS_DESC_SLOTS; ++i) {
+        int ix = x + 15 + i * 39;
+        int st = mgmtVisualSlotState(i);
+        int isMember = (slot >= 0 && owner >= 0 &&
+            mgmtSlotOwner(i) == owner);
+        DWORD fill;
+        if (st == EOS_SLOT_FREE) fill = rowFace;
+        else if (st == EOS_SLOT_SHADOW) fill = (EOS_DIM & 0x00FFFFFF) | 0x78000000u;
+        else fill = (EOS_PURPLE & 0x00FFFFFF) | 0x88000000u;
+        if (isMember) fill = (EOS_PURPLE & 0x00FFFFFF) | 0xE8000000u;
+        Gfx_FillRounded(ix, y + 197, 33, 20, 6, fill);
+        char digit[2] = { (char)('1' + i), 0 };
+        Font_DrawScaled(ix + 12, y + 200, digit,
+            isMember ? EOS_WHITE : EOS_DIM, 0.76f);
+    }
+}
+
 static void BankMgmt_Frame(WORD b)
 {
-    int  n = Bank_Count();
-    int  i;
+    int n = Bank_Count();
+    int i;
+    int cap = (n < EOS_BANK_MAX) ? n : EOS_BANK_MAX;
+    static char rows[EOS_BANK_MAX][64];
+    const char* ptrs[EOS_BANK_MAX];
 
-    if (s_mgmtSel >= n) s_mgmtSel = (n > 0) ? n - 1 : 0;
-
-    if (n > 0) {
-        if (Pressed(b, s_prevBtn, BTN_DPAD_UP))
-            s_mgmtSel = (s_mgmtSel + n - 1) % n;
-        if (Pressed(b, s_prevBtn, BTN_DPAD_DOWN))
-            s_mgmtSel = (s_mgmtSel + 1) % n;
-    }
+    for (i = 0; i < cap; ++i) { buildMgmtRow(rows[i], i); ptrs[i] = rows[i]; }
+    if (s_mgmtSel >= cap) s_mgmtSel = (cap > 0) ? cap - 1 : 0;
+    if (cap > 0)
+        s_mgmtSel = Ui_MenuNavigateInRegion(ptrs, cap, s_mgmtSel,
+            b, s_prevBtn, MGMT_MENU_LEFT, MGMT_MENU_RIGHT);
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_MENU); return; }
 
     if (Pressed(b, s_prevBtn, BTN_X)) {
@@ -2543,13 +2955,17 @@ static void BankMgmt_Frame(WORD b)
             Bank_SetAutoBoot(s_mgmtSel, enable);
             rc = Config_Save();
             if (rc == EOS_FLASH_OK) {
-                SetStatus(enable ? "Auto boot enabled" : "Auto boot disabled");
+                char result[64];
+                int p = appendStr(result, 0, enable ? "Autoboot: Bank " : "Autoboot OFF: Bank ");
+                p = appendBankNumber(result, p, slot + 1);
+                appendStr(result, p, enable ? " selected" : " deselected");
+                SetOperationStatus(result, 0);
             }
             else {
                 // Keep the live table consistent with what remains in flash.
                 Bank_SetAutoBoot(s_mgmtSel, 0);
                 if (oldAuto >= 0) Bank_SetAutoBoot(oldAuto, 1);
-                SetStatus("Auto boot save FAILED");
+                SetOperationStatus("Autoboot save FAILED", 1);
             }
         }
     }
@@ -2586,16 +3002,15 @@ static void BankMgmt_Frame(WORD b)
         hdr[hp++] = (char)("0123456789"[freeSlots & 0x0F]);
         hp = appendStr(hdr, hp, " of 4 free  (1MB budget)");
         hdr[hp] = 0;
-        Font_DrawCentered(0, g_scrW, 92, hdr, EOS_DIM);
+        Ui_TextCenteredFit(MGMT_MENU_LEFT, MGMT_MENU_RIGHT - MGMT_MENU_LEFT,
+            92, hdr, EOS_DIM);
     }
 
-    {
-        static char rows[EOS_BANK_MAX][64];
-        const char* ptrs[EOS_BANK_MAX];
-        int cap = (n < EOS_BANK_MAX) ? n : EOS_BANK_MAX;
-        for (i = 0; i < cap; ++i) { buildMgmtRow(rows[i], i); ptrs[i] = rows[i]; }
-        Ui_Menu3D(ptrs, cap, s_mgmtSel);
-    }
+    // Rebuild names to reflect any live bank state changes above.
+    for (i = 0; i < cap; ++i) buildMgmtRow(rows[i], i);
+    Ui_Menu3DInRegion(ptrs, cap, s_mgmtSel,
+        MGMT_MENU_LEFT, MGMT_MENU_RIGHT);
+    BankMgmt_DrawDetails(s_mgmtSel);
 
     Ui_Footer("A FLASH   X DELETE   Y RENAME   WHITE AUTO BOOT   BLACK LED");
     Gfx_End();
@@ -2739,13 +3154,13 @@ static void DoFlash(int idx, const char* path)
     int  got, rc, sc, n, s;
     char nm[EOS_BANK_NAMELEN];
 
-    if (idx < 0 || Bank_IsLocked(idx)) { SetStatus("Protected bank"); return; }
+    if (idx < 0 || Bank_IsLocked(idx)) { SetOperationStatus("Flash refused: protected bank", 1); return; }
 
     // Read the file. Up to 1MB so a large BIOS can be read even though the
     // target slot's nominal capacity is 256K (it will go to the new region).
     got = File_ReadInto(path, s_imgBuf, EOS_IMG_BUF_MAX);
-    if (got < 0) { SetStatus("Read failed / too big (max 1MB)"); return; }
-    if (got == 0) { SetStatus("Empty file"); return; }
+    if (got < 0) { SetOperationStatus("BIOS file unreadable or exceeds 1 MB", 1); return; }
+    if (got == 0) { SetOperationStatus("BIOS file is empty", 1); return; }
 
     sc = sizeCodeForLen(got);
 
@@ -2763,25 +3178,38 @@ static void DoFlash(int idx, const char* path)
         if (dslot >= 0 && Desc_Load(&s_layout) && s_layout.valid &&
             (s_layout.slot[dslot].state == EOS_SLOT_SHADOW ||
                 s_layout.slot[dslot].state == EOS_SLOT_ANCHOR)) {
-            SetStatus("Bank used by an oversized BIOS - delete it first");
+            SetOperationStatus("Bank belongs to large BIOS: delete first", 1);
             return;
         }
         rc = Flash_WriteImage(Bank_Ef(idx), s_imgBuf, got);
-        if (rc != EOS_FLASH_OK) { SetStatus("Flash FAILED"); return; }
+        if (rc != EOS_FLASH_OK) { SetOperationStatus("256K BIOS program FAILED", 1); return; }
         Bank_SetOccupied(idx, 1, sc);
         if (nm[0]) Bank_SetName(idx, nm);
         // Record this 256K in the descriptor as NATIVE so the budget/auto-place
         // logic sees the slot as consumed. Without this, a later large-bank
         // auto-place would treat this slot as FREE and overwrite it.
-        if (dslot >= 0) {
-            if (!Desc_Load(&s_layout) || !s_layout.valid) Desc_InitEmpty(&s_layout);
-            s_layout.slot[dslot].state = EOS_SLOT_NATIVE;
-            s_layout.slot[dslot].sizeCode = EOS_SZC_256K;
-            s_layout.slot[dslot].physBase = 0;
-            Desc_Save(&s_layout);
+        {
+            int descRc = EOS_FLASH_OK, configRc;
+            char result[64];
+            int p;
+            if (dslot >= 0) {
+                if (!Desc_Load(&s_layout) || !s_layout.valid) Desc_InitEmpty(&s_layout);
+                s_layout.slot[dslot].state = EOS_SLOT_NATIVE;
+                s_layout.slot[dslot].sizeCode = EOS_SZC_256K;
+                s_layout.slot[dslot].physBase = 0;
+                descRc = Desc_Save(&s_layout);
+            }
+            configRc = Config_Save();
+            if (descRc != EOS_FLASH_OK || configRc != EOS_FLASH_OK) {
+                SetOperationStatus("BIOS programmed; metadata save FAILED", 1);
+            }
+            else {
+                p = appendStr(result, 0, "Bank ");
+                p = appendBankNumber(result, p, dslot >= 0 ? dslot + 1 : idx);
+                appendStr(result, p, " programmed (256 KB)");
+                SetOperationStatus(result, 0);
+            }
         }
-        Config_Save();
-        SetStatus("Flashed OK");
         // Option B: flash is fully committed. Offer the LED color picker as an
         // optional trailing step (B backs out without affecting the flash).
         if (s_flashTarget >= 0) {
@@ -2799,7 +3227,7 @@ static void DoFlash(int idx, const char* path)
         int need = Desc_SlotsFor(szc);
         int slot = -1;   // auto-chosen anchor slot
         unsigned int nrbase;
-        int startPage, j;
+        int startPage, j, syncOk;
 
         if (descSlotForBank(idx) < 0) { SetStatus("Not a user bank"); return; }
         if (!Desc_Load(&s_layout) || !s_layout.valid) Desc_InitEmpty(&s_layout);
@@ -2823,7 +3251,8 @@ static void DoFlash(int idx, const char* path)
             }
         }
         if (slot < 0) {
-            SetStatus((szc == EOS_SZC_1MB) ? "1MB needs all banks free" : "No free pair - free some banks");
+            SetOperationStatus((szc == EOS_SZC_1MB) ? "1 MB needs all four banks free"
+                : "512 KB needs a free adjacent bank pair", 1);
             return;
         }
 
@@ -2833,16 +3262,16 @@ static void DoFlash(int idx, const char* path)
             : EOS_NEWRGN_BASE;
         startPage = (int)((nrbase - EOS_NEWRGN_BASE) / 256);
 
-        SetStatus("Writing new region...");
         rc = Flash_WriteImageAtNoSync(EOS_BANK_NEWREGION, startPage, s_imgBuf, got);
-        if (rc != EOS_FLASH_OK) { SetStatus("Flash FAILED (new region)"); return; }
+        if (rc != EOS_FLASH_OK) { SetOperationStatus("Large BIOS program FAILED", 1); return; }
 
         // Page the freshly-written new region into its SDRAM home so the bank is
         // launchable now, without needing a cold power-cycle to re-run preload.
-        Flash_SyncNewRegion();
+        rc = Flash_SyncNewRegion();
         s_extReady = Flash_NewRegionReady();   // retained for HTTP/diagnostic telemetry
+        // Feedback only: preserve the established descriptor and picker flow.
+        syncOk = (rc == EOS_FLASH_OK && s_extReady);
 
-        SetStatus("Writing descriptor...");
         s_layout.slot[slot].state = EOS_SLOT_ANCHOR;
         s_layout.slot[slot].sizeCode = (unsigned char)szc;
         s_layout.slot[slot].physBase = nrbase;
@@ -2851,7 +3280,10 @@ static void DoFlash(int idx, const char* path)
             s_layout.slot[slot + j].sizeCode = EOS_SZC_256K;
             s_layout.slot[slot + j].physBase = 0;
         }
-        if (Desc_Save(&s_layout) != EOS_FLASH_OK) { SetStatus("Descriptor write FAILED"); return; }
+        if (Desc_Save(&s_layout) != EOS_FLASH_OK) {
+            SetOperationStatus("BIOS written; descriptor save FAILED", 1);
+            return;
+        }
 
         // Mark occupancy on the ACTUAL anchor bank (the auto-chosen slot), not
         // the bank the user happened to select. The anchor bank's table index is
@@ -2864,8 +3296,21 @@ static void DoFlash(int idx, const char* path)
                 if (nm[0]) Bank_SetName(anchorTbl, nm);
             }
         }
-        Config_Save();
-        SetStatus("Flashed OK");
+        {
+            int saveRc = Config_Save();
+            char result[64];
+            if (saveRc != EOS_FLASH_OK) {
+                SetOperationStatus("BIOS written; bank info save FAILED", 1);
+            }
+            else if (!syncOk) {
+                SetOperationStatus("BIOS written; SDRAM sync not ready", 1);
+            }
+            else {
+                mgmtFootprintText(result, slot, need);
+                appendStr(result, mLen(result), " programmed");
+                SetOperationStatus(result, 0);
+            }
+        }
         // Option B: flash committed -> optional LED color picker (B = no change).
         // A large BIOS auto-places into an anchor slot that may differ from the
         // originally-selected bank, so color the ACTUAL anchor, not s_flashTarget.
@@ -3155,7 +3600,9 @@ static void Rename_Frame(WORD b)
         Osk_GetText(name, sizeof(name));
         if (name[0]) {                       // empty -> keep the old name
             Bank_SetName(s_renameTarget, name);
-            SetStatus(Config_Save() == EOS_FLASH_OK ? "Renamed" : "Renamed; cfg save FAILED");
+            int saveRc = Config_Save();
+            SetOperationStatus(saveRc == EOS_FLASH_OK ? "Bank name saved"
+                : "Bank renamed locally; save FAILED", saveRc == EOS_FLASH_OK ? 0 : 1);
         }
         GotoPhase(s_renameReturn);
         return;
@@ -3290,6 +3737,7 @@ void __cdecl main() {
         else if (s_phase == PH_FW_RCONFIRM) FwRestConfirm_Frame(uiB);
         else if (s_phase == PH_HDD_TOOLS)   HddTools_Frame(uiB);
         else if (s_phase == PH_HDD_INFO)    HddInfo_Frame(uiB);
+        else if (s_phase == PH_DLC_SIGN)       Dlc_Frame(uiB);
         else if (s_phase == PH_FORMAT)         Format_Frame(uiB);
         else if (s_phase == PH_FORMAT_CONFIRM) FormatConfirm_Frame(uiB);
         else if (s_phase == PH_CLEARCFG)       ClearCfg_Frame(uiB);

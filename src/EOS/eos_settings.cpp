@@ -49,6 +49,13 @@ static int       s_sub = SUB_HUB;
 static int       s_sel = 0;
 static int       s_row = 0;            // row cursor inside an editor
 static int       s_themePreview = 0;
+static int       s_layoutWork = 0; // staged menu layout; saved only on Theme exit
+// Entry snapshots are display-only. Preview/save behavior remains unchanged;
+// these only distinguish a pending selection from the originally saved one.
+static int       s_themeEntered = 0;
+static int       s_layoutEntered = 0;
+static int       s_bgmEntered = 0;
+static const char* s_themeMsg = 0;
 static int       s_bgmWork = 0;   // working bg-music on/off (persisted on exit)
 static int       s_returnTheme = 0;   // 1 = re-enter THEME after the song browser
 static EosThemeEntry s_ctList[32];              // scanned custom themes + source
@@ -128,8 +135,7 @@ static void rowPill(int y, int selected, int dim, const char* label, const char*
 // ---- hub -------------------------------------------------------------------
 static int hubFrame(WORD b, WORD prev)
 {
-    if (Pressed(b, prev, BTN_DPAD_UP))   s_sel = (s_sel + HUB_COUNT - 1) % HUB_COUNT;
-    if (Pressed(b, prev, BTN_DPAD_DOWN)) s_sel = (s_sel + 1) % HUB_COUNT;
+    s_sel = Ui_MenuNavigate(k_hub, HUB_COUNT, s_sel, b, prev);
     if (Pressed(b, prev, BTN_B)) return 1;
     if (Pressed(b, prev, BTN_A)) {
         s_row = 0;
@@ -153,7 +159,7 @@ static int hubFrame(WORD b, WORD prev)
         case 6: s_sub = SUB_SYSINFO; Eeprom_Read(&s_eep); Console_Read(&s_con); break;
         case 7: s_sub = SUB_THEME; themeEnter(); break;
         case 8: s_sub = SUB_VIDEO;  s_vflags = Nvram_GetVideoFlags(); break;
-        case 9: s_sub = SUB_EOS; s_row = 0; s_eosMsg = 0; break;
+        case 9: s_sub = SUB_EOS; s_row = 0; s_eosMsg = 0; Console_Read(&s_con); break;
         }
     }
     titleBar("SETTINGS");
@@ -168,10 +174,16 @@ static int eosSettingsFrame(WORD b, WORD prev)
     int rc;
     int old;
     int want;
+    int rev1011 = s_con.revStr && s_con.revStr[0] == '1' &&
+        s_con.revStr[1] == '.' &&
+        (s_con.revStr[2] == '0' || s_con.revStr[2] == '1') &&
+        s_con.revStr[3] == 0;
+    // Console_Read returns one of Conexant/Focus/Xcalibur for encStr.
+    int supported = rev1011 && s_con.encStr && s_con.encStr[0] == 'C';
 
     if (Pressed(b, prev, BTN_B)) { s_eosMsg = 0; s_sub = SUB_HUB; return 0; }
-    if (Pressed(b, prev, BTN_DPAD_UP))   s_row = (s_row + 1) % 2;
-    if (Pressed(b, prev, BTN_DPAD_DOWN)) s_row = (s_row + 1) % 2;
+    if (Pressed(b, prev, BTN_DPAD_UP)) s_row = (s_row + 2) % 3;
+    if (Pressed(b, prev, BTN_DPAD_DOWN)) s_row = (s_row + 1) % 3;
 
     if (Pressed(b, prev, BTN_A) || Pressed(b, prev, BTN_DPAD_LEFT) || Pressed(b, prev, BTN_DPAD_RIGHT)) {
         if (s_row == 0) {
@@ -186,19 +198,57 @@ static int eosSettingsFrame(WORD b, WORD prev)
                 else { eosHdmiHudHw(old); s_eosMsg = "HDMI HUD save failed"; }
             }
         }
-        else {
+        else if (s_row == 1) {
             want = Config_GetSystemCardOn() ? 0 : 1;
             rc = Config_SetSystemCardOn(want);
             s_eosMsg = (rc == 0) ? (want ? "System info card enabled" : "System info card disabled")
                 : "System info card save failed";
+        }
+        else if (!supported) {
+            s_eosMsg = "HD fix: 1.0/1.1 Conexant only";
+        }
+        else {
+            // The existing gateware patches the BIOS Xcode stream on launch.
+            // The saved opt-out takes effect at the next BIOS bank selection.
+            want = Config_GetHdFixOn() ? 0 : 1;
+            rc = Config_SetHdFixOn(want);
+            s_eosMsg = (rc == 0) ? (want ? "HD fix On - next launch" : "HD fix Off - next launch")
+                : "HD fix preference save failed";
         }
     }
 
     titleBar("EOS SETTINGS");
     rowPill(LIST_Y0, s_row == 0, 0, "HDMI HUD", Config_GetHdmiHudOn() ? "On" : "Off");
     rowPill(LIST_Y0 + LIST_DY, s_row == 1, 0, "System Info Card", Config_GetSystemCardOn() ? "On" : "Off");
-    if (s_eosMsg) Font_DrawCentered(0, g_scrW, LIST_Y0 + LIST_DY * 3, s_eosMsg, EOS_DIM);
-    footer("D-PAD  MOVE / CHANGE      A  TOGGLE      B  BACK");
+    rowPill(LIST_Y0 + LIST_DY * 2, s_row == 2, !supported,
+        "HD Fix (1.0/1.1)", supported ? (Config_GetHdFixOn() ? "On" : "Off") : "N/A");
+
+    // Read-only, selection-specific context. No changes to the toggles,
+    // save timing, hardware checks, or next-launch application of the HD fix.
+    Ui_TextCenteredFit(PILL_X, PILL_W, 262, "ABOUT THIS OPTION", EOS_DIM);
+    if (s_row == 0) {
+        Ui_TextCenteredFit(PILL_X, PILL_W, 292,
+            "Controls the EOS HDMI hardware overlay.", EOS_WHITE);
+    }
+    else if (s_row == 1) {
+        Ui_TextCenteredFit(PILL_X, PILL_W, 292,
+            "Show system information on EOS menus.", EOS_WHITE);
+    }
+    else if (supported) {
+        Ui_TextCenteredFit(PILL_X, PILL_W, 292,
+            "Conexant video initialization fix.", EOS_WHITE);
+        Ui_TextCenteredFit(PILL_X, PILL_W, 320,
+            "Takes effect on the next user BIOS launch.", EOS_DIM);
+    }
+    else {
+        Ui_TextCenteredFit(PILL_X, PILL_W, 292,
+            "Only available on Xbox 1.0/1.1", EOS_DIM);
+        Ui_TextCenteredFit(PILL_X, PILL_W, 320,
+            "with a Conexant video encoder.", EOS_DIM);
+    }
+    if (s_eosMsg)
+        Ui_TextCenteredFit(PILL_X, PILL_W, 357, s_eosMsg, EOS_PURPLE);
+    footer("UP/DN  OPTION     LEFT/RIGHT OR A  TOGGLE     B  BACK");
     return 0;
 }
 
@@ -239,8 +289,10 @@ static int autoBootFrame(WORD b, WORD prev)
 static void infoRow(int idx, const char* label, const char* value)
 {
     int y = INFO_Y0 + idx * INFO_DY;
-    Font_Draw(INFO_LX, y, label, EOS_DIM);
-    Font_Draw(INFO_VX, y, value, EOS_WHITE);
+    // Maintain the existing two-column positions but keep long hardware
+    // identifiers and names inside the design-space safe gutter.
+    Ui_TextLeftFit(INFO_LX, y, INFO_VX - INFO_LX - 18, label, EOS_DIM);
+    Ui_TextLeftFit(INFO_VX, y, g_scrW - INFO_VX - 48, value, EOS_WHITE);
 }
 
 static int sysinfoFrame(WORD b, WORD prev)
@@ -712,6 +764,9 @@ static void themeEnter(void)
     int nb = Theme_Count(), i, src = Config_GetCustomThemeSource();
     s_ctCount = ThemeCustom_Scan(s_ctList, 32);
     s_bgmWork = Config_GetBgmOn();
+    s_layoutWork = Config_GetMenuLayout();
+    if (s_layoutWork < 0 || s_layoutWork > 3) s_layoutWork = 0;
+    s_themeMsg = 0;
     s_row = 0;
     s_themePreview = Theme_Index();
     if (src != EOS_THEME_SOURCE_BUILTIN)
@@ -719,113 +774,155 @@ static void themeEnter(void)
             if (s_ctList[i].source == src && Config_CustomThemeMatches(s_ctList[i].name)) {
                 s_themePreview = nb + i; break;
             }
+    s_themeEntered = s_themePreview;
+    s_layoutEntered = s_layoutWork;
+    s_bgmEntered = s_bgmWork;
 }
 
-// One continuous theme list: built-ins [0..nb-1] then custom disk themes
-// [nb..nb+ctCount-1]. Cycling applies the theme live (built-in palette, or a
-// custom theme's colors + background + music). Custom themes hide the palette
-// swatches and the BGM/Track rows -- their colors and music come from the theme.
+// Four small palette samples shared by built-in and custom themes. Color chips
+// carry no menu actions; all settings continue to use the existing row controls.
+static void themePalettePreview(void)
+{
+    const char* labels[4] = { "ACCENT", "GLOW", "TEXT", "DIM" };
+    DWORD colors[4] = { EOS_PURPLE, EOS_GLOW, EOS_WHITE, EOS_DIM };
+    const int w = 58, gap = 18, y = 300;
+    int i, x = (g_scrW - (w * 4 + gap * 3)) / 2;
+    for (i = 0; i < 4; ++i) {
+        // Small color chips, not selectable menu cells or decorative panels.
+        Gfx_FillRounded(x, y, w, 23, 9, colors[i]);
+        Ui_TextCenteredFit(x - 6, w + 12, y + 32, labels[i], EOS_DIM);
+        x += w + gap;
+    }
+}
+
+// One continuous theme list: built-ins [0..nb-1] then custom HDD/SD themes.
+// Layout is independent of the theme and always visible. Only the pre-existing
+// theme/music options differ by theme source. A/B continue committing + leaving;
+// only the built-in Track row opens the file browser, as in the original flow.
 static int themeFrame(WORD b, WORD prev)
 {
     int nb = Theme_Count();
     int total = nb + s_ctCount;
     int isCustom;
-    char line[96]; int p;
+    int rowCount;
+    int dir;
     const char* nm;
+    const char* tk;
+    const char* base;
+    int j, last;
 
     if (total < 1) total = 1;
     isCustom = (s_themePreview >= nb);
+    // 0 Theme, 1 Layout, [2 BGM, 3 Track] only for built-in themes.
+    rowCount = isCustom ? 2 : 4;
+    if (s_row >= rowCount) s_row = rowCount - 1;
+    if (Pressed(b, prev, BTN_DPAD_UP))
+        s_row = (s_row + rowCount - 1) % rowCount;
+    if (Pressed(b, prev, BTN_DPAD_DOWN))
+        s_row = (s_row + 1) % rowCount;
 
-    // Row navigation: custom = Theme row only; built-in = Theme/BGM/Track.
-    if (!isCustom) {
-        if (Pressed(b, prev, BTN_DPAD_UP))   s_row = (s_row + 2) % 3;
-        if (Pressed(b, prev, BTN_DPAD_DOWN)) s_row = (s_row + 1) % 3;
-    }
-    else {
-        s_row = 0;
-    }
-
-    // Row 0: cycle across built-ins then customs, applying live.
-    if (s_row == 0) {
-        int dir = 0;
-        if (Pressed(b, prev, BTN_DPAD_LEFT))  dir = -1;
-        if (Pressed(b, prev, BTN_DPAD_RIGHT)) dir = +1;
-        if (dir) {
+    dir = 0;
+    if (Pressed(b, prev, BTN_DPAD_LEFT)) dir = -1;
+    if (Pressed(b, prev, BTN_DPAD_RIGHT)) dir = +1;
+    if (dir) {
+        if (s_row == 0) {
             s_themePreview = (s_themePreview + dir + total) % total;
             if (s_themePreview < nb) Theme_Preview(s_themePreview);
-            else ThemeCustom_Apply(s_ctList[s_themePreview - nb].name, s_ctList[s_themePreview - nb].source);
+            else ThemeCustom_Apply(s_ctList[s_themePreview - nb].name,
+                s_ctList[s_themePreview - nb].source);
             isCustom = (s_themePreview >= nb);
-            if (isCustom) s_row = 0;
+            if (isCustom && s_row > 1) s_row = 1;
         }
-    }
-    else if (s_row == 1) {
-        if (Pressed(b, prev, BTN_DPAD_LEFT) || Pressed(b, prev, BTN_DPAD_RIGHT)) s_bgmWork ^= 1;
+        else if (s_row == 1) {
+            // Staged until Theme exit; no flash erase on each Left/Right tap.
+            // Classic / Grid / Bubbles / Orbit. Staged until Theme exit.
+            s_layoutWork = (s_layoutWork + dir + 4) % 4;
+        }
+        else if (s_row == 2 && !isCustom) {
+            s_bgmWork ^= 1;
+        }
+        s_themeMsg = 0;
     }
 
-    // Track browser (built-in row 2 only).
-    if (!isCustom && s_row == 2 && Pressed(b, prev, BTN_A)) {
+    // Existing Track browser flow, now row 3 instead of row 2.
+    if (!isCustom && s_row == 3 && Pressed(b, prev, BTN_A)) {
         s_returnTheme = 1;
         return 2;
     }
 
-    // Commit + leave (B always; A unless on the built-in Track row).
-    if (Pressed(b, prev, BTN_B) || (Pressed(b, prev, BTN_A) && !(!isCustom && s_row == 2))) {
+    // A on a regular row or B commits the theme and layout. This preserves
+    // the original Theme workflow (including B-to-commit) exactly.
+    if (Pressed(b, prev, BTN_B) || Pressed(b, prev, BTN_A)) {
         if (isCustom) {
-            Config_SetCustomTheme(s_ctList[s_themePreview - nb].source, s_ctList[s_themePreview - nb].name);
-            // colors + background already applied; audio resyncs on Settings exit
+            Config_SetCustomTheme(s_ctList[s_themePreview - nb].source,
+                s_ctList[s_themePreview - nb].name);
+            // Colors/background already applied; audio syncs on Settings exit.
         }
         else {
-            Theme_Commit();                 // persist built-in index
+            Theme_Commit();
             Config_SetBgmOn(s_bgmWork);
-            ThemeCustom_Clear();            // -> audio falls back to global BGM
+            ThemeCustom_Clear();
         }
-        s_sub = SUB_HUB;
-        return 0;
+        if (Config_SetMenuLayout(s_layoutWork) != 0) {
+            s_themeMsg = "Menu layout save failed";
+            // Stay in Themes so the user can retry, rather than silently
+            // claiming a new layout has been stored.
+        }
+        else {
+            s_themeMsg = 0;
+            s_sub = SUB_HUB;
+            return 0;
+        }
     }
 
     // ---- draw ----
     titleBar("THEME");
-
-    nm = (s_themePreview < nb) ? Theme_Name(s_themePreview) : s_ctList[s_themePreview - nb].name;
-    {
-        DWORD col = (s_row == 0) ? EOS_WHITE : EOS_DIM;
-        p = sAppendS(line, 0, "Theme:            "); p = sAppendS(line, p, nm ? nm : "?");
-        if (isCustom) p = sAppendS(line, p, s_ctList[s_themePreview - nb].source == EOS_THEME_SOURCE_SD ? " [SD]" : " [HDD]");
-        line[p] = 0;
-        Font_DrawCentered(0, g_scrW, 150, line, col);
-    }
+    nm = (s_themePreview < nb) ? Theme_Name(s_themePreview) :
+        s_ctList[s_themePreview - nb].name;
+    rowPill(97, s_row == 0, 0, "Theme", nm ? nm : "?");
+    rowPill(145, s_row == 1, 0, "Menu Layout",
+        s_layoutWork == 3 ? "Orbit 3D" :
+        s_layoutWork == 2 ? "Floating Bubbles" :
+        s_layoutWork == 1 ? "Dynamic Grid" : "Classic 3D");
 
     if (!isCustom) {
-        const char* tk = Config_GetBgmPath();
-        const char* base; int j, last; DWORD col;
-
-        col = (s_row == 1) ? EOS_WHITE : EOS_DIM;
-        p = sAppendS(line, 0, "Background Music:  "); p = sAppendS(line, p, s_bgmWork ? "On" : "Off"); line[p] = 0;
-        Font_DrawCentered(0, g_scrW, 185, line, col);
-
-        base = tk; last = -1;
+        rowPill(193, s_row == 2, 0, "Background Music", s_bgmWork ? "On" : "Off");
+        tk = Config_GetBgmPath();
+        base = tk;
+        last = -1;
         for (j = 0; tk[j]; ++j) if (tk[j] == '\\' || tk[j] == '/') last = j;
         if (last >= 0) base = tk + last + 1;
-        col = (s_row == 2) ? EOS_WHITE : EOS_DIM;
-        p = sAppendS(line, 0, "Track:            "); p = sAppendS(line, p, (base && base[0]) ? base : "(none)"); line[p] = 0;
-        Font_DrawCentered(0, g_scrW, 220, line, col);
-
-        {
-            int sw = 80, x0 = (g_scrW - (sw * 4 + 30)) / 2, sy = 258;
-            Gfx_FillRounded(x0, sy, sw, 62, 12, EOS_PURPLE);
-            Gfx_FillRounded(x0 + (sw + 10), sy, sw, 62, 12, EOS_WHITE);
-            Gfx_FillRounded(x0 + (sw + 10) * 2, sy, sw, 62, 12, EOS_DIM);
-            Gfx_FillRounded(x0 + (sw + 10) * 3, sy, sw, 62, 12, EOS_PURPLE);
-            Font_DrawCentered(0, g_scrW, sy + 74, "Accent    Text    Dim    Accent", EOS_DIM);
-        }
-        footer("D-PAD  MOVE / CHANGE      A  SELECT      B  BACK");
+        rowPill(241, s_row == 3, 0, "Track", (base && base[0]) ? base : "(none)");
     }
     else {
-        // Custom theme: palette + music come from the theme; controls hidden.
-        Font_DrawCentered(0, g_scrW, 192, "Custom theme", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 224, "Background & music included", EOS_DIM);
-        footer("D-PAD  CHANGE      A  SELECT      B  BACK");
+        // Custom theme defines its own palette and may optionally include
+        // an image or music; do not claim both assets are always present.
+        Ui_TextCenteredFit(PILL_X, PILL_W, 214,
+            s_ctList[s_themePreview - nb].source == EOS_THEME_SOURCE_SD ?
+            "CUSTOM THEME  /  SD" : "CUSTOM THEME  /  HDD", EOS_WHITE);
+        Ui_TextCenteredFit(PILL_X, PILL_W, 252,
+            ThemeCustom_HasMusic() ? "Theme music: available" :
+            "No theme-specific music track", EOS_DIM);
     }
+    themePalettePreview();
+
+    // Clarify what's being previewed without altering Theme_Commit or the
+    // existing A/B-to-save workflow. Layout is staged until exit, while theme
+    // color changes are previewed immediately (and remain uncommitted).
+    if (s_themeMsg)
+        Ui_TextCenteredFit(PILL_X, PILL_W, 376, s_themeMsg, EOS_PURPLE);
+    else if (s_themePreview != s_themeEntered ||
+        s_layoutWork != s_layoutEntered ||
+        (!isCustom && s_bgmWork != s_bgmEntered))
+        Ui_TextCenteredFit(PILL_X, PILL_W, 376,
+            "PREVIEW ACTIVE  -  A / B SAVES", EOS_PURPLE);
+    else
+        Ui_TextCenteredFit(PILL_X, PILL_W, 376,
+            "CURRENT APPEARANCE", EOS_DIM);
+
+    footer(!isCustom && s_row == 3 ?
+        "UP/DN  OPTION     A  BROWSE TRACK     B  SAVE / BACK" :
+        "UP/DN  OPTION     LEFT/RIGHT  CHANGE     A / B  SAVE");
     return 0;
 }
 
@@ -837,7 +934,7 @@ void Settings_Enter(void)
            survived the detour; just land back on the Track row. */
         s_returnTheme = 0;
         s_sub = SUB_THEME;
-        s_row = 2;
+        s_row = 3;
     }
     else {
         s_sub = SUB_HUB;

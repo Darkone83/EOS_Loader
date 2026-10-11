@@ -46,3 +46,14 @@ void Ui_Menu3DBounded(const char** items, int count, int sel, int topY, int bott
 #define UI_PILL_R   19
 #define UI_ROW_DY   46
 #define UI_PILL_BG  EOS_PANEL   /* raised themed panel surface */
+// Navigate a shared menu list using the selected presentation's visible
+// geometry. Classic remains the original Up/Down wrap; Grid uses real rows and
+// columns, with a one-column fallback for long labels. Actions remain caller-owned.
+int Ui_MenuNavigate(const char** items, int count, int sel, WORD now, WORD prev);
+
+// Bank Management-only right-hand drawing region. Navigation uses the same
+// menu items, selection indices, and callbacks as the normal entry points.
+int Ui_MenuNavigateInRegion(const char** items, int count, int sel,
+    WORD now, WORD prev, int left, int right);
+void Ui_Menu3DInRegion(const char** items, int count, int sel,
+    int left, int right);
