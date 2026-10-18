@@ -10,6 +10,8 @@
 #include <xtl.h>
 #include "xboxinternals.h"
 #include "dd_mount.h"
+#include "eos_config.h"  /* EOS-owned saved Drive Setup, bank 0xC */
+#include "eos_hdd.h"     /* physical slave ATA IDENTIFY */
 
 /* STRING (kernel counted-string) and the Io*SymbolicLink externs now come from
    xboxinternals.h. Local alias keeps the existing call sites readable. */
@@ -17,7 +19,7 @@ typedef STRING XBOX_STRING;
 
 struct DriveMap { const char* letter; const char* device; };
 
-static const DriveMap k_drives[] = {
+static const DriveMap k_primaryDrives[] = {
     { "C", "\\Device\\Harddisk0\\Partition2" },
     { "E", "\\Device\\Harddisk0\\Partition1" },
     { "F", "\\Device\\Harddisk0\\Partition6" },
@@ -27,42 +29,177 @@ static const DriveMap k_drives[] = {
     { "Z", "\\Device\\Harddisk0\\Partition5" }
 };
 
-/* Bind every entry in k_drives[]. C/E/F/G are the user partitions; X/Y/Z are
-   the game-cache partitions. We mount them all (the faithful XbDiag behaviour) --
-   they're real volumes the user may legitimately browse, and an absent one
-   (e.g. F:/G: on a stock drive) just symlinks to a device that isn't there, so
-   FindFirstFile fails harmlessly and the scan skips it. */
-#define DD_MOUNT_COUNT  ((int)(sizeof(k_drives) / sizeof(k_drives[0])))
+/* HDD1 aliases intentionally stay out of the normal Xbox drive-letter set.
+   P/Q/R/V map the secondary C/E/F/G volumes respectively. These are also the
+   aliases used by the WebUI, FTP root, Drive Info and file browser. */
+static const DriveMap k_secondaryDrives[] = {
+    { "P", "\\Device\\Harddisk1\\Partition2" }, /* HDD1-C */
+    { "Q", "\\Device\\Harddisk1\\Partition1" }, /* HDD1-E */
+    { "R", "\\Device\\Harddisk1\\Partition6" }, /* HDD1-F */
+    { "V", "\\Device\\Harddisk1\\Partition7" }  /* HDD1-G */
+};
 
-void Mount_HddPartitions(void) {
+#define DD_PRIMARY_COUNT   ((int)(sizeof(k_primaryDrives) / sizeof(k_primaryDrives[0])))
+#define DD_SECONDARY_COUNT ((int)(sizeof(k_secondaryDrives) / sizeof(k_secondaryDrives[0])))
+
+static unsigned int s_hdd1Mask = 0;
+static unsigned int s_hdd1OwnedMask = 0;
+static int s_hdd1AtaPresent = 0;
+
+static void unmountOne(const DriveMap* m)
+{
     char linkBuf[8];
-    int  i, devLen;
+    XBOX_STRING link;
+    linkBuf[0] = '\\'; linkBuf[1] = '?'; linkBuf[2] = '?'; linkBuf[3] = '\\';
+    linkBuf[4] = m->letter[0]; linkBuf[5] = ':'; linkBuf[6] = 0;
+    link.Length = 6; link.MaximumLength = 7; link.Buffer = linkBuf;
+    IoDeleteSymbolicLink(&link);
+}
 
-    for (i = 0; i < DD_MOUNT_COUNT; ++i) {
-        const char* dev = k_drives[i].device;
+/* Match PrometheOS drive::mount(): link a kernel partition object, then
+   verify it with GetDiskFreeSpaceExA. Do not claim success on alias alone. */
+static int mountOne(const DriveMap* m, int requirePresent, int alreadyOwned)
+{
+    char linkBuf[8];
+    char root[4];
+    int devLen;
+    XBOX_STRING sLink;
+    XBOX_STRING sDev;
+    ULARGE_INTEGER totalBytes;
 
-        /* "\??\X:" -- 6 chars, plus NUL */
-        linkBuf[0] = '\\'; linkBuf[1] = '?'; linkBuf[2] = '?'; linkBuf[3] = '\\';
-        linkBuf[4] = k_drives[i].letter[0];
-        linkBuf[5] = ':';  linkBuf[6] = '\0';
+    if (!m) return 0;
+    linkBuf[0] = '\\'; linkBuf[1] = '?'; linkBuf[2] = '?'; linkBuf[3] = '\\';
+    linkBuf[4] = m->letter[0]; linkBuf[5] = ':'; linkBuf[6] = 0;
+    devLen = 0; while (m->device[devLen]) ++devLen;
+    sLink.Length = 6; sLink.MaximumLength = 7; sLink.Buffer = linkBuf;
+    sDev.Length = (USHORT)devLen; sDev.MaximumLength = (USHORT)(devLen + 1);
+    sDev.Buffer = (char*)m->device;
 
-        devLen = 0; while (dev[devLen]) devLen++;
-
-        {
-            XBOX_STRING sLink = { 6, 7, linkBuf };
-            XBOX_STRING sDev = { (USHORT)devLen, (USHORT)(devLen + 1), (char*)dev };
-            /* Delete any existing mapping first, then create ours. Cerbios and
-               other loaders may leave E:/F:/G: pointing at the wrong device (or
-               unmapped), and a bare IoCreateSymbolicLink on an already-bound
-               letter returns 0xC0000035 and is ignored -- so without the delete
-               the stale/missing mapping wins and only C: (which the kernel binds
-               for us) ever resolves. Deleting first makes our known-good
-               partition map authoritative. A delete on an unbound letter just
-               fails harmlessly. */
-            IoDeleteSymbolicLink(&sLink);
-            IoCreateSymbolicLink(&sLink, &sDev);
+    /* Never tear down a volume which EOS itself already mounted and which
+       may have active file handles (FTP, browser, WebUI). */
+    if (!alreadyOwned) {
+        if (IoCreateSymbolicLink(&sLink, &sDev) != 0) {
+            /* Do not replace unknown pre-existing P/Q/R/V aliases. */
+            return 0;
         }
     }
+    if (!requirePresent) return 1;
+
+    root[0] = m->letter[0]; root[1] = ':'; root[2] = '\\'; root[3] = 0;
+    totalBytes.QuadPart = 0;
+    if (GetDiskFreeSpaceExA(root, 0, &totalBytes, 0) && totalBytes.QuadPart != 0)
+        return 1;
+
+    /* The alias was ours, so cleanup cannot remove a foreign link. */
+    IoDeleteSymbolicLink(&sLink);
+    return 0;
+}
+
+void Mount_UnmountHddPartitionsForDisk(int disk)
+{
+    int i;
+    if (disk == 0) {
+        for (i = 0; i < DD_PRIMARY_COUNT; ++i)
+            unmountOne(&k_primaryDrives[i]);
+        return;
+    }
+    if (disk != 1) return;
+    /* Leave HDD0 mounted while an explicitly selected HDD1 is formatted. */
+    for (i = 0; i < DD_SECONDARY_COUNT; ++i)
+        if (s_hdd1OwnedMask & (1u << i)) unmountOne(&k_secondaryDrives[i]);
+    s_hdd1OwnedMask = 0;
+    s_hdd1Mask = 0;
+}
+
+void Mount_UnmountHddPartitions(void)
+{
+    Mount_UnmountHddPartitionsForDisk(0);
+    Mount_UnmountHddPartitionsForDisk(1);
+}
+
+void Mount_HddPartitions(void)
+{
+    int i;
+    EosHddInfo info;
+    unsigned long long sectors = 0;
+    unsigned int nextMask = 0;
+
+    /* Existing primary handling is preserved, but active aliases are no
+       longer torn down on every refresh. */
+    for (i = 0; i < DD_PRIMARY_COUNT; ++i)
+        mountOne(&k_primaryDrives[i], 0, 0);
+
+    /* Apply the EOS flash-backed Drive Setup value, rather than merely
+       displaying/saving it. Mode 3 enables probing the IDE slave. */
+    if (Config_GetDriveSetup() != EOS_DRIVE_DUAL_HDD) {
+        for (i = 0; i < DD_SECONDARY_COUNT; ++i)
+            if (s_hdd1OwnedMask & (1u << i)) unmountOne(&k_secondaryDrives[i]);
+        s_hdd1Mask = 0;
+        s_hdd1OwnedMask = 0;
+        s_hdd1AtaPresent = 0;
+        return;
+    }
+
+    s_hdd1AtaPresent = (Hdd_IdentifyDisk(1, &info, &sectors) == HDD_OK && sectors > 0);
+    if (!s_hdd1AtaPresent) {
+        for (i = 0; i < DD_SECONDARY_COUNT; ++i)
+            if (s_hdd1OwnedMask & (1u << i)) unmountOne(&k_secondaryDrives[i]);
+        s_hdd1Mask = 0;
+        s_hdd1OwnedMask = 0;
+        return;
+    }
+
+    for (i = 0; i < DD_SECONDARY_COUNT; ++i) {
+        unsigned int bit = 1u << i;
+        if (mountOne(&k_secondaryDrives[i], 1, (s_hdd1OwnedMask & bit) != 0)) {
+            nextMask |= bit;
+            s_hdd1OwnedMask |= bit;
+        }
+        else s_hdd1OwnedMask &= ~bit;
+    }
+    s_hdd1Mask = nextMask;
+}
+
+int Mount_Hdd1AtaPresent(void) { return s_hdd1AtaPresent; }
+
+unsigned int Mount_Hdd1MappedMask(void)
+{
+    return s_hdd1Mask;
+}
+
+int Mount_Hdd1Available(void)
+{
+    return s_hdd1Mask ? 1 : 0;
+}
+
+char Mount_Hdd1AliasForPart(char part)
+{
+    if (part >= 'a' && part <= 'z') part = (char)(part - 32);
+    if (part == 'C') return 'P';
+    if (part == 'E') return 'Q';
+    if (part == 'F') return 'R';
+    if (part == 'G') return 'V';
+    return 0;
+}
+
+char Mount_Hdd1PartForAlias(char alias)
+{
+    if (alias >= 'a' && alias <= 'z') alias = (char)(alias - 32);
+    if (alias == 'P') return 'C';
+    if (alias == 'Q') return 'E';
+    if (alias == 'R') return 'F';
+    if (alias == 'V') return 'G';
+    return 0;
+}
+
+static const char* deviceForDrive(char drive)
+{
+    int i;
+    for (i = 0; i < DD_PRIMARY_COUNT; ++i)
+        if (k_primaryDrives[i].letter[0] == drive) return k_primaryDrives[i].device;
+    for (i = 0; i < DD_SECONDARY_COUNT; ++i)
+        if (k_secondaryDrives[i].letter[0] == drive) return k_secondaryDrives[i].device;
+    return 0;
 }
 
 /*---------------------------------------------------------------------------
@@ -125,6 +262,9 @@ int Mount_LaunchXbe(const char* dosPath) {
     char        linkBuf[8];
 
     if (!dosPath || !dosPath[0]) return 1;
+    len = 0; while (dosPath[len]) ++len;
+    if (len <= 3 || dosPath[1] != ':' || (dosPath[2] != '\\' && dosPath[2] != '/')) return 3;
+
     drive = (dosPath[0] >= 'a' && dosPath[0] <= 'z')
         ? (char)(dosPath[0] - 32) : dosPath[0];
 
@@ -138,20 +278,26 @@ int Mount_LaunchXbe(const char* dosPath) {
         device = "\\Device\\Cdrom0";
     }
     else {
-        for (i = 0; i < 7; ++i)
-            if (k_drives[i].letter[0] == drive) { device = k_drives[i].device; break; }
+        device = deviceForDrive(drive);
     }
     if (!device) return 2;
 
-    len = 0; while (dosPath[len]) len++;
     lastBs = -1;
     for (i = 0; i < len; ++i) if (dosPath[i] == '\\') lastBs = i;
-    if (lastBs < 2) return 3;               /* need at least "X:\file" */
+    if (lastBs < 2 || lastBs >= len - 1) return 3; /* need at least "X:\file" */
 
-    /* devPath = partition device + the directory part after "X:" (indices 2..lastBs) */
+    /* devPath = device prefix + directory part after "X:". Refuse a path that
+       does not fit rather than mounting a silently truncated directory. */
     j = 0;
-    while (device[j] && j < (int)sizeof(devPath) - 1) { devPath[j] = device[j]; j++; }
-    for (k = 2; k < lastBs && j < (int)sizeof(devPath) - 1; ++k) devPath[j++] = dosPath[k];
+    while (device[j]) {
+        if (j >= (int)sizeof(devPath) - 1) return 3;
+        devPath[j] = device[j];
+        j++;
+    }
+    for (k = 2; k < lastBs; ++k) {
+        if (j >= (int)sizeof(devPath) - 1) return 3;
+        devPath[j++] = dosPath[k];
+    }
     devPath[j] = '\0';
 
     /* remap "\??\D:" -> devPath */
@@ -162,16 +308,31 @@ int Mount_LaunchXbe(const char* dosPath) {
         XBOX_STRING sLink = { 6, 7, linkBuf };
         XBOX_STRING sDev = { (USHORT)devLen, (USHORT)(devLen + 1), devPath };
         IoDeleteSymbolicLink(&sLink);
-        if (IoCreateSymbolicLink(&sLink, &sDev) != 0) return 4;
+        if (IoCreateSymbolicLink(&sLink, &sDev) != 0) {
+            /* D: was removed before the failed remap; put DarkDash back on its
+               own asset directory before returning to the caller. */
+            Mount_SelfToD();
+            return 4;
+        }
     }
 
     /* build "D:\<filename>" from the part after the last backslash */
+    /* A FATX leaf should already be small, but keep this exact: never turn an
+       overlong launch request into a different/truncated filename. */
+    if ((len - (lastBs + 1)) + 3 >= (int)sizeof(launchPath)) {
+        Mount_SelfToD();
+        return 3;
+    }
     k = 0;
     launchPath[k++] = 'D'; launchPath[k++] = ':'; launchPath[k++] = '\\';
-    for (i = lastBs + 1; dosPath[i] && k < (int)sizeof(launchPath) - 1; ++i)
+    for (i = lastBs + 1; dosPath[i]; ++i)
         launchPath[k++] = dosPath[i];
     launchPath[k] = '\0';
 
     XLaunchNewImage(launchPath, NULL);
-    return 5;                               /* only reached if the launch failed */
+
+    /* A successful launch never returns. If it does, immediately restore the
+       dashboard's asset mount before the caller resumes rendering. */
+    Mount_SelfToD();
+    return 5;
 }

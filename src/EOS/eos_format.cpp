@@ -2,18 +2,26 @@
     eos_format.cpp -- HDD staging (partition + format a fresh drive).
 
     Ported from the PrometheOS harddrive formatDrive path. Supports the
-    explicitly selected Xbox kernel Harddisk0 or Harddisk1 device. Staging
-    does not read the LBA48 patch table; it builds a fresh standard layout:
+    explicitly selected Xbox kernel Harddisk0 or Harddisk1 device. Detection
+    now follows PrometheOS readLbaInfo(): open Partition0, query geometry,
+    query the LBA48 patch via 0xCAFEBABE, validate its magic/version, and read
+    the live partition-table metadata before building a fresh layout:
 
-        geometry   : IOCTL_DISK_GET_DRIVE_GEOMETRY  -> total sectors
+        probe      : PrometheOS readLbaInfo() path
+        geometry   : IOCTL_DISK_GET_DRIVE_GEOMETRY -> total sectors
+        lba48      : IOCTL_CMD_LBA48_ACCESS -> patch metadata/table pointer
         table      : build standard Xbox layout (E,C,X,Y,Z,[F])
         write      : table -> Partition0 sector 0  +  backup at end of disk
         format     : XapiFormatFATVolumeEx each partition (+ F: cluster fixup)
-        mount      : recreate the \??\<letter>: symlinks
+        verify     : physical readback; no HDD1 kernel mount required
 
     No CRT, no heap. The partition table is exactly one sector (512 bytes).
 ---------------------------------------------------------------------------*/
 #include "eos_format.h"
+#include "eos_hdd.h"
+#ifndef EOS_HOST_TEST
+#include "dd_mount.h"      /* remount detected HDD1 immediately after format */
+#endif
 
 #ifndef EOS_HOST_TEST
 #include <xtl.h>
@@ -82,6 +90,18 @@ typedef struct {
 #define EOS_IOCTL_DISK_GET_DRIVE_GEOMETRY 0x00070000UL
 #define EOS_IOCTL_SUBCMD_GET_INFO          0UL
 
+/* PrometheOS / CerBIOS LBA48 patch query. */
+#define EOS_IOCTL_CMD_LBA48_ACCESS               0xCAFEBABEUL
+#define EOS_LBA48_GET_INFO_MAGIC1_IDX            0
+#define EOS_LBA48_GET_INFO_MAGIC1_VAL            0xCAFEBABEUL
+#define EOS_LBA48_GET_INFO_MAGIC2_IDX            1
+#define EOS_LBA48_GET_INFO_MAGIC2_VAL            0xBABEFACEUL
+#define EOS_LBA48_GET_INFO_PATCHCODE_VERSION_IDX 2
+#define EOS_LBA48_GET_INFO_LOWCODE_BASE_IDX      3
+#define EOS_LBA48_GET_INFO_HIGHCODE_BASE_IDX     4
+#define EOS_LBA48_GET_INFO_PATCHSEG_SIZE_IDX     5
+#define EOS_LBA48_GET_INFO_PART_TABLE_OFS_IDX    6
+
 /* drive letters that make up the standard layout, in table order +1 */
 static const char s_lyrLetter[6] = { 'E','C','X','Y','Z','F' };
 static const int  s_lyrPartNum[6] = { 1,  2,  3,  4,  5,  6 };
@@ -96,6 +116,7 @@ typedef struct {
 /* ---- no-CRT helpers ----------------------------------------------------- */
 static void fmtMemSet(void* d, int v, int n) { unsigned char* p = (unsigned char*)d; int i; for (i = 0; i < n; ++i) p[i] = (unsigned char)v; }
 static int  fmtMemCmp(const void* a, const void* b, int n) { const unsigned char* x = (const unsigned char*)a, * y = (const unsigned char*)b; int i; for (i = 0; i < n; ++i) if (x[i] != y[i]) return (int)x[i] - (int)y[i]; return 0; }
+static void fmtMemCopy(void* d, const void* s, int n) { unsigned char* x = (unsigned char*)d; const unsigned char* y = (const unsigned char*)s; int i; for (i = 0; i < n; ++i) x[i] = y[i]; }
 static int  fmtFirstSetBit(unsigned long v) { int s = 0; if (!v) return 0; while (((v >> s) & 1UL) == 0 && s < 31) ++s; return s; }
 
 /* "\Device\Harddisk0\PartitionN" -> dst(>=32) */
@@ -135,6 +156,32 @@ static unsigned long fmtCalcClusterKB(unsigned long long lbaSizeSectors)
     return kb;
 }
 
+
+/* FATX metadata sizing used by both the raw formatter and host regression
+   tests. This mirrors nxdk's nxFormatVolume layout with 4 KiB alignment. */
+static int fmtFatxPlan(unsigned long long partSectors, unsigned long clusterBytes,
+    unsigned long long* fatSectors, unsigned long* rootSectors, int* fat16)
+{
+    unsigned long clusterSectors;
+    unsigned long long numClusters;
+    unsigned long long fatBytes;
+    unsigned long entryBytes;
+
+    if (clusterBytes < 512UL || (clusterBytes & 511UL) != 0) return 0;
+    clusterSectors = clusterBytes / 512UL;
+    if (clusterSectors == 0) return 0;
+    numClusters = partSectors / (unsigned long long)clusterSectors + 1ULL;
+    entryBytes = (numClusters < 65520ULL) ? 2UL : 4UL;
+    fatBytes = numClusters * (unsigned long long)entryBytes;
+    fatBytes = (fatBytes + 4095ULL) & ~4095ULL;
+    if (8ULL + (fatBytes / 512ULL) + (unsigned long long)clusterSectors >= partSectors)
+        return 0;
+    if (fatSectors) *fatSectors = fatBytes / 512ULL;
+    if (rootSectors) *rootSectors = clusterSectors;
+    if (fat16) *fat16 = (entryBytes == 2UL) ? 1 : 0;
+    return 1;
+}
+
 /* Build the standard Xbox table for a disk of totalSectors. F: takes the
    remainder past DATA_F_START, minus one sector reserved for the backup table. */
 static void fmtBuildTable(unsigned long long totalSectors, int disk, EosPartTable* t)
@@ -167,33 +214,175 @@ const char* Format_ErrStr(int code)
     case FMT_ERR_FORMAT:return "Partition format failed";
     case FMT_ERR_FIXUP: return "Cluster fixup failed";
     case FMT_ERR_TARGET:return "Drive target changed / unsupported sector size";
+    case FMT_ERR_BOOTSTRAP:return "Blank-disk partition bootstrap failed";
+    case FMT_ERR_VERIFY:   return "Disk written; FATX verification failed";
     default:            return "Unknown error";
+    }
+}
+
+/* ---- read-only probe diagnostics --------------------------------------- */
+static FormatProbeInfo s_probe[2] = { {0}, {0} };
+static int s_lastFailurePartition = 0;
+
+static void fmtProbeReset(int disk)
+{
+    if (disk < 0 || disk > 1) return;
+    s_probe[disk].stage = FMT_PROBE_NONE;
+    s_probe[disk].openStatus = 0;
+    s_probe[disk].geometryStatus = 0;
+    s_probe[disk].lba48Status = 0;
+    s_probe[disk].lba48Magic1 = 0;
+    s_probe[disk].lba48Magic2 = 0;
+    s_probe[disk].lba48Version = 0;
+    s_probe[disk].sectors = 0;
+    s_probe[disk].bytesPerSector = 0;
+    s_probe[disk].ataResult = HDD_ERR_NODISK;
+    s_probe[disk].ataSectors = 0;
+    s_probe[disk].ataSizeMB = 0;
+}
+
+int Format_GetProbeInfo(int disk, FormatProbeInfo* out)
+{
+    if (!out || disk < 0 || disk > 1) return 0;
+    *out = s_probe[disk];
+    return 1;
+}
+
+int Format_GetLastFailurePartition(void)
+{
+    return s_lastFailurePartition;
+}
+
+const char* Format_ProbeStageStr(int stage)
+{
+    switch (stage) {
+    case FMT_PROBE_OPEN_FAIL:     return "NtOpenFile failed";
+    case FMT_PROBE_GEOM_FAIL:     return "Geometry IOCTL failed";
+    case FMT_PROBE_LBA48_FAIL:    return "LBA48 info IOCTL failed";
+    case FMT_PROBE_LBA48_MAGIC:   return "LBA48 patch magic invalid";
+    case FMT_PROBE_GEOM_OK:       return "PrometheOS probe returned";
+    case FMT_PROBE_BPS_FAIL:      return "Bytes/sector rejected";
+    case FMT_PROBE_CAPACITY_FAIL: return "Capacity rejected";
+    case FMT_PROBE_OK:            return "Detected / geometry valid";
+    case FMT_PROBE_ATA_FAIL:      return "ATA IDENTIFY failed";
+    case FMT_PROBE_BOOTSTRAP:       return "Raw ATA formatter selected";
+    case FMT_PROBE_VERIFY_FAIL:    return "Raw FATX verification failed";
+    default:                        return "Not probed";
     }
 }
 
 #ifndef EOS_HOST_TEST
 /* ---- device-side primitives -------------------------------------------- */
-static int fmtReadGeometry(int disk, unsigned long long* totalSectors, unsigned long* bytesPerSector)
+static int fmtReadLbaInfo(int disk, EosPartTable* liveTable,
+    unsigned long long* totalSectors, unsigned long* bytesPerSector,
+    unsigned int* patchVersion)
 {
-    STRING dev; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK iosb; HANDLE h; NTSTATUS st;
-    EOS_DISK_GEOMETRY g; unsigned int geomIn[100]; char path[40];
-    fmtDevicePath(disk, 0, path); RtlInitAnsiString(&dev, path);
-    oa.RootDirectory = 0; oa.ObjectName = &dev; oa.Attributes = OBJ_CASE_INSENSITIVE;
-    st = NtOpenFile(&h, (GENERIC_READ | 0x00100000), &oa, &iosb, (FILE_SHARE_READ | FILE_SHARE_WRITE), 0x10);
-    if (st != STATUS_SUCCESS) return 0;
+    STRING dev;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK iosb;
+    HANDLE h;
+    NTSTATUS st;
+    unsigned int lbaIn[100];
+    unsigned int lbaOut[100];
+    unsigned int geomIn[100];
+    unsigned int partitionTableAddr;
+    EOS_DISK_GEOMETRY g;
+    unsigned int bps;
+    const char* path;
 
-    /* Match PrometheOS/XBpartitioner here.  Both issue the geometry query with
-       a 100-DWORD GET_INFO input buffer; EOS previously passed NULL/0.  Keep
-       the request shape identical to the known-good large-drive path. */
+    EosHddInfo ataInfo;
+    unsigned long long ataSectors;
+    int ataRc;
+
+    if (disk < 0 || disk > 1) return 0;
+    fmtProbeReset(disk);
+    if (liveTable) fmtMemSet(liveTable, 0, sizeof(EosPartTable));
+
+    /* Prove the physical master/slave exists before asking for partition objects. */
+    fmtMemSet(&ataInfo, 0, sizeof(ataInfo));
+    ataSectors = 0;
+    ataRc = Hdd_IdentifyDisk(disk, &ataInfo, &ataSectors);
+    s_probe[disk].ataResult = ataRc;
+    s_probe[disk].ataSectors = ataSectors;
+    s_probe[disk].ataSizeMB = ataInfo.sizeMB;
+    if (ataRc != HDD_OK || !ataInfo.present || ataSectors == 0) {
+        s_probe[disk].stage = FMT_PROBE_ATA_FAIL;
+        return 0;
+    }
+
+    /* Keep the kernel-object portion aligned with PrometheOS readLbaInfo(). */
+    path = (disk == 0)
+        ? "\\Device\\Harddisk0\\partition0"
+        : "\\Device\\Harddisk1\\partition0";
+
+    RtlInitAnsiString(&dev, path);
+    oa.RootDirectory = 0;
+    oa.ObjectName = &dev;
+    oa.Attributes = OBJ_CASE_INSENSITIVE;
+
+    st = NtOpenFile(&h, (GENERIC_READ | 0x00100000), &oa, &iosb,
+        (FILE_SHARE_READ | FILE_SHARE_WRITE), 0x10);
+    s_probe[disk].openStatus = (unsigned int)st;
+    if (st != STATUS_SUCCESS) {
+        s_probe[disk].stage = FMT_PROBE_OPEN_FAIL;
+        return 0;
+    }
+
     fmtMemSet(geomIn, 0, sizeof(geomIn));
     geomIn[0] = (unsigned int)EOS_IOCTL_SUBCMD_GET_INFO;
     fmtMemSet(&g, 0, sizeof(g));
-    st = NtDeviceIoControlFile(h, 0, 0, 0, &iosb, EOS_IOCTL_DISK_GET_DRIVE_GEOMETRY,
+
+    st = NtDeviceIoControlFile(h, 0, 0, 0, &iosb,
+        EOS_IOCTL_DISK_GET_DRIVE_GEOMETRY,
         geomIn, sizeof(geomIn), &g, sizeof(g));
+    s_probe[disk].geometryStatus = (unsigned int)st;
+    if (st != STATUS_SUCCESS) {
+        NtClose(h);
+        s_probe[disk].stage = FMT_PROBE_GEOM_FAIL;
+        return 0;
+    }
+
+    bps = g.BytesPerSector ? (unsigned int)g.BytesPerSector : 512U;
+    s_probe[disk].sectors = (unsigned long long)g.Cylinders.QuadPart;
+    s_probe[disk].bytesPerSector = bps;
+
+    fmtMemSet(lbaIn, 0, sizeof(lbaIn));
+    lbaIn[0] = (unsigned int)EOS_IOCTL_SUBCMD_GET_INFO;
+    fmtMemSet(lbaOut, 0, sizeof(lbaOut));
+
+    st = NtDeviceIoControlFile(h, 0, 0, 0, &iosb,
+        EOS_IOCTL_CMD_LBA48_ACCESS,
+        lbaIn, sizeof(lbaIn), lbaOut, sizeof(lbaOut));
+    s_probe[disk].lba48Status = (unsigned int)st;
     NtClose(h);
-    if (st != STATUS_SUCCESS) return 0;
-    if (totalSectors)   *totalSectors = (unsigned long long)g.Cylinders.QuadPart;
-    if (bytesPerSector) *bytesPerSector = g.BytesPerSector ? g.BytesPerSector : 512;
+
+    if (st != STATUS_SUCCESS) {
+        s_probe[disk].stage = FMT_PROBE_LBA48_FAIL;
+        return 0;
+    }
+
+    s_probe[disk].lba48Magic1 = lbaOut[EOS_LBA48_GET_INFO_MAGIC1_IDX];
+    s_probe[disk].lba48Magic2 = lbaOut[EOS_LBA48_GET_INFO_MAGIC2_IDX];
+    s_probe[disk].lba48Version = lbaOut[EOS_LBA48_GET_INFO_PATCHCODE_VERSION_IDX];
+
+    if (s_probe[disk].lba48Magic1 != EOS_LBA48_GET_INFO_MAGIC1_VAL ||
+        s_probe[disk].lba48Magic2 != EOS_LBA48_GET_INFO_MAGIC2_VAL) {
+        s_probe[disk].stage = FMT_PROBE_LBA48_MAGIC;
+        return 0;
+    }
+
+    partitionTableAddr = lbaOut[EOS_LBA48_GET_INFO_LOWCODE_BASE_IDX];
+    partitionTableAddr += lbaOut[EOS_LBA48_GET_INFO_PART_TABLE_OFS_IDX];
+    if (s_probe[disk].lba48Version == 2U)
+        partitionTableAddr += 0x200U;
+
+    if (liveTable && partitionTableAddr != 0U)
+        fmtMemCopy(liveTable, (const void*)partitionTableAddr, sizeof(EosPartTable));
+
+    if (totalSectors) *totalSectors = s_probe[disk].sectors;
+    if (bytesPerSector) *bytesPerSector = bps;
+    if (patchVersion) *patchVersion = s_probe[disk].lba48Version;
+    s_probe[disk].stage = FMT_PROBE_GEOM_OK;
     return 1;
 }
 
@@ -265,28 +454,135 @@ static int fmtLargeFixup(int disk, unsigned long long lbaStart, unsigned long cl
     return ok;
 }
 
-static void fmtUnmount(int disk, char letter, int partNum)
+
+static void fmtPut16(unsigned char* p, unsigned short v)
 {
-    STRING dev, mnt; char dp[40], mp[8];
-    fmtDevicePath(disk, partNum, dp); fmtMountPath(letter, mp);
-    RtlInitAnsiString(&dev, dp); RtlInitAnsiString(&mnt, mp);
-    if (disk == 0) IoDeleteSymbolicLink(&mnt);          /* best effort */
-    IoDismountVolumeByName(&dev);        /* best effort */
+    p[0] = (unsigned char)(v & 0xFFU);
+    p[1] = (unsigned char)((v >> 8) & 0xFFU);
 }
-static void fmtMount(int disk, char letter, int partNum)
+
+static void fmtPut32(unsigned char* p, unsigned long v)
 {
-    STRING dev, mnt; char dp[40], mp[8];
-    fmtDevicePath(disk, partNum, dp); fmtMountPath(letter, mp);
-    RtlInitAnsiString(&dev, dp); RtlInitAnsiString(&mnt, mp);
-    if (disk == 0) IoCreateSymbolicLink(&mnt, &dev);
+    p[0] = (unsigned char)(v & 0xFFUL);
+    p[1] = (unsigned char)((v >> 8) & 0xFFUL);
+    p[2] = (unsigned char)((v >> 16) & 0xFFUL);
+    p[3] = (unsigned char)((v >> 24) & 0xFFUL);
 }
+
+/* Raw FATX formatter for a partition whose kernel device object does not yet
+   exist. Layout is intentionally the same as nxdk's nxFormatVolume:
+     4 KiB superblock, aligned FAT, one empty root-directory cluster.
+   Only filesystem metadata is written; the full partition is not zeroed. */
+static int fmtRawFatxPartition(int disk, unsigned long long start,
+    unsigned long long sizeSectors, unsigned long clusterBytes, unsigned long volumeId)
+{
+    unsigned char sec[512];
+    unsigned char verify[512];
+    unsigned long long fatSectors;
+    unsigned long rootSectors;
+    unsigned long long fatStart;
+    unsigned long long rootStart;
+    int fat16;
+
+    if (!fmtFatxPlan(sizeSectors, clusterBytes, &fatSectors, &rootSectors, &fat16))
+        return 0;
+
+    /* Superblock: first 4 KiB is 0xFF except the FATX header. */
+    fmtMemSet(sec, 0xFF, 512);
+    sec[0] = 'F'; sec[1] = 'A'; sec[2] = 'T'; sec[3] = 'X';
+    fmtPut32(sec + 4, volumeId);
+    fmtPut32(sec + 8, clusterBytes / 512UL);
+    fmtPut32(sec + 12, 1UL);
+    fmtPut16(sec + 16, 0);
+    if (Hdd_WriteSector(disk, start, sec) != HDD_OK) return 0;
+    fmtMemSet(sec, 0xFF, 512);
+    if (Hdd_WriteRepeatSectors(disk, start + 1ULL, 7UL, sec) != HDD_OK) return 0;
+
+    /* FAT begins immediately after the 4 KiB superblock. */
+    fatStart = start + 8ULL;
+    fmtMemSet(sec, 0, 512);
+    if (fat16) {
+        sec[0] = 0xF8; sec[1] = 0xFF;
+        sec[2] = 0xFF; sec[3] = 0xFF;
+    }
+    else {
+        sec[0] = 0xF8; sec[1] = 0xFF; sec[2] = 0xFF; sec[3] = 0xFF;
+        sec[4] = 0xFF; sec[5] = 0xFF; sec[6] = 0xFF; sec[7] = 0xFF;
+    }
+    if (Hdd_WriteSector(disk, fatStart, sec) != HDD_OK) return 0;
+    fmtMemSet(sec, 0, 512);
+    if (fatSectors > 1ULL) {
+        if (fatSectors - 1ULL > 0xFFFFFFFFULL) return 0;
+        if (Hdd_WriteRepeatSectors(disk, fatStart + 1ULL,
+            (unsigned long)(fatSectors - 1ULL), sec) != HDD_OK) return 0;
+    }
+
+    /* Empty root directory cluster follows the FAT and is all 0xFF. */
+    rootStart = fatStart + fatSectors;
+    fmtMemSet(sec, 0xFF, 512);
+    if (Hdd_WriteRepeatSectors(disk, rootStart, rootSectors, sec) != HDD_OK) return 0;
+
+    /* Cheap readback catches addressing/drive-selection mistakes immediately. */
+    if (Hdd_ReadSector(disk, start, verify) != HDD_OK) return 0;
+    if (verify[0] != 'F' || verify[1] != 'A' || verify[2] != 'T' || verify[3] != 'X') return 0;
+    if (((unsigned long)verify[8] | ((unsigned long)verify[9] << 8) |
+        ((unsigned long)verify[10] << 16) | ((unsigned long)verify[11] << 24)) !=
+        clusterBytes / 512UL) return 0;
+    return 1;
+}
+
+/* Complete a physically present drive in one pass: table at LBA0, FATX
+   metadata for every active partition, backup table at the final physical
+   sector. No kernel volume mount or reboot is required. */
+static int fmtRawFormatDisk(int disk, unsigned long long total, const EosPartTable* table)
+{
+    unsigned char verify[512];
+    FILETIME ft;
+    unsigned long volumeBase;
+    int i;
+
+    if (!table || total < (unsigned long long)DATA_F_START) return FMT_ERR_TARGET;
+
+    if (Hdd_WriteSector(disk, 0, (const unsigned char*)table) != HDD_OK)
+        return FMT_ERR_TABLE;
+    if (Hdd_ReadSector(disk, 0, verify) != HDD_OK || fmtMemCmp(verify, table, 512) != 0)
+        return FMT_ERR_TABLE;
+
+    KeQuerySystemTime(&ft);
+    volumeBase = ft.dwLowDateTime;
+
+    for (i = 0; i < 14; ++i) {
+        const EosPartEntry* e = &table->TableEntries[i];
+        unsigned long long size;
+        unsigned long clusterBytes;
+        if (e->Flags == EOS_PART_NOTINUSE) continue;
+        size = fmtGetSize(e);
+        clusterBytes = fmtCalcClusterKB(size) << 10;
+        if (!fmtRawFatxPartition(disk, fmtGetStart(e), size, clusterBytes,
+            volumeBase ^ (0x9E3779B9UL * (unsigned long)(i + 1)))) {
+            s_lastFailurePartition = i + 1;
+            return FMT_ERR_FORMAT;
+        }
+    }
+
+    /* PrometheOS keeps a backup copy at the physical end of the disk. */
+    if (Hdd_WriteSector(disk, total - 1ULL, (const unsigned char*)table) != HDD_OK)
+        return FMT_ERR_TABLE;
+    if (Hdd_ReadSector(disk, total - 1ULL, verify) != HDD_OK ||
+        fmtMemCmp(verify, table, 512) != 0) return FMT_ERR_TABLE;
+
+    /* Best effort cache flush. Readback above has already validated addressing. */
+    Hdd_FlushDisk(disk);
+    return FMT_OK;
+}
+
 #endif /* !EOS_HOST_TEST */
 
 int Format_PlanInfoForDisk(int disk, unsigned long* totalMB,
     unsigned long* dataEMB, unsigned long* driveFMB, unsigned long long* sectors)
 {
 #ifdef EOS_HOST_TEST
-    (void)disk;
+    if (disk >= 0 && disk <= 1) fmtProbeReset(disk);
     if (totalMB) *totalMB = 0;
     if (dataEMB) *dataEMB = (unsigned long)(DATA_E_SIZE / 2048);
     if (driveFMB) *driveFMB = 0;
@@ -295,11 +591,48 @@ int Format_PlanInfoForDisk(int disk, unsigned long* totalMB,
 #else
     unsigned long long total = 0;
     unsigned long bps = 0;
+    unsigned int patchVersion = 0;
+    EosPartTable liveTable;
     if (disk != 0 && disk != 1) return 0;
-    if (!fmtReadGeometry(disk, &total, &bps)) return 0;
-    /* The table and backup occupy 512-byte sectors; don't accept a geometry
-       that cannot hold the fixed C/E/cache regions, or a non-512 sector disk. */
-    if (bps != 512 || total <= DATA_E_START + DATA_E_SIZE + 1ULL) return 0;
+    if (disk == 1) {
+        EosHddInfo info;
+        unsigned long long ataSectors = 0;
+        fmtProbeReset(1);
+        fmtMemSet(&info, 0, sizeof(info));
+        s_probe[1].ataResult = Hdd_IdentifyDisk(1, &info, &ataSectors);
+        s_probe[1].ataSectors = ataSectors;
+        s_probe[1].ataSizeMB = info.sizeMB;
+        if (s_probe[1].ataResult != HDD_OK || !ataSectors) {
+            s_probe[1].stage = FMT_PROBE_ATA_FAIL;
+            return 0;
+        }
+        total = ataSectors;
+        bps = 512; // ATA PIO interface addresses 512-byte logical sectors.
+        s_probe[1].sectors = total;
+        s_probe[1].bytesPerSector = bps;
+        s_probe[1].stage = FMT_PROBE_BOOTSTRAP;
+    }
+    else if (!fmtReadLbaInfo(disk, &liveTable, &total, &bps, &patchVersion)) {
+        /* A blank/unregistered drive may have no Partition0 object. ATA
+           IDENTIFY is authoritative; formatting uses raw FATX metadata writes.
+           Mounting is attempted immediately after the completed format. */
+        if (s_probe[disk].ataResult != HDD_OK || s_probe[disk].ataSectors == 0) return 0;
+        total = s_probe[disk].ataSectors;
+        bps = 512;
+        s_probe[disk].stage = FMT_PROBE_BOOTSTRAP;
+    }
+    /* PrometheOS permits a stock-size drive whose total sector count ends
+       exactly where the optional F partition would begin. */
+    if (bps != 512) {
+        s_probe[disk].stage = FMT_PROBE_BPS_FAIL;
+        return 0;
+    }
+    if (total < (unsigned long long)DATA_F_START) {
+        s_probe[disk].stage = FMT_PROBE_CAPACITY_FAIL;
+        return 0;
+    }
+    if (s_probe[disk].stage != FMT_PROBE_BOOTSTRAP)
+        s_probe[disk].stage = FMT_PROBE_OK;
     if (totalMB) *totalMB = (unsigned long)(total / 2048ULL);
     if (dataEMB) *dataEMB = (unsigned long)(DATA_E_SIZE / 2048);
     if (driveFMB) *driveFMB = (total > DATA_F_START + 1ULL)
@@ -321,21 +654,79 @@ int Format_StageDriveChecked(int disk, unsigned long long expectedSectors)
     return FMT_ERR_GEOM; /* never simulate success for destructive operations */
 #else
     EosPartTable table;
+    EosPartTable liveTable;
     unsigned long long total = 0;
     unsigned long bps = 0;
+    unsigned int patchVersion = 0;
     int i, rc = FMT_OK;
 
+    s_lastFailurePartition = 0;
     if (disk != 0 && disk != 1) return FMT_ERR_TARGET;
-    if (!expectedSectors || !fmtReadGeometry(disk, &total, &bps)) return FMT_ERR_GEOM;
+    if (!expectedSectors) return FMT_ERR_TARGET;
+
+    /* HDD1 preparation is strictly physical ATA/LBA. Do not open any
+       \Device\Harddisk1\PartitionN path: the kernel may not expose it.
+       This is the same raw path which previously prepared the test drive. */
+    if (disk == 1) {
+        EosHddInfo info;
+        unsigned long long sectors = 0;
+        EosHddRawPartitionInfo checked[HDD_PART_MAX];
+        int tableState = 0, mode = 0, count, j, foundC = 0, foundE = 0, foundF = 0;
+        int rawRc;
+        fmtMemSet(&info, 0, sizeof(info));
+        if (Hdd_IdentifyDisk(1, &info, &sectors) != HDD_OK ||
+            sectors != expectedSectors || sectors < (unsigned long long)DATA_F_START)
+            return FMT_ERR_TARGET;
+        fmtBuildTable(sectors, 1, &table);
+        s_probe[1].stage = FMT_PROBE_BOOTSTRAP;
+        rawRc = fmtRawFormatDisk(1, sectors, &table);
+        if (rawRc != FMT_OK) return rawRc;
+        // Validate freshly-written on-disk state without a kernel mount.
+        count = Hdd_GetRawPartitionsForDisk(1, sectors, checked,
+            HDD_PART_MAX, &tableState, &mode);
+        for (j = 0; j < count; ++j) {
+            if (checked[j].fatxStatus != HDD_RAW_FATX_VALID) continue;
+            if (checked[j].partition == 'C') foundC = 1;
+            if (checked[j].partition == 'E') foundE = 1;
+            if (checked[j].partition == 'F') foundF = 1;
+        }
+        if (tableState != HDD_RAW_TABLE_VALID || mode != 2 ||
+            !foundC || !foundE ||
+            (sectors > (unsigned long long)DATA_F_START + 1ULL && !foundF)) {
+            s_probe[1].stage = FMT_PROBE_VERIFY_FAIL;
+            return FMT_ERR_VERIFY;
+        }
+        s_probe[1].stage = FMT_PROBE_OK;
+        return FMT_OK;
+    }
+
+    if (!fmtReadLbaInfo(disk, &liveTable, &total, &bps, &patchVersion)) {
+        int rawRc;
+        /* Primary-drive compatibility fallback: when the kernel lacks
+           Partition0, revalidate the physical ATA target and write/verify
+           the standard Xbox table/FATX metadata directly. */
+        if (s_probe[disk].ataResult != HDD_OK || s_probe[disk].ataSectors != expectedSectors ||
+            expectedSectors < (unsigned long long)DATA_F_START) return FMT_ERR_TARGET;
+        total = s_probe[disk].ataSectors;
+        fmtBuildTable(total, disk, &table);
+        rawRc = fmtRawFormatDisk(disk, total, &table);
+        if (rawRc != FMT_OK) return rawRc;
+
+        /* The raw formatter has written/verified the partition layout. A
+           missing kernel mount is NOT a formatting failure. */
+        if (disk == 0) Mount_HddPartitions();
+        s_probe[disk].stage = FMT_PROBE_OK;
+        return FMT_OK;
+    }
     /* Revalidate the same disk/size on the final confirm. No implicit fallback
-       to Harddisk0 if Harddisk1 disappears between the plan and the write. */
+       to the other physical device if the selected target changes. */
     if (total != expectedSectors || bps != 512 ||
-        total <= DATA_E_START + DATA_E_SIZE + 1ULL) return FMT_ERR_TARGET;
+        total < (unsigned long long)DATA_F_START) return FMT_ERR_TARGET;
 
     fmtBuildTable(total, disk, &table);
-    /* Disk 1 has no E:/C:/F: mapping in the EOS loader. Dismount native
-       partitions only; do not tear down disk 0 symlinks or data access. */
-    for (i = 0; i < 6; ++i) fmtUnmount(disk, s_lyrLetter[i], s_lyrPartNum[i]);
+    /* PrometheOS semantics: release DOS aliases only, not HDD volume objects.
+       Reset EOS-owned mount state before the table/volume rewrite. */
+    Mount_UnmountHddPartitionsForDisk(disk);
 
     if (!fmtWriteTable(disk, &table)) { rc = FMT_ERR_TABLE; goto remount; }
 
@@ -351,19 +742,15 @@ int Format_StageDriveChecked(int disk, unsigned long long expectedSectors)
         fmtDevicePath(disk, i + 1, dp);
         RtlInitAnsiString(&devStr, dp);
         ok = XapiFormatFATVolumeEx(&devStr, clusterBytes);
-        if (ok == FALSE) { rc = FMT_ERR_FORMAT; goto remount; }
+        if (ok == FALSE) { s_lastFailurePartition = i + 1; rc = FMT_ERR_FORMAT; goto remount; }
         if (i >= 5 && !fmtLargeFixup(disk, fmtGetStart(e), clusterBytes)) {
+            s_lastFailurePartition = i + 1;
             rc = FMT_ERR_FIXUP; goto remount;
         }
     }
 remount:
-    if (disk == 0) {  /* preserve original primary drive mount behavior */
-        for (i = 0; i < 6; ++i) {
-            EosPartEntry* e = &table.TableEntries[i];
-            if (e->Flags != EOS_PART_NOTINUSE)
-                fmtMount(0, s_lyrLetter[i], s_lyrPartNum[i]);
-        }
-    }
+    /* Restore existing HDD0 aliases on the kernel-backed primary path. */
+    Mount_HddPartitions();
     return rc;
 #endif
 }
@@ -447,18 +834,69 @@ int main(void)
         }
     }
 
+    /* Secondary large-drive regression: FATX mode 2 retains the full 48-bit
+       F size; this specifically exercises LBASizeHi above the 2 TiB boundary. */
+    {
+        unsigned long long total = 7812500000ULL; /* 4 TB decimal */
+        unsigned long long want = total - DATA_F_START - 1ULL;
+        fmtBuildTable(total, 1, &t);
+        if (t.FatxMode != 2) { printf("FAIL 4TB secondary fatxmode\n"); ++fails; }
+        if (fmtGetSize(&t.TableEntries[5]) != want) {
+            printf("FAIL 4TB secondary F size %llX want %llX\n",
+                fmtGetSize(&t.TableEntries[5]), want); ++fails;
+        }
+        if (t.TableEntries[5].LBASizeHi == 0) {
+            printf("FAIL 4TB secondary high LBA size not encoded\n"); ++fails;
+        }
+    }
+
     /* cluster doubling threshold is 0x20000000 sectors (256 GB) */
     if (fmtCalcClusterKB(0x20000000ULL) != 16) { printf("FAIL cluster @256G\n"); ++fails; }
     if (fmtCalcClusterKB(0x20000001ULL) != 32) { printf("FAIL cluster >256G\n"); ++fails; }
     if (fmtCalcClusterKB(0x40000001ULL) != 64) { printf("FAIL cluster >512G\n"); ++fails; }
     if (fmtCalcClusterKB(0x80000001ULL) != 128) { printf("FAIL cluster >1T\n"); ++fails; }
 
-    /* small drive below F start -> no F entry */
+    /* stock-size 8 GB geometry: total ends exactly at DATA_F_START.
+       This is a valid C/E/cache-only layout and must not invent F:. */
+    {
+        unsigned long long total = (unsigned long long)DATA_F_START;
+        fmtBuildTable(total, 1, &t);
+        if (t.FatxMode != 2) { printf("FAIL stock secondary fatxmode\n"); ++fails; }
+        if (t.TableEntries[5].Flags != EOS_PART_NOTINUSE) { printf("FAIL stock-size F present\n"); ++fails; }
+        fails += chkEntry(&t, 0, "XBOX DATA E", DATA_E_START, DATA_E_SIZE);
+    }
+
+    /* small drive below F start -> no F entry (builder-only regression;
+       runtime validation correctly rejects a disk this small). */
     {
         unsigned long long total = DATA_F_START - 100ULL;
         fmtBuildTable(total, 0, &t);
         if (t.TableEntries[5].Flags != EOS_PART_NOTINUSE) { printf("FAIL small-drive F present\n"); ++fails; }
         fails += chkEntry(&t, 0, "XBOX DATA E", DATA_E_START, DATA_E_SIZE);  /* E still there */
+    }
+
+    /* Raw FATX metadata plan regression. Even on an 8 TB F partition the
+       metadata region stays below LBA28, while the end-of-disk backup uses the
+       generic LBA48 single-sector writer. */
+    {
+        static const unsigned long long totals[] = {
+            1953125000ULL, 3906250000ULL, 7812500000ULL, 15625000000ULL
+        };
+        int n;
+        for (n = 0; n < 4; ++n) {
+            unsigned long long fs = totals[n] - DATA_F_START - 1ULL;
+            unsigned long cb = fmtCalcClusterKB(fs) << 10;
+            unsigned long long fatSec = 0;
+            unsigned long rootSec = 0;
+            int fat16 = 0;
+            if (!fmtFatxPlan(fs, cb, &fatSec, &rootSec, &fat16)) {
+                printf("FAIL raw FATX plan %d\n", n); ++fails;
+            }
+            else if ((unsigned long long)DATA_F_START + 8ULL + fatSec + rootSec >= 0x10000000ULL) {
+                printf("FAIL raw FATX metadata exceeds LBA28 %d\n", n); ++fails;
+            }
+            if (fat16) { printf("FAIL large F unexpectedly FATX16 %d\n", n); ++fails; }
+        }
     }
 
     /* device/mount path building */

@@ -6,6 +6,7 @@
 #include <xtl.h>
 #include "xboxinternals.h"
 #include "eos_sdcard.h"
+#include "dd_mount.h"
 #endif
 #include "eos_webfiles.h"
 
@@ -20,29 +21,21 @@ static int weq(const char* a, const char* b) { int i = 0; while (a[i] && b[i]) {
 static int wpref(const char* a, const char* b) { int i = 0; while (b[i]) { if (upper(a[i]) != upper(b[i]))return 0; ++i; }return 1; }
 static int isName(const char* s) { int i, n = wlen(s); if (!n || n > 63 || (n == 1 && s[0] == '.') || (n == 2 && s[0] == '.' && s[1] == '.') || s[n - 1] == ' ' || s[n - 1] == '.')return 0; for (i = 0; i < n; i++) { unsigned char c = (unsigned char)s[i]; if (c < 32 || c == 127 || c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|' || c == '%')return 0; }return 1; }
 
-// Reserved secondary DOS letters. Never replace a pre-existing symlink: this
-// is used only if the running BIOS actually exposes HDD1 partitions.
+// Reserved secondary DOS letters shared with dd_mount. The loader owns the
+// mappings centrally; WebUI only consumes the resulting availability mask.
 static const char kHdd1Alias[4] = { 'P','Q','R','V' };
 static const char kHdd1Part[4] = { 'C','E','F','G' };
-static const int  kHdd1Num[4] = { 2,1,6,7 };
 static unsigned char s_hdd1Mapped[4] = { 0,0,0,0 };
-static int s_hdd1Checked = 0;
 static void secondaryEnsure(void)
 {
-    if (s_hdd1Checked)return;
-    s_hdd1Checked = 1;
-    for (int i = 0; i < 4; ++i) {
-        char alias[7] = { '\\','?','?','\\',kHdd1Alias[i],':',0 };
-        char device[40] = "\\Device\\Harddisk1\\Partition";
-        int j = wlen(device); device[j++] = (char)('0' + kHdd1Num[i]); device[j] = 0;
-        STRING ln = { (USHORT)6,(USHORT)7,alias };
-        STRING dn = { (USHORT)wlen(device),(USHORT)(wlen(device) + 1),device };
-        if (IoCreateSymbolicLink(&ln, &dn) == 0) {
-            char root[4] = { kHdd1Alias[i],':','\\',0 };
-            if (GetFileAttributesA(root) != 0xFFFFFFFFUL)s_hdd1Mapped[i] = 1;
-            else IoDeleteSymbolicLink(&ln);
-        }
-    }
+    int i;
+    unsigned int mask = 0;
+#ifndef EOS_WEBFILES_HOST_TEST
+    /* Loader startup/settings own the actual symlinks. WebUI only consumes the
+       current central mask so it cannot remap drives during active file I/O. */
+    mask = Mount_Hdd1MappedMask();
+#endif
+    for (i = 0; i < 4; ++i)s_hdd1Mapped[i] = (mask & (1u << i)) ? 1 : 0;
 }
 
 struct WfPath { char native[EOS_WF_PATH]; char base[EOS_WF_PATH]; int sd; int root; int writable; };
@@ -549,10 +542,10 @@ int Wf_DownloadRead(char* out, int cap)
 }
 void Wf_Shutdown(void)
 {
+    int i;
     Wf_UploadAbort(); Wf_DownloadClose(); treeClose(); s_treeState = 0; s_treeLevel = -1;
-    for (int i = 0; i < 4; ++i)if (s_hdd1Mapped[i]) {
-        char alias[7] = { '\\','?','?','\\',kHdd1Alias[i],':',0 }; STRING ln = { (USHORT)6,(USHORT)7,alias };
-        IoDeleteSymbolicLink(&ln); s_hdd1Mapped[i] = 0;
-    }
-    s_hdd1Checked = 0;
+    /* HDD aliases are loader-global and may be in use by FTP/file browsing;
+       WebUI no longer owns or removes them. */
+    for (i = 0; i < 4; ++i)s_hdd1Mapped[i] = 0;
+
 }

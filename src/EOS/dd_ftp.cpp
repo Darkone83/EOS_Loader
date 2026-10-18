@@ -12,6 +12,7 @@
 //               (AUTH/PBSZ/PROT/EPSV/REST/ALLO acknowledged but not fully implemented)
 
 #include "dd_ftp.h"
+#include "dd_mount.h"     /* primary + detected HDD1 aliases */
 #include "dd_net.h"       /* Net_Ip / Net_IsUp (deferred start) */
 #include <xtl.h>
 #include <winsockx.h>
@@ -49,10 +50,10 @@ static void IntToStr(int v, char* buf, int bufLen) {
 // Constants
 // ============================================================================
 
-/* control port + credentials come from dd_data (Data_Get()) */
 #define FTP_DATA_PORT_BASE   2024
 #define FTP_DATA_PORT_COUNT  32
 #define FTP_MAX_PATH         256    // max path length used in FTP operations
+#define FTP_PATH_PATTERN_MAX (FTP_MAX_PATH + 4)
 #define FTP_IDLE_TIMEOUT_MS  300000UL  // drop an idle control connection after 5 min
 
 // ============================================================================
@@ -86,27 +87,51 @@ void FtpServ_TruncName(const char* src, char* dst, int maxChars, int dstLen)
     }
 }
 
+// Local bounded path helpers. Kept here so FTP does not depend on the
+// DarkDash dd_path/dd_fileops modules that are not part of EOS Loader.
+static int FtpPathLen(const char* s)
+{
+    int n = 0; if (!s) return 0; while (s[n]) ++n; return n;
+}
+
+static int FtpPathCopy(char* dst, int cap, const char* src)
+{
+    int i = 0;
+    if (!dst || cap <= 0 || !src) return 0;
+    while (src[i] && i < cap - 1) { dst[i] = src[i]; ++i; }
+    dst[i] = 0;
+    return src[i] == 0;
+}
+
+static int FtpPathJoin(char* dst, int cap, const char* a, const char* b)
+{
+    int n, i = 0;
+    if (!FtpPathCopy(dst, cap, a)) return 0;
+    n = FtpPathLen(dst);
+    if (n > 0 && dst[n - 1] != '\\' && dst[n - 1] != '/') {
+        if (n >= cap - 1) return 0;
+        dst[n++] = '\\'; dst[n] = 0;
+    }
+    while (b && b[i]) {
+        if (n >= cap - 1) return 0;
+        dst[n++] = b[i++];
+    }
+    dst[n] = 0;
+    return 1;
+}
+
 // ============================================================================
 // Module state
 // ============================================================================
 
-/* ---- session pool + shared listener (2-session model) -------------------
-   The proven engine body refers to g_ftp throughout; we point g_ftp at the
-   session currently being serviced and tick each slot in turn. The listener is
-   shared -- one bind on the control port, accepted clients land in a free slot. */
-static FtpCtx  s_sess[FTP_MAX_SESSIONS];
-static FtpCtx* s_cur = &s_sess[0];
-static SOCKET  s_listen = INVALID_SOCKET;
-#define g_ftp (*s_cur)
-
-/* ---- credentials / control port (replaces dd_data Data_Get) ------------- */
-static char s_ftpUser[32] = "xbox";
-static char s_ftpPass[32] = "xbox";
-static int  s_ftpPort = 21;
+FtpCtx g_ftp;
 
 static int  s_nextDataPort = 0;
 static char s_ipStr[20];
 static bool s_ipOK = false;
+static char s_ftpUser[32] = "xbox";
+static char s_ftpPass[32] = "xbox";
+static int  s_ftpPort = 21;
 
 // ============================================================================
 // FTP helpers
@@ -276,67 +301,69 @@ static bool FtpAppendListLine(const char* name, bool isDir, DWORD sizeLow)
 
 void FtpServ_Start(const char* ipStr, bool ipOK)
 {
-    int i;
-    DWORD reuse; u_long nb; SOCKADDR_IN sa; int port;
+    // Refresh primary and secondary HDD aliases before exposing the FTP root.
+    Mount_HddPartitions();
 
+    // Store network state from FileExplorer
     s_ipOK = ipOK;
     if (ipStr) { int _i = 0; while (ipStr[_i] && _i < 19) { s_ipStr[_i] = ipStr[_i]; ++_i; } s_ipStr[_i] = '\0'; }
 
-    // Init the whole session pool to free/closed.
-    for (i = 0; i < FTP_MAX_SESSIONS; ++i)
-    {
-        ZeroMemory(&s_sess[i], sizeof(FtpCtx));
-        s_sess[i].ctrlSock = INVALID_SOCKET;
-        s_sess[i].dataListen = INVALID_SOCKET;
-        s_sess[i].dataSock = INVALID_SOCKET;
-        s_sess[i].xferFile = INVALID_HANDLE_VALUE;
-        s_sess[i].state = FTP_OFF;
-    }
-    s_cur = &s_sess[0];
-    s_listen = INVALID_SOCKET;
-    s_nextDataPort = 0;            // reset passive-port rotation on each start
+    ZeroMemory(&g_ftp, sizeof(g_ftp));
+    g_ftp.listenSock = INVALID_SOCKET;
+    g_ftp.ctrlSock = INVALID_SOCKET;
+    g_ftp.dataListen = INVALID_SOCKET;
+    g_ftp.dataSock = INVALID_SOCKET;
+    g_ftp.xferFile = INVALID_HANDLE_VALUE;
+    s_nextDataPort = 0;  // reset port rotation on each server start
 
-    if (!s_ipOK) return;          // no network yet
+    if (!s_ipOK) return;  // no network
 
-    s_listen = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s_listen == INVALID_SOCKET) return;
+    g_ftp.listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (g_ftp.listenSock == INVALID_SOCKET) return;
 
-    reuse = 1;
-    setsockopt(s_listen, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
-    nb = 1;
-    ioctlsocket(s_listen, FIONBIO, &nb);
+    DWORD reuse = 1;
+    setsockopt(g_ftp.listenSock, SOL_SOCKET, SO_REUSEADDR,
+        (const char*)&reuse, sizeof(reuse));
 
+    u_long nb = 1;
+    ioctlsocket(g_ftp.listenSock, FIONBIO, &nb);
+
+    SOCKADDR_IN sa;
     ZeroMemory(&sa, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_addr.s_addr = INADDR_ANY;
-    port = s_ftpPort;
-    if (port < 1 || port > 65535) port = 21;
-    sa.sin_port = htons((u_short)port);
-
-    // Backlog covers both sessions plus the transient secondary connects clients open.
-    if (bind(s_listen, (SOCKADDR*)&sa, sizeof(sa)) != 0 ||
-        listen(s_listen, FTP_MAX_SESSIONS + 3) != 0)
     {
-        closesocket(s_listen);
-        s_listen = INVALID_SOCKET;
+        int port = s_ftpPort;
+        if (port < 1 || port > 65535) port = 21;
+        sa.sin_port = htons((u_short)port);
+    }
+
+    if (bind(g_ftp.listenSock, (SOCKADDR*)&sa, sizeof(sa)) != 0 ||
+        listen(g_ftp.listenSock, 5) != 0)
+    {
+        closesocket(g_ftp.listenSock);
+        g_ftp.listenSock = INVALID_SOCKET;
         return;
     }
+
+    // Always start in virtual root — MapFtpPath converts at filesystem boundaries
+    g_ftp.atVirtualRoot = true;
+    StrCopy(g_ftp.cwd, sizeof(g_ftp.cwd), "/");
+    g_ftp.state = FTP_LISTEN;
 }
 
 // Stop FTP server — close all sockets
 void FtpServ_Stop()
 {
-    int i;
-    for (i = 0; i < FTP_MAX_SESSIONS; ++i)
+    if (g_ftp.xferFile != INVALID_HANDLE_VALUE)
     {
-        FtpCtx* c = &s_sess[i];
-        if (c->xferFile != INVALID_HANDLE_VALUE) { CloseHandle(c->xferFile); c->xferFile = INVALID_HANDLE_VALUE; }
-        if (c->dataSock != INVALID_SOCKET) { closesocket(c->dataSock);   c->dataSock = INVALID_SOCKET; }
-        if (c->dataListen != INVALID_SOCKET) { closesocket(c->dataListen); c->dataListen = INVALID_SOCKET; }
-        if (c->ctrlSock != INVALID_SOCKET) { closesocket(c->ctrlSock);   c->ctrlSock = INVALID_SOCKET; }
-        c->state = FTP_OFF;
+        CloseHandle(g_ftp.xferFile); g_ftp.xferFile = INVALID_HANDLE_VALUE;
     }
-    if (s_listen != INVALID_SOCKET) { closesocket(s_listen); s_listen = INVALID_SOCKET; }
+    if (g_ftp.dataSock != INVALID_SOCKET) { closesocket(g_ftp.dataSock);   g_ftp.dataSock = INVALID_SOCKET; }
+    if (g_ftp.dataListen != INVALID_SOCKET) { closesocket(g_ftp.dataListen); g_ftp.dataListen = INVALID_SOCKET; }
+    if (g_ftp.ctrlSock != INVALID_SOCKET) { closesocket(g_ftp.ctrlSock);   g_ftp.ctrlSock = INVALID_SOCKET; }
+    if (g_ftp.listenSock != INVALID_SOCKET) { closesocket(g_ftp.listenSock); g_ftp.listenSock = INVALID_SOCKET; }
+    g_ftp.state = FTP_OFF;
 }
 
 // Clean a virtual FTP path.
@@ -346,10 +373,13 @@ void FtpServ_Stop()
 // - Rejects components containing Windows-illegal chars (* ? " < > |).
 // - Accepts ANY other name: _folder, .hidden, __temp, F:, etc.
 // - Result always starts with '/' and has no trailing '/'.
-static void CleanVirtualPath(const char* virtualPath, char* out, int outLen)
+static int CleanVirtualPath(const char* virtualPath, char* out, int outLen)
 {
     int  oi = 0;
     const char* p = virtualPath;
+
+    if (!out || outLen < 2) return 0;
+    out[0] = '\0';
 
     while (*p)
     {
@@ -357,11 +387,15 @@ static void CleanVirtualPath(const char* virtualPath, char* out, int outLen)
         while (*p == '/' || *p == '\\') p++;
         if (!*p) break;
 
-        // Extract next component
+        // Extract next component. Refuse an overlong component rather than
+        // silently converting it into a different path.
         char tok[FTP_MAX_PATH];
         int  ti = 0;
-        while (*p && *p != '/' && *p != '\\' && ti < (int)sizeof(tok) - 1)
+        while (*p && *p != '/' && *p != '\\')
+        {
+            if (ti >= (int)sizeof(tok) - 1) return 0;
             tok[ti++] = *p++;
+        }
         tok[ti] = '\0';
 
         if (tok[0] == '\0')
@@ -382,68 +416,120 @@ static void CleanVirtualPath(const char* virtualPath, char* out, int outLen)
         }
 
         // Reject Windows-illegal chars (colon is allowed: needed for "F:")
-        bool bad = false;
         for (int i = 0; tok[i]; i++)
         {
             char c = tok[i];
             if (c == '*' || c == '?' || c == '"' ||
                 c == '<' || c == '>' || c == '|')
-            {
-                bad = true; break;
-            }
+                return 0;
         }
-        if (bad) continue;
 
-        // Append /component
-        if (oi < outLen - 1) out[oi++] = '/';
-        for (int i = 0; tok[i] && oi < outLen - 1; i++)
-            out[oi++] = tok[i];
+        // Append /component exactly; never truncate.
+        if (oi + 1 + ti >= outLen) return 0;
+        out[oi++] = '/';
+        for (int i = 0; tok[i]; i++) out[oi++] = tok[i];
     }
 
-    if (oi == 0) { out[0] = '/'; out[1] = '\0'; return; }
+    if (oi == 0) { out[0] = '/'; out[1] = '\0'; return 1; }
     out[oi] = '\0';
+    return 1;
 }
 
 
-static void ResolveRelative(const char* cwd, const char* arg, char* out, int outLen)
+static int ResolveRelative(const char* cwd, const char* arg, char* out, int outLen)
 {
     if (arg[0] != '/') {
-        // relative — join with backslash then clean
+        // Max accepted cwd + separator + arg fits exactly in this scratch buffer.
         char tmp[FTP_MAX_PATH * 2];
+        int need = FtpPathLen(cwd) + 1 + FtpPathLen(arg);
+        if (need >= (int)sizeof(tmp)) return 0;
         StrCopy(tmp, sizeof(tmp), cwd);
         FtpServ_AppendStr(tmp, sizeof(tmp), "\\");
         FtpServ_AppendStr(tmp, sizeof(tmp), arg);
-        CleanVirtualPath(tmp, out, outLen);
+        return CleanVirtualPath(tmp, out, outLen);
     }
-    else {
-        // absolute virtual path — clean as-is
-        CleanVirtualPath(arg, out, outLen);
-    }
+    // absolute virtual path — clean as-is
+    return CleanVirtualPath(arg, out, outLen);
 }
 
 // Port of PrometheOS mapFtpPath (simplified for bare drive-letter virtual paths).
-// "/F:/Apps/Type D" -> "F:\Apps\Type D"
+// "/F:/Apps/Type D" -> "F:\\Apps\\Type D"
 // "/" -> "/"  (virtual root — caller must check)
-static void MapFtpPath(const char* virt, char* out, int outLen)
+static int MapFtpPath(const char* virt, char* out, int outLen)
 {
     const char* a = (virt[0] == '/') ? virt + 1 : virt;
+    int alen = FtpPathLen(a);
 
-    StrCopy(out, outLen, a);
-    for (int i = 0; out[i]; i++) if (out[i] == '/') out[i] = '\\';
-    // "F:" (drive root) -> "F:\"
-    int len = 0; while (out[len]) len++;
-    if (len == 2 && out[1] == ':')
+    if (!out || outLen <= 0) return 0;
+    out[0] = '\0';
+
+    // Translate secondary HDD friendly names to the loader's reserved aliases.
+    // /HDD1-C/... -> P:\\..., /HDD1-E/... -> Q:\\..., etc. Direct P:/Q:/R:/V:
+    // paths remain accepted for compatibility, but the FTP root advertises the
+    // descriptive HDD1-* names.
+    if (a[0] == 'H' && a[1] == 'D' && a[2] == 'D' && a[3] == '1' &&
+        a[4] == '-' && (a[5] == 'C' || a[5] == 'E' || a[5] == 'F' || a[5] == 'G') &&
+        (a[6] == '\0' || a[6] == '/' || a[6] == '\\'))
     {
+        char alias = Mount_Hdd1AliasForPart(a[5]);
+        const char* rest = a + 6;
+        int restLen;
+        if (!alias) return 0;
+        if (*rest == '/' || *rest == '\\') ++rest;
+        restLen = FtpPathLen(rest);
+        if (3 + restLen >= outLen) return 0;
+        out[0] = alias; out[1] = ':'; out[2] = '\\'; out[3] = '\0';
+        if (*rest)
+        {
+            int i = 3;
+            while (*rest)
+            {
+                out[i++] = (*rest == '/') ? '\\' : *rest;
+                ++rest;
+            }
+            out[i] = '\0';
+        }
+        return 1;
+    }
+
+    // Normal drive mapping is length preserving except "F:" -> "F:\\".
+    if (alen >= outLen) return 0;
+    if (!FtpPathCopy(out, outLen, a)) return 0;
+    for (int i = 0; out[i]; i++) if (out[i] == '/') out[i] = '\\';
+    if (alen == 2 && out[1] == ':')
+    {
+        if (3 >= outLen) { out[0] = '\0'; return 0; }
         out[2] = '\\'; out[3] = '\0';
     }
+    return 1;
 }
 
 // Convenience: resolve arg against cwd then map to real Windows path.
-static void FtpResolvePath(const char* arg, char* out, int outLen)
+static int FtpResolvePath(const char* arg, char* out, int outLen)
 {
     char virt[FTP_MAX_PATH];
-    ResolveRelative(g_ftp.cwd, arg, virt, sizeof(virt));
-    MapFtpPath(virt, out, outLen);
+    if (!ResolveRelative(g_ftp.cwd, arg, virt, sizeof(virt))) return 0;
+    return MapFtpPath(virt, out, outLen);
+}
+
+/* A DOS drive root is considered present when the filesystem can report its
+   volume size.  This intentionally matches Drive Info and PrometheOS instead
+   of requiring FILE_ATTRIBUTE_DIRECTORY on X:\\, which is unreliable for
+   FATX volume roots/secondary aliases on RXDK. */
+static int FtpDriveRootAvailable(char letter)
+{
+    char root[4];
+    ULARGE_INTEGER freeAvail, totalBytes, totalFree;
+    DWORD attr;
+
+    root[0] = letter; root[1] = ':'; root[2] = '\\'; root[3] = 0;
+    if (GetDiskFreeSpaceExA(root, &freeAvail, &totalBytes, &totalFree) &&
+        totalBytes.QuadPart != 0)
+        return 1;
+
+    /* Keep a conservative fallback for non-FATX mappings such as D:. */
+    attr = GetFileAttributesA(root);
+    return attr != 0xFFFFFFFFUL;
 }
 // Execute a pending LIST — enumerate and send directly to dataSock, reply 226.
 // Build listing into listBuf then start async drain via XFER_LIST.
@@ -458,13 +544,20 @@ static void FtpDoListing()
         const char* driveLetters[] = { "C", "D", "E", "F", "G", "X", "Y", "Z", NULL };
         for (int di = 0; driveLetters[di]; ++di)
         {
-            char pat[8];
-            pat[0] = driveLetters[di][0]; pat[1] = ':'; pat[2] = '\\'; pat[3] = '\0';
-            DWORD attr = GetFileAttributesA(pat);
-            if (attr != 0xFFFFFFFF && (attr & FILE_ATTRIBUTE_DIRECTORY))
+            if (FtpDriveRootAvailable(driveLetters[di][0]))
             {
                 char driveName[4] = { driveLetters[di][0], ':', '\0' };
                 FtpAppendListLine(driveName, true, 0);
+            }
+        }
+        {
+            static const char secAlias[4] = { 'P','Q','R','V' };
+            static const char* secName[4] = { "HDD1-C","HDD1-E","HDD1-F","HDD1-G" };
+            unsigned int mask = Mount_Hdd1MappedMask();
+            for (int si = 0; si < 4; ++si)
+            {
+                if ((mask & (1u << si)) && FtpDriveRootAvailable(secAlias[si]))
+                    FtpAppendListLine(secName[si], true, 0);
             }
         }
     }
@@ -499,11 +592,8 @@ static void FtpDoListing()
 // Recursively delete a directory and all its contents
 static bool FtpDeleteDir(const char* path)
 {
-    char pat[FTP_MAX_PATH + 4];
-    StrCopy(pat, sizeof(pat), path);
-    int pl = 0; while (pat[pl]) pl++;
-    if (pl > 0 && pat[pl - 1] != '\\') { pat[pl] = '\\'; pat[pl + 1] = '\0'; pl++; }
-    pat[pl] = '*'; pat[pl + 1] = '\0';
+    char pat[FTP_PATH_PATTERN_MAX];
+    if (!FtpPathJoin(pat, sizeof(pat), path, "*")) return false;
 
     WIN32_FIND_DATA fd;
     HANDLE h = FindFirstFile(pat, &fd);
@@ -514,10 +604,10 @@ static bool FtpDeleteDir(const char* path)
 
             // Build full child path
             char child[FTP_MAX_PATH];
-            StrCopy(child, sizeof(child), path);
-            int cl = 0; while (child[cl]) cl++;
-            if (cl > 0 && child[cl - 1] != '\\') { child[cl] = '\\'; child[cl + 1] = '\0'; }
-            FtpServ_AppendStr(child, sizeof(child), fd.cFileName);
+            if (!FtpPathJoin(child, sizeof(child), path, fd.cFileName)) {
+                FindClose(h);
+                return false;
+            }
 
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
             {
@@ -538,11 +628,20 @@ static void FtpHandleCommand(char* cmd)
 {
     // Split verb and argument
     char verb[16] = {};
-    char arg[FTP_MAX_PATH] = {};
+    char arg[1024] = {};
     int i = 0;
     while (cmd[i] && cmd[i] != ' ' && i < 15) { verb[i] = cmd[i]; i++; }
     verb[i] = '\0';
-    if (cmd[i] == ' ') { i++; StrCopy(arg, sizeof(arg), cmd + i); }
+    if (cmd[i] == ' ') {
+        int ai = 0;
+        i++;
+        while (cmd[i + ai]) {
+            if (ai >= (int)sizeof(arg) - 1) { FtpReply(501, "Argument too long."); return; }
+            arg[ai] = cmd[i + ai];
+            ai++;
+        }
+        arg[ai] = '\0';
+    }
 
     // Strip surrounding quotes — some clients quote paths containing spaces
     // e.g. CWD "F:\Apps\Type D"
@@ -580,7 +679,7 @@ static void FtpHandleCommand(char* cmd)
         {
             FtpReply(221, "Bye.");
             closesocket(g_ftp.ctrlSock); g_ftp.ctrlSock = INVALID_SOCKET;
-            g_ftp.state = FTP_OFF;
+            g_ftp.state = FTP_LISTEN;
         }
         else { FtpReply(530, "Not logged in."); }
         return;
@@ -618,7 +717,9 @@ static void FtpHandleCommand(char* cmd)
         const char* param = isCdup ? ".." : arg;
 
         char newVirtual[FTP_MAX_PATH];
-        ResolveRelative(g_ftp.cwd, param, newVirtual, sizeof(newVirtual));
+        if (!ResolveRelative(g_ftp.cwd, param, newVirtual, sizeof(newVirtual))) {
+            FtpReply(553, "Path too long or invalid."); return;
+        }
 
         bool isFolder = false;
 
@@ -630,13 +731,15 @@ static void FtpHandleCommand(char* cmd)
         else
         {
             char ftpPath[FTP_MAX_PATH];
-            MapFtpPath(newVirtual, ftpPath, sizeof(ftpPath));
+            if (!MapFtpPath(newVirtual, ftpPath, sizeof(ftpPath))) {
+                FtpReply(553, "Path too long or invalid."); return;
+            }
 
             // Case 2: drive root — ftpPath is "F:" or "F:\"
             int fplen = 0; while (ftpPath[fplen]) fplen++;
             if (fplen >= 2 && ftpPath[1] == ':' && (ftpPath[2] == '\0' || (ftpPath[2] == '\\' && ftpPath[3] == '\0')))
             {
-                isFolder = true;
+                isFolder = FtpDriveRootAvailable(ftpPath[0]) ? true : false;
             }
             else
             {
@@ -703,9 +806,17 @@ static void FtpHandleCommand(char* cmd)
         if (!listVirtualRoot)
         {
             if (listArg[0] != '\0')
-                FtpResolvePath(listArg, listDir, sizeof(listDir));
+            {
+                if (!FtpResolvePath(listArg, listDir, sizeof(listDir))) {
+                    FtpReply(553, "Path too long or invalid."); return;
+                }
+            }
             else
-                MapFtpPath(g_ftp.cwd, listDir, sizeof(listDir));
+            {
+                if (!MapFtpPath(g_ftp.cwd, listDir, sizeof(listDir))) {
+                    FtpReply(553, "Path too long or invalid."); return;
+                }
+            }
         }
 
         // Store as pending then dispatch immediately if dataSock is already
@@ -726,7 +837,9 @@ static void FtpHandleCommand(char* cmd)
         }
 
         char fullPath[FTP_MAX_PATH];
-        FtpResolvePath(arg, fullPath, sizeof(fullPath));
+        if (!FtpResolvePath(arg, fullPath, sizeof(fullPath))) {
+            FtpReply(553, "Path too long or invalid."); return;
+        }
 
         HANDLE hf = CreateFile(fullPath, GENERIC_READ, FILE_SHARE_READ,
             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -774,7 +887,9 @@ static void FtpHandleCommand(char* cmd)
         }
 
         char fullPath[FTP_MAX_PATH];
-        FtpResolvePath(arg, fullPath, sizeof(fullPath));
+        if (!FtpResolvePath(arg, fullPath, sizeof(fullPath))) {
+            FtpReply(553, "Path too long or invalid."); return;
+        }
 
         // ALLO pre-check: if the client declared a size and the target volume
         // can't hold it, refuse now rather than filling the disk and failing
@@ -843,7 +958,7 @@ static void FtpHandleCommand(char* cmd)
         if (g_ftp.dataSock != INVALID_SOCKET) { closesocket(g_ftp.dataSock);   g_ftp.dataSock = INVALID_SOCKET; }
         if (g_ftp.dataListen != INVALID_SOCKET) { closesocket(g_ftp.dataListen); g_ftp.dataListen = INVALID_SOCKET; }
         closesocket(g_ftp.ctrlSock); g_ftp.ctrlSock = INVALID_SOCKET;
-        g_ftp.state = FTP_OFF;
+        g_ftp.state = FTP_LISTEN;
         g_ftp.authed = false;
         g_ftp.gotUser = false;
         g_ftp.gotRnfr = false;
@@ -863,7 +978,9 @@ static void FtpHandleCommand(char* cmd)
     {
         // Delete a file
         char fullPath[FTP_MAX_PATH];
-        FtpResolvePath(arg, fullPath, sizeof(fullPath));
+        if (!FtpResolvePath(arg, fullPath, sizeof(fullPath))) {
+            FtpReply(553, "Path too long or invalid."); return;
+        }
         if (DeleteFileA(fullPath))
             FtpReply(250, "File deleted.");
         else
@@ -874,9 +991,13 @@ static void FtpHandleCommand(char* cmd)
     {
         // Create directory
         char newVirt[FTP_MAX_PATH];
-        ResolveRelative(g_ftp.cwd, arg, newVirt, sizeof(newVirt));
+        if (!ResolveRelative(g_ftp.cwd, arg, newVirt, sizeof(newVirt))) {
+            FtpReply(553, "Path too long or invalid."); return;
+        }
         char fullPath[FTP_MAX_PATH];
-        MapFtpPath(newVirt, fullPath, sizeof(fullPath));
+        if (!MapFtpPath(newVirt, fullPath, sizeof(fullPath))) {
+            FtpReply(553, "Path too long or invalid."); return;
+        }
         if (CreateDirectoryA(fullPath, NULL))
         {
             // RFC 959: 257 response quotes the virtual path
@@ -896,7 +1017,9 @@ static void FtpHandleCommand(char* cmd)
     {
         // Remove directory and all contents recursively
         char fullPath[FTP_MAX_PATH];
-        FtpResolvePath(arg, fullPath, sizeof(fullPath));
+        if (!FtpResolvePath(arg, fullPath, sizeof(fullPath))) {
+            FtpReply(553, "Path too long or invalid."); return;
+        }
         if (FtpDeleteDir(fullPath))
             FtpReply(250, "Directory removed.");
         else
@@ -906,7 +1029,10 @@ static void FtpHandleCommand(char* cmd)
     {
         // Rename from — verify source exists before storing
         char fullPath[FTP_MAX_PATH];
-        FtpResolvePath(arg, fullPath, sizeof(fullPath));
+        if (!FtpResolvePath(arg, fullPath, sizeof(fullPath))) {
+            g_ftp.gotRnfr = false;
+            FtpReply(553, "Path too long or invalid."); return;
+        }
 
         // Check as file first, then as directory
         DWORD attr = GetFileAttributesA(fullPath);
@@ -931,7 +1057,9 @@ static void FtpHandleCommand(char* cmd)
         g_ftp.gotRnfr = false;
 
         char fullPath[FTP_MAX_PATH];
-        FtpResolvePath(arg, fullPath, sizeof(fullPath));
+        if (!FtpResolvePath(arg, fullPath, sizeof(fullPath))) {
+            FtpReply(553, "Path too long or invalid."); return;
+        }
         if (MoveFileA(g_ftp.rnfrPath, fullPath))
             FtpReply(250, "Renamed.");
         else
@@ -998,7 +1126,9 @@ static void FtpHandleCommand(char* cmd)
     else if (verb[0] == 'S' && verb[1] == 'I' && verb[2] == 'Z' && verb[3] == 'E')
     {
         char fullPath[FTP_MAX_PATH];
-        FtpResolvePath(arg, fullPath, sizeof(fullPath));
+        if (!FtpResolvePath(arg, fullPath, sizeof(fullPath))) {
+            FtpReply(553, "Path too long or invalid."); return;
+        }
         WIN32_FILE_ATTRIBUTE_DATA fad;
         if (GetFileAttributesExA(fullPath, GetFileExInfoStandard, &fad) &&
             !(fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
@@ -1085,73 +1215,7 @@ static void FtpHandleCommand(char* cmd)
 // FtpTick — called once per frame, non-blocking throughout
 // ============================================================================
 
-static void FtpSessionTick(void);   /* defined below; called by the dispatcher */
-
-/* ---- multi-session dispatcher --------------------------------------------
-   Accept new clients on the shared listener into a free slot (or 421 if the
-   pool is full), then service each active session. The engine body
-   (FtpSessionTick) operates on whichever slot s_cur points at. */
 void FtpServ_Tick()
-{
-    int i;
-    if (s_listen == INVALID_SOCKET) return;
-
-    for (;;)
-    {
-        SOCKADDR_IN ca; int caLen = sizeof(ca);
-        FtpCtx* slot; u_long nb;
-        SOCKET cs = accept(s_listen, (SOCKADDR*)&ca, &caLen);
-        if (cs == INVALID_SOCKET) break;
-
-        slot = 0;
-        for (i = 0; i < FTP_MAX_SESSIONS; ++i)
-            if (s_sess[i].state == FTP_OFF) { slot = &s_sess[i]; break; }
-
-        if (slot)
-        {
-            nb = 1; ioctlsocket(cs, FIONBIO, &nb);
-            ZeroMemory(slot, sizeof(FtpCtx));
-            slot->ctrlSock = cs;
-            slot->dataListen = INVALID_SOCKET;
-            slot->dataSock = INVALID_SOCKET;
-            slot->xferFile = INVALID_HANDLE_VALUE;
-            slot->lastActivityMs = GetTickCount();
-            slot->state = FTP_CONNECTED;
-            s_cur = slot;
-            FtpSendStr(slot->ctrlSock, "220-Eos FTP Server\r\n");
-            FtpSendStr(slot->ctrlSock, "220-Original Xbox  /  Eos modchip\r\n");
-            FtpSendStr(slot->ctrlSock, "220-Team Resurgent  /  Darkone83\r\n");
-            FtpSendStr(slot->ctrlSock, "220-\r\n");
-            FtpSendStr(slot->ctrlSock, "220-Mode : Passive (PASV) only\r\n");
-            FtpSendStr(slot->ctrlSock, "220 Ready.\r\n");
-        }
-        else
-        {
-            /* Pool full -- reject with 421. Force blocking + linger so the reply
-               is actually delivered before close (clients otherwise see an
-               abortive close and report a failed session). */
-            struct linger lg; u_long blk = 0;
-            const char* busy = "421 All sessions in use, try again later.\r\n";
-            int len = 0; while (busy[len]) len++;
-            ioctlsocket(cs, FIONBIO, &blk);
-            lg.l_onoff = 1; lg.l_linger = 1;
-            setsockopt(cs, SOL_SOCKET, SO_LINGER, (const char*)&lg, sizeof(lg));
-            send(cs, busy, len, 0);
-            closesocket(cs);
-        }
-    }
-
-    for (i = 0; i < FTP_MAX_SESSIONS; ++i)
-    {
-        if (s_sess[i].state != FTP_OFF)
-        {
-            s_cur = &s_sess[i];
-            FtpSessionTick();
-        }
-    }
-}
-
-static void FtpSessionTick()
 {
     if (g_ftp.state == FTP_OFF) return;
 
@@ -1177,7 +1241,7 @@ static void FtpSessionTick()
             g_ftp.listBufLen = 0; g_ftp.listBufOff = 0;
             g_ftp.sendLen = 0; g_ftp.sendOff = 0;
             g_ftp.restOffset = 0; g_ftp.alloSize = 0;
-            g_ftp.state = FTP_OFF;
+            g_ftp.state = FTP_LISTEN;
             return;
         }
     }
@@ -1213,7 +1277,81 @@ static void FtpSessionTick()
             g_ftp.retrBufLen = 0; g_ftp.retrBufOff = 0;
             g_ftp.listBufLen = 0; g_ftp.listBufOff = 0;
             g_ftp.sendLen = 0; g_ftp.sendOff = 0;
-            g_ftp.state = FTP_OFF;
+            g_ftp.state = FTP_LISTEN;
+            return;
+        }
+    }
+
+    // ---- Drain secondary connection attempts --------------------------------
+    // FileZilla opens a second ctrl connection for transfers while keeping the
+    // browsing connection open. Our server is single-session, so we accept and
+    // immediately reject any connection that arrives while already connected.
+    // This is critical: leaving it stuck in the listen backlog causes FileZilla
+    // to wait until its own connection timeout fires, which it reports as a
+    // disconnect. Sending 421 immediately tells FileZilla to reuse the existing
+    // session instead of waiting on the stalled second connection.
+    if ((g_ftp.state == FTP_CONNECTED || g_ftp.state == FTP_TRANSFER) &&
+        g_ftp.listenSock != INVALID_SOCKET)
+    {
+        // Drain ALL pending secondary connections this tick (FileZilla may open
+        // several at once). The accepted socket INHERITS the listen socket's
+        // non-blocking mode, so a plain send() can return WSAEWOULDBLOCK and the
+        // 421 never goes out before we close -- FileZilla then sees an abortive
+        // close and reports a failed session instead of reusing the existing one.
+        // Force the socket blocking and linger-on-close so the reply is actually
+        // delivered, then FileZilla falls back to the single live session.
+        const char* k_busy = "421 Only one session permitted.\r\n";
+        int len = 0; while (k_busy[len]) len++;
+        for (;;)
+        {
+            SOCKADDR_IN ca; int caLen = sizeof(ca);
+            SOCKET cs = accept(g_ftp.listenSock, (SOCKADDR*)&ca, &caLen);
+            struct linger lg;
+            u_long blk = 0;
+            if (cs == INVALID_SOCKET) break;
+            ioctlsocket(cs, FIONBIO, &blk);                 /* -> blocking          */
+            lg.l_onoff = 1; lg.l_linger = 1;                /* flush on close       */
+            setsockopt(cs, SOL_SOCKET, SO_LINGER, (const char*)&lg, sizeof(lg));
+            send(cs, k_busy, len, 0);
+            closesocket(cs);
+        }
+    }
+
+    // ---- Accept new control connection ------------------------------------
+    if (g_ftp.state == FTP_LISTEN && g_ftp.listenSock != INVALID_SOCKET)
+    {
+        SOCKADDR_IN ca; int caLen = sizeof(ca);
+        SOCKET cs = accept(g_ftp.listenSock, (SOCKADDR*)&ca, &caLen);
+        if (cs != INVALID_SOCKET)
+        {
+            u_long nb = 1; ioctlsocket(cs, FIONBIO, &nb);
+            g_ftp.ctrlSock = cs;
+            g_ftp.authed = false;
+            g_ftp.gotUser = false;
+            g_ftp.gotRnfr = false;
+            g_ftp.atVirtualRoot = false;
+            g_ftp.ctrlHalfClosed = false;
+            g_ftp.xferType = XFER_NONE;
+            g_ftp.recvLen = 0;
+            g_ftp.restOffset = 0;
+            g_ftp.alloSize = 0;
+            g_ftp.lastActivityMs = GetTickCount();
+            g_ftp.state = FTP_CONNECTED;
+            // Multi-line 220 banner — FTP spec: "NNN-" for continuation, "NNN " for final line.
+            // FlashFXP and FileZilla display the continuation lines in their message/log panel.
+            FtpSendStr(g_ftp.ctrlSock, "220-DarkDash FTP Server\r\n");
+            FtpSendStr(g_ftp.ctrlSock, "220-Original Xbox Dashboard\r\n");
+            FtpSendStr(g_ftp.ctrlSock, "220-Team Resurgent  /  Darkone83\r\n");
+            FtpSendStr(g_ftp.ctrlSock, "220-\r\n");
+            FtpSendStr(g_ftp.ctrlSock, "220-Mode : Passive (PASV) only\r\n");
+            FtpSendStr(g_ftp.ctrlSock, "220 Ready.\r\n");
+            // Fall through — don't return. The send-drain at the top of the
+            // next-tick pass needs the banner to be flushed promptly. Returning
+            // here would defer it one full frame on every new connection.
+        }
+        else
+        {
+            // No pending connection this tick — nothing else to do in LISTEN state.
             return;
         }
     }
@@ -1389,7 +1527,7 @@ static void FtpSessionTick()
             g_ftp.sendOff = 0;
             g_ftp.restOffset = 0;
             g_ftp.alloSize = 0;
-            g_ftp.state = FTP_OFF;
+            g_ftp.state = FTP_LISTEN;
             return;
         }
     skip_ctrl_disconnect:;
@@ -1568,8 +1706,22 @@ static void FtpSessionTick()
 
 static int s_ftpWanted = 0;   /* 1 if the user has FTP enabled */
 
+void Ftp_SetCredentials(const char* user, const char* pass, int port)
+{
+    int i;
+    if (user) {
+        i = 0; while (user[i] && i < (int)sizeof(s_ftpUser) - 1) { s_ftpUser[i] = user[i]; ++i; }
+        s_ftpUser[i] = 0;
+    }
+    if (pass) {
+        i = 0; while (pass[i] && i < (int)sizeof(s_ftpPass) - 1) { s_ftpPass[i] = pass[i]; ++i; }
+        s_ftpPass[i] = 0;
+    }
+    if (port > 0 && port < 65536) s_ftpPort = port;
+}
+
 void Ftp_Init(void) {
-    s_listen = INVALID_SOCKET;
+    g_ftp.state = FTP_OFF;
     s_ftpWanted = 0;
 }
 
@@ -1591,50 +1743,26 @@ void Ftp_Stop(void) {
 }
 
 void Ftp_Tick(void) {
-    /* Deferred start: bind once the network resolves; if the link drops while
-       running, stop so we retry cleanly when it returns. */
+    /* Deferred start: if wanted but not yet listening, bring it up as soon as
+       the network is ready. If the link drops while running, stop so we retry
+       cleanly when it returns. */
     if (s_ftpWanted) {
-        if (s_listen == INVALID_SOCKET && Net_IsUp())
-            FtpServ_Start(Net_Ip(), 1);
-        else if (s_listen != INVALID_SOCKET && !Net_IsUp())
-            FtpServ_Stop();
+        if (g_ftp.state == FTP_OFF) {
+            if (Net_IsUp())
+                FtpServ_Start(Net_Ip(), 1);
+        }
     }
-    if (s_listen != INVALID_SOCKET) FtpServ_Tick();
+    if (g_ftp.state != FTP_OFF) FtpServ_Tick();
 }
 
-int  Ftp_IsRunning(void) { return s_listen != INVALID_SOCKET ? 1 : 0; }
+int  Ftp_IsRunning(void) { return g_ftp.state != FTP_OFF; }
 int  Ftp_Wanted(void) { return s_ftpWanted; }
 
-int  Ftp_SessionCount(void) {
-    int i, n = 0;
-    for (i = 0; i < FTP_MAX_SESSIONS; ++i)
-        if (s_sess[i].state == FTP_CONNECTED || s_sess[i].state == FTP_TRANSFER) ++n;
-    return n;
-}
-
-void Ftp_SetCredentials(const char* user, const char* pass, int port) {
-    if (user) StrCopy(s_ftpUser, sizeof(s_ftpUser), user);
-    if (pass) StrCopy(s_ftpPass, sizeof(s_ftpPass), pass);
-    if (port > 0 && port < 65536) s_ftpPort = port;
-}
-
-/* 0 off, 1 listening, 2 connected, 3 transferring -- highest across sessions */
-int  Ftp_Status(void) {
-    int i, best = 0;
-    if (s_listen != INVALID_SOCKET) best = 1;
-    for (i = 0; i < FTP_MAX_SESSIONS; ++i) {
-        if (s_sess[i].state == FTP_TRANSFER) return 3;
-        if (s_sess[i].state == FTP_CONNECTED && best < 2) best = 2;
-    }
-    return best;
-}
+/* 0 off, 1 listening, 2 connected, 3 transferring -- mirrors FtpState */
+int  Ftp_Status(void) { return (int)g_ftp.state; }
 
 /* transfer progress for the status panel (bytes); 0/0 when idle */
 void Ftp_Progress(unsigned long* done, unsigned long* total) {
-    int i; unsigned long d = 0, t = 0;
-    for (i = 0; i < FTP_MAX_SESSIONS; ++i) {
-        if (s_sess[i].state == FTP_TRANSFER) { d += s_sess[i].xferDone; t += s_sess[i].xferTotal; }
-    }
-    if (done)  *done = d;
-    if (total) *total = t;
+    if (done)  *done = g_ftp.xferDone;
+    if (total) *total = g_ftp.xferTotal;
 }

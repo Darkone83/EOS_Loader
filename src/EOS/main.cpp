@@ -23,6 +23,7 @@
 #include "eos_dlc.h"
 #include "eos_flash.h"
 #include "eos_file.h"
+#include "dd_mount.h"
 #include "eos_sdcard.h"    // onboard SD card: FAT32 browse + BIOS precache/launch
 #include "eos_osk.h"
 #include "eos_settings.h"
@@ -2314,17 +2315,21 @@ static void FwRestConfirm_Frame(WORD b)
 }
 
 // ---------------------------------------------------------------------------
-// HDD TOOLS: drive info + ATA security. Unlock removes security; Lock binds the
-// drive to this console's key. Both are armed (press A twice). The password is
-// derived from the kernel HDD key -- see eos_hdd.
+// HDD TOOLS: physical HDD0/HDD1 identify + mounted-partition usage. ATA
+// security lock/unlock intentionally remains primary-master only.
 // ---------------------------------------------------------------------------
-static EosHddInfo       s_hddInfo;
-static EosPartitionInfo s_hddParts[HDD_PART_MAX];
-static int              s_hddPartCount = 0;
-static int              s_hddOk = 0;
-static int              s_hddToolSel = 0;
-static int              s_hddArm = 0;
-static DWORD            s_hddUsageNext = 0;
+static EosHddInfo          s_hddInfo[2];
+static EosHddPartitionInfo s_hddParts[2][HDD_PART_MAX];
+static EosHddRawPartitionInfo s_hdd1Raw[HDD_PART_MAX];
+static int s_hdd1RawTableState = HDD_RAW_TABLE_READ_ERROR;
+static int s_hdd1RawMode = 0;
+static unsigned long long s_hdd1Sectors = 0;
+static int                 s_hddPartCount[2] = { 0, 0 };
+static int                 s_hddOk[2] = { 0, 0 };
+static int                 s_hddInfoDisk = 0;
+static int                 s_hddToolSel = 0;
+static int                 s_hddArm = 0;
+static DWORD               s_hddUsageNext = 0;
 
 static int appendUInt(char* out, int p, unsigned long v)
 {
@@ -2332,6 +2337,27 @@ static int appendUInt(char* out, int p, unsigned long v)
     if (v == 0) { out[p++] = '0'; return p; }
     while (v && n < 11) { tmp[n++] = (char)('0' + (int)(v % 10)); v /= 10; }
     while (n > 0) out[p++] = tmp[--n];
+    return p;
+}
+
+static int appendHex32(char* out, int p, unsigned int v)
+{
+    static const char kHex[] = "0123456789ABCDEF";
+    int sh;
+    p = appendStr(out, p, "0x");
+    for (sh = 28; sh >= 0 && p < 62; sh -= 4)
+        out[p++] = kHex[(v >> sh) & 0x0F];
+    out[p] = 0;
+    return p;
+}
+
+static int appendUInt64(char* out, int p, unsigned long long v)
+{
+    char tmp[24]; int n = 0;
+    if (v == 0) { out[p++] = '0'; out[p] = 0; return p; }
+    while (v && n < 23) { tmp[n++] = (char)('0' + (int)(v % 10ULL)); v /= 10ULL; }
+    while (n > 0 && p < 62) out[p++] = tmp[--n];
+    out[p] = 0;
     return p;
 }
 
@@ -2354,7 +2380,7 @@ static int hddAppendSize(char* out, int p, unsigned long mb, int useGB)
     return p;
 }
 
-static void hddPartLine(const EosPartitionInfo* pi, char* out)
+static void hddPartLine(const EosHddPartitionInfo* pi, char* out)
 {
     int p = 0;
     int useGB = (pi->totalMB >= 1024);
@@ -2370,19 +2396,44 @@ static void hddPartLine(const EosPartitionInfo* pi, char* out)
     out[p] = 0;
 }
 
-static void HddUsage_Refresh(void)
+static void HddUsage_RefreshDisk(int disk)
 {
-    File_MountDrives();
-    s_hddPartCount = Hdd_GetPartitions(s_hddParts, HDD_PART_MAX);
+    if (disk < 0 || disk > 1) return;
+    s_hddPartCount[disk] = 0;
+    if (!s_hddOk[disk]) return;
+    // HDD1 Drive Info is physical read-only ATA/LBA, never DOS drive-letter I/O.
+    if (disk == 1) {
+        s_hddPartCount[1] = Hdd_GetRawPartitionsForDisk(1, s_hdd1Sectors,
+            s_hdd1Raw, HDD_PART_MAX, &s_hdd1RawTableState, &s_hdd1RawMode);
+    }
+    else s_hddPartCount[0] = Hdd_GetPartitionsForDisk(0, s_hddParts[0], HDD_PART_MAX);
 }
 
-// Identify on entry/action, then keep the inexpensive filesystem usage values
-// live while Drive Info is open. This is especially useful during FTP copies.
+static void HddUsage_Refresh(void)
+{
+    HddUsage_RefreshDisk(0);
+    HddUsage_RefreshDisk(1);
+}
+
+// Identify both physical IDE devices on entry/action. ATA IDENTIFY does not
+// depend on the kernel partition namespace, so a blank secondary still appears.
 static void HddInfo_Refresh(void)
 {
-    s_hddPartCount = 0;
-    s_hddOk = (Hdd_Identify(&s_hddInfo) == HDD_OK);
-    if (s_hddOk) HddUsage_Refresh();
+    unsigned long long sectors;
+    s_hddPartCount[0] = 0;
+    s_hddPartCount[1] = 0;
+    sectors = 0;
+    s_hddOk[0] = (Hdd_IdentifyDisk(0, &s_hddInfo[0], &sectors) == HDD_OK);
+    sectors = 0;
+    s_hddOk[1] = (Hdd_IdentifyDisk(1, &s_hddInfo[1], &sectors) == HDD_OK);
+    s_hdd1Sectors = s_hddOk[1] ? sectors : 0;
+    s_hdd1RawTableState = HDD_RAW_TABLE_READ_ERROR;
+    s_hdd1RawMode = 0;
+    /* Bind storage once on entry/action; the 1 Hz usage poll does not remap
+       symlinks while FTP or file-browser operations may be active. */
+    File_MountDrives();
+    HddUsage_Refresh();
+    if (!s_hddOk[s_hddInfoDisk]) s_hddInfoDisk = s_hddOk[0] ? 0 : (s_hddOk[1] ? 1 : 0);
     s_hddUsageNext = GetTickCount() + 1000;
 }
 
@@ -2398,7 +2449,7 @@ static void hddSecLine(unsigned short s, char* out)
 
 static void HddTools_Enter(void)
 {
-    s_hddToolSel = 0; s_hddArm = 0;
+    s_hddToolSel = 0; s_hddArm = 0; s_hddInfoDisk = 0;
     HddInfo_Refresh();
     GotoPhase(PH_HDD_TOOLS);
 }
@@ -2418,8 +2469,9 @@ static void HddTools_Frame(WORD b)
             GotoPhase(PH_HDD_INFO);
             return;
         }
-        if (!s_hddOk) { SetStatus("No drive detected"); }
-        else if (s_hddToolSel == 1) {                  // UNLOCK (remove security)
+        /* Security operations deliberately target only physical HDD0. */
+        if (!s_hddOk[0]) { SetStatus("No primary drive detected"); }
+        else if (s_hddToolSel == 1) {
             if (!s_hddArm) s_hddArm = 1;
             else {
                 rc = Hdd_Unlock(); s_hddArm = 0;
@@ -2432,7 +2484,7 @@ static void HddTools_Frame(WORD b)
                 HddInfo_Refresh();
             }
         }
-        else {                                       // LOCK to this console
+        else {
             if (!s_hddArm) s_hddArm = 1;
             else {
                 rc = Hdd_Lock(); s_hddArm = 0;
@@ -2452,66 +2504,105 @@ static void HddTools_Frame(WORD b)
     listScreen("HDD Tools", it, 3, s_hddToolSel);
 }
 
+// Shared partition-row geometry for both physical disks. HDD1 reports raw
+// capacity only; an empty track is not an allocation-usage measurement.
+static void HddInfo_DrawPartitionRow(int y, char letter, const char* label,
+    int usageKnown, unsigned int percent)
+{
+    char drv[4];
+    int barX = 132;
+    int barW = g_scrW - 202;
+    int fillW;
+    drv[0] = letter; drv[1] = ':'; drv[2] = 0;
+    Font_Draw(70, y, drv, EOS_WHITE);
+    Font_Draw(132, y, label, EOS_DIM);
+    Gfx_Fill((float)barX, (float)(y + 19), (float)barW, 7.0f,
+        EOS_ARGB(72, 255, 255, 255));
+    if (usageKnown) {
+        if (percent > 100) percent = 100;
+        fillW = (barW * (int)percent) / 100;
+        if (fillW > 0)
+            Gfx_Fill((float)barX, (float)(y + 19), (float)fillW, 7.0f, EOS_PURPLE);
+    }
+}
+
 static void HddInfo_Frame(WORD b)
 {
-    char line[80]; int p, y, i; DWORD now;
+    char line[80];
+    char title[32];
+    int p, y, i, disk;
+    DWORD now;
+    EosHddInfo* hi;
 
     if (Pressed(b, s_prevBtn, BTN_B) || Pressed(b, s_prevBtn, BTN_A)) { GotoPhase(PH_HDD_TOOLS); return; }
 
-    // Refresh only free/used partition figures once a second. Avoid repeatedly
-    // issuing ATA IDENTIFY while FTP traffic is active.
+    if (s_hddOk[0] && s_hddOk[1]) {
+        if (Pressed(b, s_prevBtn, BTN_DPAD_LEFT) || Pressed(b, s_prevBtn, BTN_DPAD_RIGHT))
+            s_hddInfoDisk ^= 1;
+    }
+    disk = s_hddInfoDisk;
+    hi = &s_hddInfo[disk];
+
+    // HDD0 usage refreshes once per second. HDD1's physical raw partition
+    // snapshot refreshes on entry and never requires kernel FATX mounting.
     now = GetTickCount();
-    if (s_hddOk && (LONG)(now - s_hddUsageNext) >= 0) {
-        HddUsage_Refresh();
+    if (s_hddOk[0] && (LONG)(now - s_hddUsageNext) >= 0) {
+        HddUsage_RefreshDisk(0);
         s_hddUsageNext = now + 1000;
     }
 
+    p = 0; p = appendStr(title, p, "Drive Info - HDD"); title[p++] = (char)('0' + disk); title[p] = 0;
     Gfx_Begin(EOS_BG); Ui_Backdrop();
-    Ui_TitleBar("Drive Info");
-    if (!s_hddOk) {
-        Font_DrawCentered(0, g_scrW, 160, "No drive detected on the primary channel.", EOS_DIM);
+    Ui_TitleBar(title);
+    if (!s_hddOk[disk]) {
+        Font_DrawCentered(0, g_scrW, 160,
+            disk == 0 ? "No primary drive detected." : "No secondary drive detected.", EOS_DIM);
     }
     else {
-        // Compact the drive-identify block slightly so C/E/F/G usage fits cleanly
-        // on the same 480p screen without scrolling.
+        // Shared drive-identification and partition layout for HDD0 and HDD1.
         y = 82;
-        Font_Draw(70, y, "Model", EOS_DIM); Font_Draw(210, y, s_hddInfo.model, EOS_WHITE); y += 26;
-        Font_Draw(70, y, "Serial", EOS_DIM); Font_Draw(210, y, s_hddInfo.serial, EOS_WHITE); y += 26;
-        p = 0; p = appendUInt(line, p, s_hddInfo.sizeMB / 1024); p = appendStr(line, p, " GB (");
-        p = appendUInt(line, p, s_hddInfo.sizeMB); p = appendStr(line, p, " MB)"); line[p] = 0;
+        Font_Draw(70, y, "Model", EOS_DIM); Font_Draw(210, y, hi->model, EOS_WHITE); y += 26;
+        Font_Draw(70, y, "Serial", EOS_DIM); Font_Draw(210, y, hi->serial, EOS_WHITE); y += 26;
+        p = 0; p = appendUInt(line, p, hi->sizeMB / 1024); p = appendStr(line, p, " GB (");
+        p = appendUInt(line, p, hi->sizeMB); p = appendStr(line, p, " MB)"); line[p] = 0;
         Font_Draw(70, y, "Size", EOS_DIM); Font_Draw(210, y, line, EOS_WHITE); y += 26;
-        hddSecLine(s_hddInfo.security, line);
+        hddSecLine(hi->security, line);
         Font_Draw(70, y, "Security", EOS_DIM); Font_Draw(210, y, line, EOS_WHITE); y += 36;
 
         Font_Draw(70, y, "PARTITIONS", EOS_PURPLE); y += 24;
-
-        if (s_hddPartCount <= 0) {
-            Font_Draw(100, y, "Partition usage unavailable.", EOS_DIM);
+        if (s_hddPartCount[disk] <= 0) {
+            Font_Draw(100, y, "Partition information unavailable.", EOS_DIM);
         }
         else {
-            for (i = 0; i < s_hddPartCount && i < HDD_PART_MAX; ++i) {
-                const EosPartitionInfo* pi = &s_hddParts[i];
-                char drv[4];
-                int barX = 110;
-                int barW = g_scrW - 180;
-                int fillW;
-
-                drv[0] = pi->drive; drv[1] = ':'; drv[2] = 0;
-                hddPartLine(pi, line);
-
-                Font_Draw(70, y, drv, EOS_WHITE);
-                Font_Draw(110, y, line, EOS_DIM);
-
-                // Small percentage bar directly beneath the numeric usage line.
-                fillW = (barW * (int)pi->usedPercent) / 100;
-                Gfx_Fill((float)barX, (float)(y + 19), (float)barW, 7.0f, EOS_ARGB(72, 255, 255, 255));
-                if (fillW > 0)
-                    Gfx_Fill((float)barX, (float)(y + 19), (float)fillW, 7.0f, EOS_PURPLE);
+            for (i = 0; i < s_hddPartCount[disk] && i < HDD_PART_MAX; ++i) {
+                char letter;
+                int usageKnown;
+                unsigned int usedPercent;
+                if (disk == 0) {
+                    const EosHddPartitionInfo* pi = &s_hddParts[0][i];
+                    letter = pi->drive;
+                    hddPartLine(pi, line);
+                    usedPercent = pi->usedPercent;
+                    usageKnown = 1;
+                }
+                else {
+                    const EosHddRawPartitionInfo* pi = &s_hdd1Raw[i];
+                    int useGB = (pi->sizeMB >= 1024);
+                    letter = pi->suggestedAlias;
+                    p = 0;
+                    p = hddAppendSize(line, p, pi->sizeMB, useGB);
+                    p = appendStr(line, p, useGB ? " GB" : " MB");
+                    p = appendStr(line, p, "   Usage unavailable");
+                    line[p] = 0;
+                    usedPercent = 0;
+                    usageKnown = 0;
+                }
+                HddInfo_DrawPartitionRow(y, letter, line, usageKnown, usedPercent);
                 y += 40;
             }
         }
     }
-    Ui_Footer("B  BACK");
+    Ui_Footer(s_hddOk[0] && s_hddOk[1] ? "LEFT / RIGHT  DRIVE      B  BACK" : "B  BACK");
     Gfx_End();
 }
 
@@ -2607,12 +2698,14 @@ static unsigned long s_fmtTotalMB[2] = { 0, 0 };
 static unsigned long s_fmtEMB[2] = { 0, 0 };
 static unsigned long s_fmtFMB[2] = { 0, 0 };
 static unsigned long long s_fmtSectors[2] = { 0, 0 };
+static FormatProbeInfo s_fmtProbe[2];
 
 static void Format_Refresh(int disk)
 {
     if (disk < 0 || disk > 1) return;
     s_fmtHasDisk[disk] = Format_PlanInfoForDisk(disk, &s_fmtTotalMB[disk],
         &s_fmtEMB[disk], &s_fmtFMB[disk], &s_fmtSectors[disk]);
+    Format_GetProbeInfo(disk, &s_fmtProbe[disk]);
 }
 static void Format_Enter(void)
 {
@@ -2626,6 +2719,7 @@ static void Format_Enter(void)
 static void Format_Frame(WORD b)
 {
     char line[80]; int p, y;
+    FormatProbeInfo* d;
     if (Pressed(b, s_prevBtn, BTN_B)) { GotoPhase(PH_TOOLS); return; }
     if (Pressed(b, s_prevBtn, BTN_DPAD_LEFT) ||
         Pressed(b, s_prevBtn, BTN_DPAD_RIGHT)) {
@@ -2639,23 +2733,30 @@ static void Format_Frame(WORD b)
         if (s_fmtHasDisk[s_fmtDisk]) { GotoPhase(PH_FORMAT_CONFIRM); return; }
     }
 
+    d = &s_fmtProbe[s_fmtDisk];
     Gfx_Begin(EOS_BG); Ui_Backdrop();
-    Ui_TitleBar("Stage Hard Drive");
+    Ui_TitleBar("Format Hard Drive");
     Font_DrawCentered(0, g_scrW, 88,
         s_fmtDisk == 0 ? "TARGET: HDD0  -  PRIMARY" : "TARGET: HDD1  -  SECONDARY",
         EOS_PURPLE);
     Font_DrawCentered(0, g_scrW, 115, "LEFT / RIGHT  choose physical drive", EOS_DIM);
 
     if (!s_fmtHasDisk[s_fmtDisk]) {
-        Font_DrawCentered(0, g_scrW, 182,
-            s_fmtDisk == 0 ? "Harddisk0 unavailable / unsupported geometry"
-            : "Harddisk1 not detected by active BIOS", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 215, "No format action is available.", EOS_DIM);
+        Font_DrawCentered(0, g_scrW, 176,
+            d->ataResult == HDD_OK ? "Drive present but unavailable for formatting"
+            : "No physical ATA drive detected",
+            EOS_WHITE);
+        Font_DrawCentered(0, g_scrW, 210, Format_ProbeStageStr(d->stage), EOS_DIM);
         Ui_Footer("LEFT / RIGHT  DRIVE     B  BACK");
         Gfx_End(); return;
     }
-    Font_DrawCentered(0, g_scrW, 149, "Create the Xbox FATX layout and ERASE this disk", EOS_WHITE);
+
+    Font_DrawCentered(0, g_scrW, 149,
+        s_fmtProbe[s_fmtDisk].stage == FMT_PROBE_BOOTSTRAP
+        ? "Raw ATA format - no kernel mount required"
+        : "Kernel-backed format - selected physical drive", EOS_WHITE);
     y = 203;
+
     Font_Draw(140, y, "Physical device", EOS_DIM);
     Font_Draw(320, y, s_fmtDisk == 0 ? "Harddisk0" : "Harddisk1", EOS_WHITE); y += 34;
     Font_Draw(140, y, "Capacity", EOS_DIM);
@@ -2670,7 +2771,7 @@ static void Format_Frame(WORD b)
         p = appendStr(line, p, " GB"); line[p] = 0;
         Font_Draw(320, y, line, EOS_WHITE);
     }
-    else Font_Draw(320, y, "none (small drive)", EOS_DIM);
+    else Font_Draw(320, y, "none (stock-size drive)", EOS_DIM);
     y += 32;
     Font_DrawCentered(0, g_scrW, y, "ERASES THE SELECTED PHYSICAL DRIVE.", EOS_PURPLE);
     Ui_Footer("LEFT / RIGHT  DRIVE     A  CONTINUE     B  BACK");
@@ -2684,14 +2785,29 @@ static void FormatConfirm_Frame(WORD b)
         if (!s_fmtArm) s_fmtArm = 1;
         else {
             int rc;
-            // Formatter re-reads device geometry and refuses if it changed.
             rc = Format_StageDriveChecked(s_fmtDisk, s_fmtSectors[s_fmtDisk]);
             s_fmtArm = 0;
             if (rc == FMT_OK) {
-                SetOperationStatus(s_fmtDisk == 0 ? "Harddisk0 staged successfully"
-                    : "Harddisk1 staged; mount through dual-drive BIOS", 0);
+                /* A successful HDD1 format is validated by physical raw ATA
+                   reads, not the kernel's optional FATX volume namespace. */
+                SetOperationStatus(s_fmtDisk == 1
+                    ? "Harddisk1 table and FATX headers verified"
+                    : "Harddisk0 formatted", 0);
+                HddInfo_Refresh();
+                GotoPhase(PH_TOOLS);
+                return;
             }
-            else SetOperationStatus(Format_ErrStr(rc), 1);
+            {
+                int fp = Format_GetLastFailurePartition();
+                char msg[80]; int p = 0;
+                p = appendStr(msg, p, Format_ErrStr(rc));
+                if (fp > 0) {
+                    p = appendStr(msg, p, "  Partition ");
+                    p = appendUInt(msg, p, (unsigned long)fp);
+                }
+                msg[p] = 0;
+                SetOperationStatus(msg, 1);
+            }
             GotoPhase(PH_TOOLS);
             return;
         }
@@ -2702,9 +2818,10 @@ static void FormatConfirm_Frame(WORD b)
         s_fmtDisk == 0 ? "ERASE: PRIMARY Harddisk0" : "ERASE: SECONDARY Harddisk1",
         EOS_PURPLE);
     Font_DrawCentered(0, g_scrW, 152, "ALL DATA ON THIS PHYSICAL DISK WILL BE LOST.", EOS_WHITE);
-    Font_DrawCentered(0, g_scrW, 185, "The other disk is not the target.", EOS_DIM);
+    Font_DrawCentered(0, g_scrW, 185,
+        "Write FATX metadata and verify disk (no reboot)", EOS_DIM);
     Font_DrawCentered(0, g_scrW, 237,
-        s_fmtArm ? "Press A again to FORMAT the selected HDD" : "Press A to arm formatting",
+        s_fmtArm ? "Press A again to ERASE the selected HDD" : "Press A to arm formatting",
         EOS_PURPLE);
     Font_DrawCentered(0, g_scrW, 272, "B CANCELS - no changes made", EOS_DIM);
     Ui_Footer("A  CONFIRM     B  CANCEL");
@@ -3656,9 +3773,8 @@ void __cdecl main() {
     if (!Gfx_Init())    return;
     InitInput();
     Bank_SetResting();   // boot bank = safe resting selection
-    File_MountDrives();  // bind HDD partitions so E:/F:/... resolve for browsing
-    Config_Load();       // pull persisted bank table from the Eos config bank
-    Settings_ApplyEosRuntime(); // restore sticky EOS hardware controls (HDMI HUD)
+    Config_Load();       // restore EOS settings bank 0xC before storage setup
+    Settings_ApplyEosRuntime(); // apply HDMI controls AND Drive Setup mounts
     // Re-assert the saved fan policy on every Loader start. This makes manual
     // control deterministic across warm/cold reboot instead of relying on SMC
     // register retention or on whatever the previously-running BIOS requested.

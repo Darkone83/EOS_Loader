@@ -4,6 +4,7 @@
 #include "eos_hdd.h"
 #include "eos_vsc.h"           // vendor-specific fallback only after normal unlock fails
 #include "eos_gfx.h"           // <xtl.h>: BYTE/WORD, Sleep
+#include "dd_mount.h"          // detected HDD1 P/Q/R/V aliases
 #ifndef EOS_HOST_TEST
 #include "xboxinternals.h"     // KeStallExecutionProcessor, XboxHDKey
 #endif
@@ -14,7 +15,13 @@ typedef unsigned char  u8;
 // IDE ports / ATA constants.
 #define IDE_PRIMARY        0x01F0
 #define IDE_DEV_MASTER     0x00A0
+#define IDE_DEV_SLAVE      0x00B0
 #define ATA_IDENTIFY       0xEC
+#define ATA_READ_SECTORS       0x20
+#define ATA_READ_SECTORS_EXT   0x24
+#define ATA_WRITE_SECTORS      0x30
+#define ATA_WRITE_SECTORS_EXT  0x34
+#define ATA_FLUSH_CACHE        0xE7
 #define ATA_SEC_SETPASS    0xF1
 #define ATA_SEC_UNLOCK     0xF2
 #define ATA_SEC_DISABLE    0xF6
@@ -211,7 +218,7 @@ static void genPwd(const u8* hddKey, const u8* ideData, u8 pass[20])
     hmacSha1(pass, hddKey, 0x10, model, mLen, serial, sLen);
 }
 
-static void parseIdentify(const u8* d, EosHddInfo* out)
+static unsigned long long parseIdentify(const u8* d, EosHddInfo* out)
 {
     u8 tmp[0x28]; int n, i;
     unsigned long long sectors;
@@ -247,28 +254,236 @@ static void parseIdentify(const u8* d, EosHddInfo* out)
         if (s48 > sectors) sectors = s48;
     }
     out->sizeMB = (unsigned long)(sectors / 2048ULL);   // 512-byte sectors -> MB
+    return sectors;
 }
 
 // ===========================================================================
 // Public API.
 // ===========================================================================
-static int identifyInto(AtaCmd* cmd)
+static int identifyIntoDisk(AtaCmd* cmd, int disk)
 {
     zeroCmd(cmd);
     cmd->dataSize = 0;
-    cmd->ip.driveHead = IDE_DEV_MASTER;
+    cmd->ip.driveHead = (disk == 0) ? IDE_DEV_MASTER : IDE_DEV_SLAVE;
     cmd->ip.command = ATA_IDENTIFY;
     return sendATA(IDE_PRIMARY, cmd, ATA_RD);
 }
 
-int Hdd_Identify(EosHddInfo* out)
+static int identifyInto(AtaCmd* cmd)
+{
+    return identifyIntoDisk(cmd, 0);
+}
+
+/* Raw ATA PIO helpers for the blank-disk formatter.  These bypass the Xbox
+   filesystem namespace entirely, so they work before Partition0 exists. */
+static void ata400ns(unsigned short port)
+{
+    inB((unsigned short)(0x200 + port + 6));
+    inB((unsigned short)(0x200 + port + 6));
+    inB((unsigned short)(0x200 + port + 6));
+    inB((unsigned short)(0x200 + port + 6));
+}
+
+static int ataWaitNotBusy(unsigned short port)
+{
+    u32 wait = 300000;
+    u8 st;
+    while (wait-- > 0) {
+        st = inB((unsigned short)(port + 7));
+        if ((st & 0x80) == 0) return (st & 0x01) ? 0 : 1;
+        KeStallExecutionProcessor(10);
+    }
+    return 0;
+}
+
+static int ataWaitDrq(unsigned short port)
+{
+    u32 wait = 300000;
+    u8 st;
+    while (wait-- > 0) {
+        st = inB((unsigned short)(port + 7));
+        if (st & 0x01) return 0;
+        if ((st & 0x80) == 0 && (st & 0x08)) return 1;
+        KeStallExecutionProcessor(10);
+    }
+    return 0;
+}
+
+static int ataRwSector(int disk, unsigned long long lba, unsigned char* data, int write)
+{
+    unsigned short port = IDE_PRIMARY;
+    u32* dw = (u32*)data;
+    int i;
+    u8 dev;
+    u8 cmd;
+
+    if (!data || (disk != 0 && disk != 1) || lba >= (1ULL << 48)) return 0;
+    if (!ataWaitNotBusy(port)) return 0;
+
+    if (lba < 0x10000000ULL) {
+        dev = (u8)((disk == 0 ? 0xE0 : 0xF0) | ((lba >> 24) & 0x0F));
+        outB((unsigned short)(port + 6), dev);
+        ata400ns(port);
+        outB((unsigned short)(port + 1), 0);
+        outB((unsigned short)(port + 2), 1);
+        outB((unsigned short)(port + 3), (u8)(lba & 0xFF));
+        outB((unsigned short)(port + 4), (u8)((lba >> 8) & 0xFF));
+        outB((unsigned short)(port + 5), (u8)((lba >> 16) & 0xFF));
+        cmd = write ? ATA_WRITE_SECTORS : ATA_READ_SECTORS;
+    }
+    else {
+        dev = (u8)(disk == 0 ? 0x40 : 0x50);
+        outB((unsigned short)(port + 6), dev);
+        ata400ns(port);
+        /* LBA48 taskfile: high-order bytes first, then low-order bytes. */
+        outB((unsigned short)(port + 1), 0);
+        outB((unsigned short)(port + 2), 0);
+        outB((unsigned short)(port + 3), (u8)((lba >> 24) & 0xFF));
+        outB((unsigned short)(port + 4), (u8)((lba >> 32) & 0xFF));
+        outB((unsigned short)(port + 5), (u8)((lba >> 40) & 0xFF));
+        outB((unsigned short)(port + 1), 0);
+        outB((unsigned short)(port + 2), 1);
+        outB((unsigned short)(port + 3), (u8)(lba & 0xFF));
+        outB((unsigned short)(port + 4), (u8)((lba >> 8) & 0xFF));
+        outB((unsigned short)(port + 5), (u8)((lba >> 16) & 0xFF));
+        cmd = write ? ATA_WRITE_SECTORS_EXT : ATA_READ_SECTORS_EXT;
+    }
+
+    outB((unsigned short)(port + 7), cmd);
+    if (!ataWaitDrq(port)) return 0;
+
+    if (write) {
+        for (i = 0; i < 128; ++i) outD(port, dw[i]);
+    }
+    else {
+        for (i = 0; i < 128; ++i) dw[i] = inD(port);
+    }
+
+    return ataWaitNotBusy(port);
+}
+
+/* Fast repeated-sector writer. FATX formatting writes long runs of all-zero
+   or all-0xFF sectors; issue up to 255 sectors per LBA28 command instead of
+   paying command/setup latency once per sector. Metadata for the supported
+   Xbox layout remains well below the LBA28 boundary even on multi-TB disks. */
+static int ataWriteRepeat28(int disk, unsigned long long lba, unsigned long count,
+    const unsigned char sector512[512])
+{
+    unsigned short port = IDE_PRIMARY;
+    const u32* dw = (const u32*)sector512;
+    unsigned long done = 0;
+    unsigned long chunk;
+    unsigned long n;
+    int i;
+    u8 dev;
+
+    if (!sector512 || (disk != 0 && disk != 1)) return 0;
+    while (done < count) {
+        if (lba + done >= 0x10000000ULL) return 0;
+        chunk = count - done;
+        if (chunk > 255UL) chunk = 255UL;
+        if (lba + done + chunk > 0x10000000ULL)
+            chunk = (unsigned long)(0x10000000ULL - (lba + done));
+        if (chunk == 0) return 0;
+
+        if (!ataWaitNotBusy(port)) return 0;
+        dev = (u8)((disk == 0 ? 0xE0 : 0xF0) | (((lba + done) >> 24) & 0x0F));
+        outB((unsigned short)(port + 6), dev);
+        ata400ns(port);
+        outB((unsigned short)(port + 1), 0);
+        outB((unsigned short)(port + 2), (u8)chunk);
+        outB((unsigned short)(port + 3), (u8)((lba + done) & 0xFF));
+        outB((unsigned short)(port + 4), (u8)(((lba + done) >> 8) & 0xFF));
+        outB((unsigned short)(port + 5), (u8)(((lba + done) >> 16) & 0xFF));
+        outB((unsigned short)(port + 7), ATA_WRITE_SECTORS);
+
+        for (n = 0; n < chunk; ++n) {
+            if (!ataWaitDrq(port)) return 0;
+            for (i = 0; i < 128; ++i) outD(port, dw[i]);
+        }
+        if (!ataWaitNotBusy(port)) return 0;
+        done += chunk;
+    }
+    return 1;
+}
+
+int Hdd_ReadSector(int disk, unsigned long long lba, unsigned char out512[512])
+{
+    if (!out512) return HDD_ERR_ATA;
+    return ataRwSector(disk, lba, out512, 0) ? HDD_OK : HDD_ERR_ATA;
+}
+
+int Hdd_WriteSector(int disk, unsigned long long lba, const unsigned char in512[512])
+{
+    unsigned char temp[512];
+    int i;
+    if (!in512) return HDD_ERR_ATA;
+    for (i = 0; i < 512; ++i) temp[i] = in512[i];
+    return ataRwSector(disk, lba, temp, 1) ? HDD_OK : HDD_ERR_ATA;
+}
+
+int Hdd_WriteRepeatSectors(int disk, unsigned long long lba, unsigned long count,
+    const unsigned char sector512[512])
+{
+    unsigned long i;
+    if (!sector512) return HDD_ERR_ATA;
+    if (count == 0) return HDD_OK;
+    if (lba < 0x10000000ULL && lba + count <= 0x10000000ULL)
+        return ataWriteRepeat28(disk, lba, count, sector512) ? HDD_OK : HDD_ERR_ATA;
+    for (i = 0; i < count; ++i)
+        if (Hdd_WriteSector(disk, lba + i, sector512) != HDD_OK) return HDD_ERR_ATA;
+    return HDD_OK;
+}
+
+int Hdd_FlushDisk(int disk)
+{
+    unsigned short port = IDE_PRIMARY;
+    if (disk != 0 && disk != 1) return HDD_ERR_ATA;
+    if (!ataWaitNotBusy(port)) return HDD_ERR_ATA;
+    outB((unsigned short)(port + 6), (u8)(disk == 0 ? 0xE0 : 0xF0));
+    ata400ns(port);
+    outB((unsigned short)(port + 7), ATA_FLUSH_CACHE);
+    return ataWaitNotBusy(port) ? HDD_OK : HDD_ERR_ATA;
+}
+
+int Hdd_ReadSector0(int disk, unsigned char out512[512])
+{
+    return Hdd_ReadSector(disk, 0, out512);
+}
+
+int Hdd_WriteSector0(int disk, const unsigned char in512[512])
+{
+    return Hdd_WriteSector(disk, 0, in512);
+}
+
+int Hdd_IdentifyDisk(int disk, EosHddInfo* out, unsigned long long* outSectors)
 {
     AtaCmd cmd;
+    unsigned long long sectors;
+
+    if (!out || (disk != 0 && disk != 1)) return HDD_ERR_NODISK;
+
     out->present = 0;
-    if (!identifyInto(&cmd)) return HDD_ERR_NODISK;
-    parseIdentify(cmd.data, out);
+    out->model[0] = 0;
+    out->serial[0] = 0;
+    out->security = 0;
+    out->sizeMB = 0;
+    if (outSectors) *outSectors = 0;
+
+    /* Physical IDE probe: works on FATX, garbage, or a completely blank disk. */
+    if (!identifyIntoDisk(&cmd, disk)) return HDD_ERR_NODISK;
+
+    sectors = parseIdentify(cmd.data, out);
+    if (!sectors) return HDD_ERR_NODISK;
+
     out->present = 1;
+    if (outSectors) *outSectors = sectors;
     return HDD_OK;
+}
+
+int Hdd_Identify(EosHddInfo* out)
+{
+    return Hdd_IdentifyDisk(0, out, 0);
 }
 
 int Hdd_Unlock(void)
@@ -338,14 +553,115 @@ int Hdd_Lock(void)
     return (sec & HDD_SEC_ENABLED) ? HDD_OK : HDD_ERR_ATA;
 }
 
+// FATX partition-table inspection: raw ATA sector 0 (PrometheOS 512-byte
+// XboxPartitionTable layout), then raw FATX superblocks at partition starts.
+// This is intentionally NOT a DOS/kernel mount or an allocation usage probe.
+static unsigned long hddRaw32(const unsigned char* p)
+{
+    return ((unsigned long)p[0]) | ((unsigned long)p[1] << 8) |
+        ((unsigned long)p[2] << 16) | ((unsigned long)p[3] << 24);
+}
+static unsigned long hddRaw16(const unsigned char* p)
+{
+    return ((unsigned long)p[0]) | ((unsigned long)p[1] << 8);
+}
+static int hddRawMatch(const unsigned char* name, const char* expect)
+{
+    int i = 0;
+    while (expect[i]) {
+        if (i >= 16 || name[i] != (unsigned char)expect[i]) return 0;
+        ++i;
+    }
+    while (i < 16) {
+        if (name[i] != (unsigned char)' ' && name[i] != 0) return 0;
+        ++i;
+    }
+    return 1;
+}
+
+int Hdd_GetRawPartitionsForDisk(int disk, unsigned long long totalSectors,
+    EosHddRawPartitionInfo* out, int maxEntries, int* tableState, int* fatxMode)
+{
+    static const int idx[4] = { 1, 0, 5, 6 }; // table slots C/E/F/G
+    static const char logical[4] = { 'C', 'E', 'F', 'G' };
+    static const char aliases[4] = { 'P', 'Q', 'R', 'V' };
+    unsigned char table[512];
+    unsigned char header[512];
+    int i, j, n = 0;
+
+    if (tableState) *tableState = HDD_RAW_TABLE_READ_ERROR;
+    if (fatxMode) *fatxMode = 0;
+    if (!out || maxEntries <= 0 || totalSectors == 0 || (disk != 0 && disk != 1)) return 0;
+    if (Hdd_ReadSector(disk, 0ULL, table) != HDD_OK) return 0;
+    if (tableState) *tableState = HDD_RAW_TABLE_INVALID;
+    {
+        static const char* magic = "****PARTINFO****";
+        for (j = 0; j < 16; ++j)
+            if (table[j] != (unsigned char)magic[j]) return 0;
+    }
+    if (fatxMode) *fatxMode = (int)table[16];
+    // Modes 1 (primary), 2 (secondary), 3 (Stellar) are known.
+    if (table[16] < 1 || table[16] > 3) return 0;
+
+    // Reject malformed table geometry before returning partial information.
+    // Partition entries begin at offset 48 and occupy exactly 32 bytes each.
+    for (i = 0; i < 4; ++i) {
+        const unsigned char* e = table + 48 + idx[i] * 32;
+        unsigned long flags = hddRaw32(e + 16);
+        unsigned long long start, count;
+        const char* name = (i == 0) ? "XBOX SHELL C" :
+            (i == 1) ? "XBOX DATA E" :
+            (i == 2) ? "DRIVE F" : "DRIVE G";
+        if (flags == 0) continue;
+        if (flags != 0x80000000UL || !hddRawMatch(e, name)) return 0;
+        start = (unsigned long long)hddRaw32(e + 20) |
+            ((unsigned long long)hddRaw16(e + 28) << 32);
+        count = (unsigned long long)hddRaw32(e + 24) |
+            ((unsigned long long)hddRaw16(e + 30) << 32);
+        if (!start || !count || start >= totalSectors || count > totalSectors - start)
+            return 0;
+        if (n >= maxEntries) continue;
+        out[n].partition = logical[i];
+        out[n].suggestedAlias = aliases[i];
+        out[n].tablePartitionNumber = idx[i] + 1;
+        out[n].startLBA = start;
+        out[n].sectorCount = count;
+        out[n].sizeMB = (unsigned long)(count / 2048ULL);
+        out[n].sectorsPerCluster = 0;
+        out[n].fatxStatus = HDD_RAW_FATX_READ_ERROR;
+        ++n;
+    }
+    if (tableState) *tableState = HDD_RAW_TABLE_VALID;
+    for (i = 0; i < n; ++i) {
+        unsigned long spc;
+        if (Hdd_ReadSector(disk, out[i].startLBA, header) != HDD_OK) continue;
+        out[i].fatxStatus = HDD_RAW_FATX_MISSING;
+        if (header[0] != 'F' || header[1] != 'A' ||
+            header[2] != 'T' || header[3] != 'X') continue;
+        spc = hddRaw32(header + 8);
+        // Header plausibility checks; do not infer allocated/free clusters.
+        if (spc == 0 || spc > 256 || (spc & (spc - 1)) != 0 ||
+            hddRaw32(header + 12) == 0) continue;
+        out[i].sectorsPerCluster = spc;
+        out[i].fatxStatus = HDD_RAW_FATX_VALID;
+    }
+    return n;
+}
+
 // Query mounted user-facing Xbox partitions for the Drive Info screen.
 // Missing volumes (normally F:/G: on smaller layouts) are simply omitted.
-int Hdd_GetPartitions(EosPartitionInfo* out, int maxCount)
+int Hdd_GetPartitionsForDisk(int disk, EosHddPartitionInfo* out, int maxCount)
 {
-    static const char drives[HDD_PART_MAX] = { 'C', 'E', 'F', 'G' };
+    static const char primary[HDD_PART_MAX] = { 'C', 'E', 'F', 'G' };
+    static const char secondary[HDD_PART_MAX] = { 'P', 'Q', 'R', 'V' };
+    const char* drives;
     int i, n;
 
-    if (!out || maxCount <= 0) return 0;
+    if (!out || maxCount <= 0 || (disk != 0 && disk != 1)) return 0;
+
+    /* Aliases are owned by loader startup/settings. Usage polling only reads
+       the existing namespace so it cannot disturb active FTP/file handles. */
+    drives = (disk == 0) ? primary : secondary;
 
     n = 0;
     for (i = 0; i < HDD_PART_MAX && n < maxCount; ++i) {
@@ -366,7 +682,6 @@ int Hdd_GetPartitions(EosPartitionInfo* out, int maxCount)
         usedBytes = (total > freeBytes) ? (total - freeBytes) : 0;
 
         out[n].drive = drives[i];
-        out[n].present = 1;
         out[n].totalMB = (unsigned long)(total / 1048576);
         out[n].freeMB = (unsigned long)(freeBytes / 1048576);
         out[n].usedMB = (unsigned long)(usedBytes / 1048576);
@@ -377,3 +692,9 @@ int Hdd_GetPartitions(EosPartitionInfo* out, int maxCount)
 
     return n;
 }
+
+int Hdd_GetPartitions(EosHddPartitionInfo* out, int maxCount)
+{
+    return Hdd_GetPartitionsForDisk(0, out, maxCount);
+}
+

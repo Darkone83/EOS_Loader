@@ -20,6 +20,8 @@
 #include "eos_theme.h"
 #include "eos_config.h"
 #include "eos_bank.h"
+#include "eos_file.h"          // legacy file support
+#include "dd_mount.h"          // apply EOS Drive Setup to mounted aliases
 #include "eos_theme_custom.h"  // disk theme scan/apply + flash-backed selection
 #include "eos_rtc.h"           // X-RTC presence for the Date & Time screen
 #include "eos_lcd.h"           // LCD settings screen
@@ -92,6 +94,9 @@ static int eosHdmiHudHw(int enabled)
 void Settings_ApplyEosRuntime(void)
 {
     eosHdmiHudHw(Config_GetHdmiHudOn());
+    /* Save/load already handled by Config_SetDriveSetup/Config_Load.
+       Apply the restored setting to the HDD mappings on every Loader boot. */
+    Mount_HddPartitions();
 }
 
 // ---- tiny helpers (no CRT) -------------------------------------------------
@@ -169,11 +174,25 @@ static int hubFrame(WORD b, WORD prev)
 }
 
 // ---- EOS settings ----------------------------------------------------------
+static const char* driveSetupName(int mode)
+{
+    static const char* kModes[4] = {
+        "HDD & DVD",
+        "HDD & No DVD (Legacy)",
+        "HDD & No DVD (Modern)",
+        "Dual HDD"
+    };
+    if (mode < EOS_DRIVE_HDD_DVD || mode > EOS_DRIVE_DUAL_HDD) mode = EOS_DRIVE_NODVD_LEGACY;
+    return kModes[mode];
+}
+
 static int eosSettingsFrame(WORD b, WORD prev)
 {
+    const int rows = 4;
     int rc;
     int old;
     int want;
+    int dir;
     int rev1011 = s_con.revStr && s_con.revStr[0] == '1' &&
         s_con.revStr[1] == '.' &&
         (s_con.revStr[2] == '0' || s_con.revStr[2] == '1') &&
@@ -182,10 +201,14 @@ static int eosSettingsFrame(WORD b, WORD prev)
     int supported = rev1011 && s_con.encStr && s_con.encStr[0] == 'C';
 
     if (Pressed(b, prev, BTN_B)) { s_eosMsg = 0; s_sub = SUB_HUB; return 0; }
-    if (Pressed(b, prev, BTN_DPAD_UP)) s_row = (s_row + 2) % 3;
-    if (Pressed(b, prev, BTN_DPAD_DOWN)) s_row = (s_row + 1) % 3;
+    if (Pressed(b, prev, BTN_DPAD_UP)) s_row = (s_row + rows - 1) % rows;
+    if (Pressed(b, prev, BTN_DPAD_DOWN)) s_row = (s_row + 1) % rows;
 
-    if (Pressed(b, prev, BTN_A) || Pressed(b, prev, BTN_DPAD_LEFT) || Pressed(b, prev, BTN_DPAD_RIGHT)) {
+    dir = 0;
+    if (Pressed(b, prev, BTN_DPAD_LEFT)) dir = -1;
+    if (Pressed(b, prev, BTN_DPAD_RIGHT) || Pressed(b, prev, BTN_A)) dir = 1;
+
+    if (dir) {
         if (s_row == 0) {
             old = Config_GetHdmiHudOn();
             want = old ? 0 : 1;
@@ -204,16 +227,37 @@ static int eosSettingsFrame(WORD b, WORD prev)
             s_eosMsg = (rc == 0) ? (want ? "System info card enabled" : "System info card disabled")
                 : "System info card save failed";
         }
-        else if (!supported) {
-            s_eosMsg = "HD fix: 1.0/1.1 Conexant only";
+        else if (s_row == 2) {
+            if (!supported) {
+                s_eosMsg = "HD fix: 1.0/1.1 Conexant only";
+            }
+            else {
+                // The existing gateware patches the BIOS Xcode stream on launch.
+                // The saved opt-out takes effect at the next BIOS bank selection.
+                want = Config_GetHdFixOn() ? 0 : 1;
+                rc = Config_SetHdFixOn(want);
+                s_eosMsg = (rc == 0) ? (want ? "HD fix On - next launch" : "HD fix Off - next launch")
+                    : "HD fix preference save failed";
+            }
         }
         else {
-            // The existing gateware patches the BIOS Xcode stream on launch.
-            // The saved opt-out takes effect at the next BIOS bank selection.
-            want = Config_GetHdFixOn() ? 0 : 1;
-            rc = Config_SetHdFixOn(want);
-            s_eosMsg = (rc == 0) ? (want ? "HD fix On - next launch" : "HD fix Off - next launch")
-                : "HD fix preference save failed";
+            old = Config_GetDriveSetup();
+            want = old + dir;
+            if (want < EOS_DRIVE_HDD_DVD) want = EOS_DRIVE_DUAL_HDD;
+            if (want > EOS_DRIVE_DUAL_HDD) want = EOS_DRIVE_HDD_DVD;
+            rc = Config_SetDriveSetup(want);
+            if (rc == 0) {
+                // EOS's HDD1 Drive Info / formatter use direct ATA and do not
+                // depend on kernel FATX mounts. Preserve this setting for the
+                // later DarkDash filesystem integration.
+                Settings_ApplyEosRuntime();
+                s_eosMsg = want == EOS_DRIVE_DUAL_HDD
+                    ? "Dual HDD preference saved - inspect HDD1 in Drive Info"
+                    : "Drive Setup preference saved";
+            }
+            else {
+                s_eosMsg = "Drive Setup save failed";
+            }
         }
     }
 
@@ -222,33 +266,37 @@ static int eosSettingsFrame(WORD b, WORD prev)
     rowPill(LIST_Y0 + LIST_DY, s_row == 1, 0, "System Info Card", Config_GetSystemCardOn() ? "On" : "Off");
     rowPill(LIST_Y0 + LIST_DY * 2, s_row == 2, !supported,
         "HD Fix (1.0/1.1)", supported ? (Config_GetHdFixOn() ? "On" : "Off") : "N/A");
+    rowPill(LIST_Y0 + LIST_DY * 3, s_row == 3, 0,
+        "Drive Setup", driveSetupName(Config_GetDriveSetup()));
 
-    // Read-only, selection-specific context. No changes to the toggles,
-    // save timing, hardware checks, or next-launch application of the HD fix.
-    Ui_TextCenteredFit(PILL_X, PILL_W, 262, "ABOUT THIS OPTION", EOS_DIM);
+    Ui_TextCenteredFit(PILL_X, PILL_W, 292, "ABOUT THIS OPTION", EOS_DIM);
     if (s_row == 0) {
-        Ui_TextCenteredFit(PILL_X, PILL_W, 292,
+        Ui_TextCenteredFit(PILL_X, PILL_W, 320,
             "Controls the EOS HDMI hardware overlay.", EOS_WHITE);
     }
     else if (s_row == 1) {
-        Ui_TextCenteredFit(PILL_X, PILL_W, 292,
+        Ui_TextCenteredFit(PILL_X, PILL_W, 320,
             "Show system information on EOS menus.", EOS_WHITE);
     }
-    else if (supported) {
-        Ui_TextCenteredFit(PILL_X, PILL_W, 292,
-            "Conexant video initialization fix.", EOS_WHITE);
+    else if (s_row == 2 && supported) {
         Ui_TextCenteredFit(PILL_X, PILL_W, 320,
+            "Conexant video initialization fix.", EOS_WHITE);
+        Ui_TextCenteredFit(PILL_X, PILL_W, 346,
             "Takes effect on the next user BIOS launch.", EOS_DIM);
     }
-    else {
-        Ui_TextCenteredFit(PILL_X, PILL_W, 292,
-            "Only available on Xbox 1.0/1.1", EOS_DIM);
+    else if (s_row == 2) {
         Ui_TextCenteredFit(PILL_X, PILL_W, 320,
-            "with a Conexant video encoder.", EOS_DIM);
+            "Only available on Xbox 1.0/1.1 with Conexant.", EOS_DIM);
+    }
+    else {
+        Ui_TextCenteredFit(PILL_X, PILL_W, 320,
+            "PrometheOS-compatible IDE topology preference.", EOS_WHITE);
+        Ui_TextCenteredFit(PILL_X, PILL_W, 346,
+            "Dual HDD enables HDD1 mappings when the kernel exposes them.", EOS_DIM);
     }
     if (s_eosMsg)
-        Ui_TextCenteredFit(PILL_X, PILL_W, 357, s_eosMsg, EOS_PURPLE);
-    footer("UP/DN  OPTION     LEFT/RIGHT OR A  TOGGLE     B  BACK");
+        Ui_TextCenteredFit(PILL_X, PILL_W, 382, s_eosMsg, EOS_PURPLE);
+    footer("UP/DN  OPTION     LEFT/RIGHT OR A  CHANGE     B  BACK");
     return 0;
 }
 

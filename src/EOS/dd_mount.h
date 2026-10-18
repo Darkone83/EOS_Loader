@@ -1,29 +1,28 @@
 /*---------------------------------------------------------------------------
-    dd_mount.h -- mount the Xbox HDD partitions to drive letters.
-
-    The kernel only auto-mounts D: (the running title's directory). Anything
-    that touches C/E/F/G/X/Y/Z must symlink the letter to its partition device
-    first. Call Mount_HddPartitions() once at boot before scanning drives.
-    Idempotent -- safe to call again (already-mounted just returns an error
-    code we ignore).
+    dd_mount.h -- mount primary and optional secondary Xbox HDD partitions.
 ---------------------------------------------------------------------------*/
 #ifndef DD_MOUNT_H
 #define DD_MOUNT_H
 
 void Mount_HddPartitions(void);
+void Mount_UnmountHddPartitions(void);
+void Mount_UnmountHddPartitionsForDisk(int disk);
 
-/* Re-point D: at the folder this XBE actually launched from (derived from the
-   kernel's XeImageFileName). The kernel usually auto-maps D: to the running
-   title's directory, but when DarkDash is booted as the *dashboard* (e.g. by
-   Cerbios) that mapping can be absent or point elsewhere -- so all the "D:\..."
-   asset paths resolve to nothing. Calling this first makes D: correct
-   regardless of how we were launched. Returns 1 on success, 0 on failure
-   (caller can then fall back to assuming the kernel's D:). */
+/* Secondary HDD DOS aliases. Mount_HddPartitions() applies saved EOS Drive
+   Setup mode 3, probes ATA slave, and retains aliases only when
+   GetDiskFreeSpaceExA confirms the corresponding FATX volume:
+       P: = HDD1-C / Partition2
+       Q: = HDD1-E / Partition1
+       R: = HDD1-F / Partition6
+       V: = HDD1-G / Partition7
+   Bit 0..3 in the mask correspond to P/Q/R/V. */
+unsigned int Mount_Hdd1MappedMask(void);
+int          Mount_Hdd1Available(void);
+int          Mount_Hdd1AtaPresent(void); /* last mount attempt: physical ATA slave */
+char         Mount_Hdd1AliasForPart(char part);
+char         Mount_Hdd1PartForAlias(char alias);
+
 int Mount_SelfToD(void);
-
-/* Launch the XBE at a DOS path ("E:\Apps\Foo\default.xbe"). Remaps D: to the
-   target partition then XLaunchNewImage()s it. Does not return on success;
-   returns non-zero on failure. */
 int Mount_LaunchXbe(const char* dosPath);
 
 #endif /* DD_MOUNT_H */

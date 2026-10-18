@@ -70,3 +70,13 @@ int  Config_SetHdFixOn(int on);
 // Reserved theme layout preference: 0 Classic, 1 Grid, 2 Bubbles 3D, 3 Orbit 3D.
 int  Config_GetMenuLayout(void);
 int  Config_SetMenuLayout(int layout);
+// PrometheOS/Cerbios-compatible IDE topology preference. Stored only in the
+// EOS settings bank; callers use the same numeric contract as PrometheOS:
+// 0 HDD+DVD, 1 HDD/no-DVD legacy, 2 HDD/no-DVD modern, 3 Dual HDD.
+#define EOS_DRIVE_HDD_DVD        0
+#define EOS_DRIVE_NODVD_LEGACY   1
+#define EOS_DRIVE_NODVD_MODERN   2
+#define EOS_DRIVE_DUAL_HDD       3
+int  Config_GetDriveSetup(void);
+int  Config_SetDriveSetup(int driveSetup);
+

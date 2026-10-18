@@ -105,13 +105,24 @@ int File_IsDir(const char* path)
 
 int File_ListDrives(EosFileEntry* out, int maxEntries)
 {
-    static const char k_letters[7] = { 'C', 'E', 'F', 'G', 'X', 'Y', 'Z' };
+    /* P/Q/R/V are HDD1 C/E/F/G aliases. They are included only when the
+       central mount layer proved the corresponding kernel volume resolves. */
+    static const char k_letters[12] = { 'C', 'D', 'E', 'F', 'G', 'P', 'Q', 'R', 'V', 'X', 'Y', 'Z' };
     char root[4];
     int  i, n = 0;
 
-    for (i = 0; i < 7 && n < maxEntries; ++i) {
+    for (i = 0; i < 12 && n < maxEntries; ++i) {
+        int present = 0;
         root[0] = k_letters[i]; root[1] = ':'; root[2] = '\\'; root[3] = 0;
-        if (GetFileAttributesA(root) != 0xFFFFFFFF) {
+        if (k_letters[i] == 'D') {
+            present = (GetFileAttributesA(root) != 0xFFFFFFFF);
+        }
+        else {
+            ULARGE_INTEGER totalBytes;
+            totalBytes.QuadPart = 0;
+            present = GetDiskFreeSpaceExA(root, 0, &totalBytes, 0) && totalBytes.QuadPart != 0;
+        }
+        if (present) {
             out[n].name[0] = k_letters[i]; out[n].name[1] = ':'; out[n].name[2] = 0;
             out[n].is_dir = 1;
             ++n;

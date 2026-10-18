@@ -21,7 +21,7 @@
 #define CFG_VERIFY_FAIL (-2)
 
 #define BANKS_VER   2
-#define SET_VER     6
+#define SET_VER     7
 #define OLD_SET_OFF 240           /* theme offset in the legacy combined "EOSC" page */
 #define SET_FAN_MODE_OFF 231       /* byte after BGM path [7..230] */
 #define SET_FAN_PCT_OFF  232
@@ -35,6 +35,7 @@
 #define SET_EOS_HD_FIX_DISABLED  0x04
 #define SET_EOS_LAYOUT_MASK      0x18
 #define SET_EOS_LAYOUT_SHIFT     3
+#define SET_DRIVE_SETUP_OFF      241   /* PrometheOS/Cerbios-compatible drive mode: 0..3 */
 
 static int s_themeIdx = 0;        /* cached setting, loaded by Config_Load */
 static int s_bgmOn = 0;        /* background music enabled */
@@ -49,6 +50,7 @@ static int s_hdmiHudOn = 1;       /* onboard FPGA HDMI overlay */
 static int s_systemCardOn = 1;    /* Loader system info card */
 static int s_hdFixOn = 1;        /* default ON: retain existing gateware behavior */
 static int s_menuLayout = 0;     /* 0=Classic, 1=Grid, 2=Bubbles, 3=Orbit */
+static int s_driveSetup = EOS_DRIVE_NODVD_LEGACY; /* PrometheOS-compatible drive topology */
 
 int Config_GetThemeIdx(void) { return s_themeIdx; }
 int Config_GetFanManual(void) { return s_fanManual ? 1 : 0; }
@@ -59,6 +61,7 @@ int Config_GetHdmiHudOn(void) { return s_hdmiHudOn ? 1 : 0; }
 int Config_GetSystemCardOn(void) { return s_systemCardOn ? 1 : 0; }
 int Config_GetHdFixOn(void) { return s_hdFixOn ? 1 : 0; }
 int Config_GetMenuLayout(void) { return s_menuLayout; }
+int Config_GetDriveSetup(void) { return s_driveSetup; }
 
 static unsigned int customThemeHash(const char* s, int* outLen)
 {
@@ -168,6 +171,18 @@ int Config_SetMenuLayout(int layout)
     if (s_menuLayout == old) return EOS_FLASH_OK;
     rc = Config_SaveSettings();
     if (rc != EOS_FLASH_OK) s_menuLayout = old;
+    return rc;
+}
+
+int Config_SetDriveSetup(int driveSetup)
+{
+    int old = s_driveSetup;
+    int rc;
+    if (driveSetup < EOS_DRIVE_HDD_DVD || driveSetup > EOS_DRIVE_DUAL_HDD) return -1;
+    s_driveSetup = driveSetup;
+    if (s_driveSetup == old) return EOS_FLASH_OK;
+    rc = Config_SaveSettings();
+    if (rc != EOS_FLASH_OK) s_driveSetup = old;
     return rc;
 }
 
@@ -316,6 +331,7 @@ int Config_SaveSettings(void)
         | (s_systemCardOn ? SET_EOS_SYSTEM_CARD : 0)
         | (s_hdFixOn ? 0 : SET_EOS_HD_FIX_DISABLED)
         | ((s_menuLayout << SET_EOS_LAYOUT_SHIFT) & SET_EOS_LAYOUT_MASK));
+    buf[SET_DRIVE_SETUP_OFF] = (unsigned char)s_driveSetup;
     putSum(buf);
     return writePage(EOS_SETTINGS_BANK, buf);
 }
@@ -338,6 +354,7 @@ int Config_ResetSettings(void)
     s_systemCardOn = 1;
     s_hdFixOn = 1;
     s_menuLayout = 0;
+    s_driveSetup = EOS_DRIVE_NODVD_LEGACY;
     return Config_SaveSettings();
 }
 
@@ -359,6 +376,7 @@ int Config_ClearAll(void)
     s_systemCardOn = 1;
     s_hdFixOn = 1;
     s_menuLayout = 0;
+    s_driveSetup = EOS_DRIVE_NODVD_LEGACY;
     return (r1 == EOS_FLASH_OK && r2 == EOS_FLASH_OK) ? EOS_FLASH_OK : -1;
 }
 
@@ -375,6 +393,7 @@ static void loadSettings(void)
     s_systemCardOn = 1;
     s_hdFixOn = 1;
     s_menuLayout = 0;
+    s_driveSetup = EOS_DRIVE_NODVD_LEGACY;
     rc = Flash_ReadPage(EOS_SETTINGS_BANK, 0, buf);
     if (rc != EOS_FLASH_OK) return;
     if (!(buf[0] == 'E' && buf[1] == 'O' && buf[2] == 'S' && buf[3] == 'S')) return;
@@ -420,6 +439,10 @@ static void loadSettings(void)
         s_systemCardOn = (flags & SET_EOS_SYSTEM_CARD) ? 1 : 0;
         s_hdFixOn = (flags & SET_EOS_HD_FIX_DISABLED) ? 0 : 1;
         s_menuLayout = (flags & SET_EOS_LAYOUT_MASK) >> SET_EOS_LAYOUT_SHIFT;
+    }
+    if (buf[4] >= 7) {
+        int ds = (int)buf[SET_DRIVE_SETUP_OFF];
+        if (ds >= EOS_DRIVE_HDD_DVD && ds <= EOS_DRIVE_DUAL_HDD) s_driveSetup = ds;
     }
 }
 
